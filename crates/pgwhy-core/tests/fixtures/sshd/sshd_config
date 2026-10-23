@@ -1,0 +1,14 @@
+# pgWhy tunnel test fixture (throwaway). Ed25519 host key only; key + password auth for the
+# "pgwhy" user; TCP forwarding on so Postgres (not published) is reachable only through here.
+Port 22
+HostKey /etc/ssh/ssh_host_ed25519_key
+PermitRootLogin no
+PubkeyAuthentication yes
+AuthorizedKeysFile /fixture/authorized_keys
+StrictModes no
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+AllowTcpForwarding yes
+AllowUsers pgwhy
+PrintMotd no
+LogLevel VERBOSE

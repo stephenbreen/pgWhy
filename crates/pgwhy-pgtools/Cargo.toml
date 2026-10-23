@@ -1,0 +1,25 @@
+[package]
+name = "pgwhy-pgtools"
+description = "pgWhy pg client tools engine: discovery, version gates, child runner, pgpass, TOC, retention. Never depends on pgwhy-core."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+pgwhy-errors.workspace = true
+serde.workspace = true
+rustls-native-certs.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+testcontainers.workspace = true

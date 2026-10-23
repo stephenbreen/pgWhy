@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "dev.pgwhy.app.e2e",
+  "build": {
+    "beforeBuildCommand": { "script": "npm run build:e2e", "cwd": "../ui" }
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": [
+        "default",
+        { "identifier": "e2e", "windows": ["main"], "permissions": ["core:default", "core:window:default", "wdio:default"] }
+      ]
+    }
+  }
+}

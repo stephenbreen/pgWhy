@@ -1,0 +1,9 @@
+/target/
+**/target/
+node_modules/
+ui/dist/
+src-tauri/gen/
+.DS_Store
+*.log
+# local prototypes, not part of the app
+spikes/

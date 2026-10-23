@@ -1,0 +1,43 @@
+[package]
+name = "pgwhy"
+description = "pgWhy desktop app: Tauri command/event/channel layer over the pgwhy-* crates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "pgwhy_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.1", features = [] }
+
+[dependencies]
+pgwhy-core.workspace = true
+pgwhy-pgtools.workspace = true
+pgwhy-workflow.workspace = true
+pgwhy-errors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tauri = { version = "=2.12.1", features = [] }
+tauri-plugin-single-instance = "=2.5.2"
+tauri-plugin-dialog = "=2.8.1"
+tauri-plugin-wdio = { version = "=1.5.0", optional = true }
+tauri-plugin-wdio-webdriver = { version = "=1.5.0", optional = true }
+
+[dev-dependencies]
+tauri = { version = "=2.12.1", features = ["test"] }
+testcontainers.workspace = true
+tempfile.workspace = true
+tokio-postgres.workspace = true
+
+[features]
+# `cargo tauri dev` / `tauri build` pass this to use the dev server URL
+custom-protocol = ["tauri/custom-protocol"]
+# WebdriverIO e2e builds (e2e/): embedded WebDriver + execute/log plugins
+e2e = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]

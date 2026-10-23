@@ -1,0 +1,22 @@
+{
+  "name": "pgwhy-e2e",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "//": "Golden-flow e2e (plan U17): WebdriverIO + @wdio/tauri-service (embedded driver, macOS-capable) against the real app and a containerized Postgres.",
+  "scripts": {
+    "build:app": "cd .. && npx tauri build --debug --no-bundle --features e2e --config src-tauri/tauri.e2e.conf.json",
+    "test": "wdio run ./wdio.conf.ts"
+  },
+  "devDependencies": {
+    "@wdio/cli": "9.32.0",
+    "@wdio/globals": "9.31.3",
+    "@wdio/local-runner": "9.32.0",
+    "@wdio/mocha-framework": "9.32.0",
+    "@wdio/spec-reporter": "9.32.0",
+    "@wdio/tauri-service": "1.5.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "webdriverio": "9.32.0"
+  }
+}

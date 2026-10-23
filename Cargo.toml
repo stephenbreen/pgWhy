@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = ["crates/pgwhy-errors", "crates/pgwhy-core", "crates/pgwhy-pgtools", "crates/pgwhy-workflow", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+publish = false
+license = "MIT"
+
+[workspace.dependencies]
+pgwhy-errors = { path = "crates/pgwhy-errors" }
+pgwhy-core = { path = "crates/pgwhy-core" }
+pgwhy-pgtools = { path = "crates/pgwhy-pgtools" }
+pgwhy-workflow = { path = "crates/pgwhy-workflow" }
+
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.21"
+tokio = { version = "=1.53.2", features = ["full"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+uuid = { version = "=1.27.0", features = ["v4", "serde"] }
+toml = "=1.1.7"
+directories = "=6.0.0"
+tempfile = "=3.27.0"
+sha2 = "=0.11.0"
+
+# Postgres + TLS
+tokio-postgres = "=0.7.18"
+tokio-postgres-rustls = "=0.14.0"
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "=1.15.1"
+rustls-native-certs = "=0.8.4"
+futures-util = "=0.3.34"
+keyring = "=4.2.0"
+rcgen = "=0.14.10"
+russh = { version = "=0.64.1", default-features = false, features = ["ring", "rsa"] }
+
+testcontainers = "=0.28.0"
+
+# pgwhy-pgtools: process-group signalling for child cancellation (POSIX)
+libc = "=0.2.190"

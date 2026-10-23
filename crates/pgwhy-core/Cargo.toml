@@ -1,0 +1,31 @@
+[package]
+name = "pgwhy-core"
+description = "pgWhy core: connections, tunnels, introspection, query execution, scripts. No Tauri dependency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+pgwhy-errors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-native-certs.workspace = true
+futures-util.workspace = true
+keyring.workspace = true
+uuid.workspace = true
+tempfile.workspace = true
+russh.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+testcontainers.workspace = true
