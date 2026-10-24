@@ -1083,7 +1083,19 @@ pub(crate) async fn run(
                 None => problems.push(format!("{} no longer exists", plan.staging_db)),
             }
         } else {
-            check_free(&plan.staging_db, MarkerRole::Staging, &mut problems);
+            // A retry drops the retried run's own staging before creating the new one, so a
+            // fresh name that lands on it (a retry within the same second) is not a conflict.
+            let dropped_by_retry = prev.is_some_and(|p| {
+                p.staging_db.as_deref() == Some(plan.staging_db.as_str())
+                    && dbs
+                        .iter()
+                        .find(|d| d.name == plan.staging_db)
+                        .and_then(|d| d.comment.as_deref().and_then(Marker::parse))
+                        .is_some_and(|m| m.run_id == p.run_id.0)
+            });
+            if !dropped_by_retry {
+                check_free(&plan.staging_db, MarkerRole::Staging, &mut problems);
+            }
         }
         if !create_mode {
             check_free(&plan.old_db, MarkerRole::Old, &mut problems);

@@ -229,9 +229,17 @@ impl Recents {
 mod tests {
     use super::*;
 
+    /// `/x/a.sql` has no drive letter, so it is not absolute on Windows.
+    fn abs(path: &str) -> PathBuf {
+        match path.strip_prefix('/') {
+            Some(rest) if cfg!(windows) => PathBuf::from(format!("C:\\{rest}")),
+            _ => PathBuf::from(path),
+        }
+    }
+
     fn use_(path: &str, action: RecentAction) -> RecentUse {
         RecentUse {
-            path: PathBuf::from(path),
+            path: abs(path),
             library_id: None,
             action,
             connection_id: None,
@@ -270,15 +278,9 @@ mod tests {
         saved.library_id = Some(ScriptId("s1".into()));
         r.record_at(saved.clone(), 2).unwrap();
         // Same id at a new path replaces the old entry rather than duplicating it.
-        saved.path = PathBuf::from("/lib/moved/b.sql");
+        saved.path = abs("/lib/moved/b.sql");
         r.record_at(saved, 3).unwrap();
         let paths: Vec<_> = r.entries().iter().map(|e| e.path.clone()).collect();
-        assert_eq!(
-            paths,
-            [
-                PathBuf::from("/lib/moved/b.sql"),
-                PathBuf::from("/lib/a.sql")
-            ]
-        );
+        assert_eq!(paths, [abs("/lib/moved/b.sql"), abs("/lib/a.sql")]);
     }
 }

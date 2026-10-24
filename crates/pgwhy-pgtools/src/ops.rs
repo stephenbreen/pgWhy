@@ -422,6 +422,7 @@ fn claim_partial(path: &Path, format: DumpFormat) -> std::io::Result<()> {
             opts.open(path).map(drop)
         }
         DumpFormat::Directory => {
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
             {
