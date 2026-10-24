@@ -61,7 +61,7 @@ pub enum ErrorPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScriptMode {
-    /// The post-restore script runs in one transaction (R22 default).
+    /// The post-restore script runs in one transaction (the default).
     #[default]
     Transaction,
     /// For scripts with CONCURRENTLY / VACUUM etc.; a failure leaves staging partially mutated.
@@ -111,7 +111,7 @@ impl RefreshOptions {
     }
 }
 
-/// A confirmation the user asked pgWhy to remember (R14): valid only while the workflow's
+/// A confirmation the user asked pgWhy to remember: valid only while the workflow's
 /// confirmation fingerprint is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RememberedConfirmation {
@@ -126,7 +126,7 @@ pub struct RefreshWorkflow {
     pub name: String,
     pub source: DbRef,
     pub target: DbRef,
-    /// Stable library script id (U14).
+    /// Stable library script id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_restore_script: Option<String>,
     #[serde(default)]
@@ -180,8 +180,8 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Save-time and run-time validation that doesn't need a server: the R18 tag gate and
-/// source ≠ target (SM-12).
+/// Save-time and run-time validation that doesn't need a server: the environment-tag gate and
+/// source ≠ target.
 pub fn validate(
     wf: &RefreshWorkflow,
     source: &ConnectionEntry,

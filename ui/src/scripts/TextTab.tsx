@@ -1,7 +1,7 @@
 // A text tab for plain-text and Markdown notes (.txt / .md) kept with the scripts: no
 // connection and no Run, just edit and save. A file opened from disk can be added to the
 // script library, after which the tab edits the library copy. Like editor tabs, a clean
-// buffer follows the file on disk and a dirty one asks (EC-8).
+// buffer follows the file on disk and a dirty one asks.
 
 import { useEffect, useRef, useState } from "react";
 import { EditorState } from "@codemirror/state";

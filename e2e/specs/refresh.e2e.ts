@@ -1,4 +1,4 @@
-// F1 / AE2 through the real UI: a Production-tagged remote, a Local target, a saved Refresh
+// A Refresh run through the real UI: a Production-tagged remote, a Local target, a saved Refresh
 // workflow, the preflight secret prompt (session-only credentials don't survive a restart),
 // one confirmation, and a successful staging-then-swap run.
 
@@ -42,7 +42,7 @@ describe("Refresh local from remote", () => {
     await expect($("aria/E2E remote")).toBeDisplayed();
   });
 
-  it("saves a workflow; Production can't be the target (AE7)", async () => {
+  it("saves a workflow; Production can't be the target", async () => {
     await $("aria/Workflows").click();
     await $("aria/New workflow").click();
     await fill("Workflow", "Name", "Refresh e2e");
@@ -53,10 +53,10 @@ describe("Refresh local from remote", () => {
     await expect($("span=Refresh e2e")).toBeDisplayed();
   });
 
-  it("runs after one confirmation and replaces the local database (AE2)", async () => {
+  it("runs after one confirmation and replaces the local database", async () => {
     await $(".workflow-item").$("button=Run").click();
     // session-only credentials: if the app restarted since the Local connection was created,
-    // preflight asks for its password (EC-10) before the confirmation can run
+    // preflight asks for its password before the confirmation can run
     const confirm = await $("button=Replace shop");
     await browser.waitUntil(async () => (await confirm.isDisplayed()) || (await $("aria/Database password for E2E local").isDisplayed()), { timeout: 30_000 });
     const prompt = await $("aria/Database password for E2E local");

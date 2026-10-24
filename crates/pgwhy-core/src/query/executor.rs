@@ -8,7 +8,7 @@
 //!
 //! Results go to a [`ResultSink`] synchronously, in protocol order. Rows arrive in
 //! [`RowBatch`]es that borrow the wire buffers (`Option<&str>` per cell, no per-cell
-//! allocation) — U12 appends them into its columnar arena. A batch is flushed when it reaches
+//! allocation) — the result buffer appends them into its columnar arena. A batch is flushed when it reaches
 //! [`RunOptions::batch_rows`] or the socket has nothing more ready, so the executor never
 //! holds more than one batch and rows reach the sink incrementally; TCP backpressure does the
 //! rest when the sink is slow.
@@ -284,7 +284,7 @@ pub enum RunOutcome {
         index: usize,
     },
     /// The connection died at statement `index`. `transaction_lost` when a transaction was
-    /// open — the server rolled it back (R19 "transaction lost").
+    /// open — the server rolled it back ("transaction lost").
     ConnectionLost {
         index: usize,
         transaction_lost: bool,
@@ -486,7 +486,7 @@ impl QuerySession {
     }
 
     /// True when the connection is gone while a transaction was open — its work was rolled back
-    /// by the server and the tab must say so (R19 / SM-6).
+    /// by the server and the tab must say so.
     pub fn transaction_lost(&self) -> bool {
         self.is_closed() && self.txn_status() != TxnStatus::Idle
     }
@@ -958,7 +958,7 @@ impl QuerySession {
     }
 
     /// Re-derive the transaction status from the server (one cheap, side-effect-free round
-    /// trip). Use before an R19 close prompt when certainty matters, or after the connection
+    /// trip). Use before a close prompt when certainty matters, or after the connection
     /// was used outside this session.
     pub async fn resync_txn(&self) -> AppResult<TxnStatus> {
         let _lock = self.acquire()?;
@@ -1004,7 +1004,7 @@ impl QuerySession {
         res
     }
 
-    /// `COMMIT` the open transaction (R19 close/quit prompt). In a failed transaction the
+    /// `COMMIT` the open transaction (close/quit prompt). In a failed transaction the
     /// server rolls back instead; the result is still `Idle`.
     pub async fn commit(&self) -> AppResult<TxnStatus> {
         let mut lock = self.acquire()?;
@@ -1014,7 +1014,7 @@ impl QuerySession {
         Ok(self.txn_status())
     }
 
-    /// `ROLLBACK` the open transaction (R19 close/quit prompt).
+    /// `ROLLBACK` the open transaction (close/quit prompt).
     pub async fn rollback(&self) -> AppResult<TxnStatus> {
         let mut lock = self.acquire()?;
         self.control_locked(&mut lock, "rollback")
@@ -1023,7 +1023,7 @@ impl QuerySession {
         Ok(self.txn_status())
     }
 
-    /// Run a whole script as the post-restore step (R22).
+    /// Run a whole script as the post-restore step.
     ///
     /// [`ScriptMode::SingleTransaction`] wraps it in `BEGIN … COMMIT`, stopping at the first
     /// failure and rolling back; it refuses — before sending anything — scripts that contain
@@ -1257,7 +1257,7 @@ fn ms(d: Duration) -> f64 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// A sink that keeps everything (tests, small workflow results, the U11 mock pane)
+// A sink that keeps everything (tests, small workflow results, mock result panes)
 // ---------------------------------------------------------------------------------------------
 
 /// One entry of [`CollectSink::log`], recording the order events arrived in.

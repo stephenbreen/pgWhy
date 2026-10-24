@@ -1,4 +1,4 @@
-// Completion namespace for the editor (R7): object names from the explorer's catalog cache.
+// Completion namespace for the editor: object names from the explorer's catalog cache.
 // Filled in by the introspection integration; until a catalog is loaded, keywords only.
 
 import { useEffect, useState } from "react";

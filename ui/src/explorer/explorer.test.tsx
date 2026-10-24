@@ -107,7 +107,7 @@ async function connect(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe("object explorer", () => {
-  it("AE1: on first connect a table's columns are one click away, details need no dialog", async () => {
+  it("on first connect a table's columns are one click away, details need no dialog", async () => {
     const user = userEvent.setup();
     backend();
     render(<App />);

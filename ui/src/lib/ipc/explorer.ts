@@ -1,4 +1,4 @@
-// Typed wrappers over src-tauri/src/commands/explorer.rs (introspection, U8/U9/U10).
+// Typed wrappers over src-tauri/src/commands/explorer.rs (introspection, tree, details).
 
 import { invoke } from "@tauri-apps/api/core";
 

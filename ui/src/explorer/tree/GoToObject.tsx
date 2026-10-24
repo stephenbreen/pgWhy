@@ -1,5 +1,5 @@
 // ⌘P / Ctrl+P (Find object): find any table/view/function in the active connection's database by name,
-// then expand the tree down to it and select it (R3 go-to-object).
+// then expand the tree down to it and select it.
 
 import { useEffect, useState } from "react";
 import { useConnections } from "../../connection/store";

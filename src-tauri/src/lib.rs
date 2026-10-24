@@ -162,7 +162,7 @@ async fn shutdown_and_exit<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
     app.exit(0);
 }
 
-/// Quit after the UI has dealt with open transactions (R19): the window's close request is
+/// Quit after the UI has dealt with open transactions: the window's close request is
 /// intercepted and forwarded as `close-requested`; the UI asks per tab, then calls this.
 ///
 /// Async so a slow shutdown (a live `pg_dump` being killed) never freezes the window while the
@@ -275,7 +275,7 @@ fn with_e2e(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
     builder
 }
 
-/// Process start, for the cold-start budget (R17: usable connection list in < 2 s).
+/// Process start, for the cold-start budget (usable connection list in < 2 s).
 pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 pub fn run() {

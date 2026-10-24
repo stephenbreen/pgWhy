@@ -37,7 +37,7 @@ export function actionsFor(t: NodeTarget): NodeAction[] {
   return actions.filter((a) => a.applies(t)).sort((a, b) => Number(!!b.primary) - Number(!!a.primary));
 }
 
-/** The details panel (U10) listens to selections. */
+/** The details panel listens to selections. */
 export function setSelectHandler(h: SelectHandler | null) {
   onSelect = h;
 }

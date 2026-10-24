@@ -1,4 +1,4 @@
-//! Result buffer tests (U12): window protocol, pending overlay, copy, export, retention, and
+//! Result buffer tests: window protocol, pending overlay, copy, export, retention, and
 //! streaming through the executor into a buffer against containerized Postgres.
 
 mod harness;

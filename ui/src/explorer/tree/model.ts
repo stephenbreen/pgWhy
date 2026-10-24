@@ -146,7 +146,7 @@ export const useTrees = create<TreesState>((set, get) => {
     },
 
     // first connect: default database, its public schema and its Tables folder open, so a
-    // table's columns are one click away (AE1); later connects restore what was open
+    // table's columns are one click away; later connects restore what was open
     restore: async (connectionId, defaultDb) => {
       if (get().trees[connectionId]?.restored) return;
       let saved: string[] = [];

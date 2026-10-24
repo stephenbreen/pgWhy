@@ -1,4 +1,4 @@
-// Per-editor-tab state: its connection binding (R2), transaction state (R19), the current
+// Per-editor-tab state: its connection binding, transaction state, the current
 // run's result sets (SSMS-style single results pane with a switcher) and messages.
 
 import { create } from "zustand";

@@ -1,4 +1,4 @@
-//! Refresh workflow runs (U16 ↔ U15): preflight → one confirmation → start; live events as
+//! Refresh workflow runs: preflight → one confirmation → start; live events as
 //! the global `workflow-event` (runs outlive any tab); history, re-inventory and the
 //! state-aware actions; retry; and the post-swap catalog invalidation.
 
@@ -66,7 +66,7 @@ pub async fn workflow_apply_fix(
     state.engine().apply_preflight_fix(&wf, &fix).await
 }
 
-/// EC-10: store a secret preflight said is missing, then the UI re-runs preflight.
+/// store a secret preflight said is missing, then the UI re-runs preflight.
 #[tauri::command]
 pub fn workflow_provide_secret(
     state: State<'_, AppState>,

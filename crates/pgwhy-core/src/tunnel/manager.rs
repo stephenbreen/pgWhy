@@ -187,7 +187,7 @@ impl TunnelManager {
         self.inner.known_hosts.list()
     }
 
-    /// Preflight (EC-10): which SSH secrets starting `entry`'s tunnel would need but are not
+    /// Preflight: which SSH secrets starting `entry`'s tunnel would need but are not
     /// available. Empty when the tunnel can start without prompting (or the entry has none).
     /// Reads the key file; never touches the network.
     pub fn missing_secrets(&self, entry: &ConnectionEntry) -> AppResult<Vec<SecretKind>> {

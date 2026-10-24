@@ -1,4 +1,4 @@
-// Run history for a workflow (R21): status, timings, and one click into any run's report.
+// Run history for a workflow: status, timings, and one click into any run's report.
 
 import { useEffect, useState } from "react";
 import { useWorkspace, type Tab } from "../app/workspace";

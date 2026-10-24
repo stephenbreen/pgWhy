@@ -82,7 +82,7 @@ pub(super) fn resolve_auth(entry: &ConnectionEntry, vault: &Vault) -> AppResult<
 }
 
 /// Which secrets starting this entry's tunnel would need that are not available — the
-/// "resolve before run" check workflows run at preflight (EC-10). Does not touch the network.
+/// "resolve before run" check workflows run at preflight. Does not touch the network.
 pub(super) fn missing_secrets(
     entry: &ConnectionEntry,
     vault: &Vault,

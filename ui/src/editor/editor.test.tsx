@@ -72,7 +72,7 @@ describe("editor tab", () => {
     expect(calls.find((c) => c.cmd === "editor_open")?.args).toMatchObject({ connectionId: "c1", database: "app" });
   });
 
-  it("switching the connection rebinds the tab and reopens on the new target (AE3)", async () => {
+  it("switching the connection rebinds the tab and reopens on the new target", async () => {
     const user = userEvent.setup();
     useConnections.setState({ entries: [entry, { ...entry, id: "c2", name: "Staging", env_tag: "staging", database: "stage" }] });
     const calls = backend();

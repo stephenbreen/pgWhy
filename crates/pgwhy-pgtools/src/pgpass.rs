@@ -1,5 +1,5 @@
 //! Per-run temporary pgpass files — the single sanctioned transient on-disk form of a
-//! credential (R20).
+//! credential.
 //!
 //! Lifecycle: one randomly-named file per child run, inside a dedicated app-owned directory
 //! ([`PgPassDir`]), created atomically with owner-only permissions (POSIX `O_CREAT|O_EXCL`
@@ -17,7 +17,7 @@
 //!
 //! Windows: files are created inside the per-user temp directory (`%LOCALAPPDATA%\Temp`),
 //! whose inherited ACL already grants access only to the user, SYSTEM and Administrators;
-//! no explicit ACL is applied (documented best-effort per the plan).
+//! no explicit ACL is applied (best effort).
 
 use crate::endpoint::{ToolEndpoint, ToolPassword};
 use pgwhy_errors::{AppError, AppResult, ErrorKind};

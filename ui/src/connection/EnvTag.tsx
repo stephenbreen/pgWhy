@@ -1,4 +1,4 @@
-// Environment tag rendering (R18): a colour bar on tree nodes and tabs, a labelled pill in
+// Environment tag rendering: a colour bar on tree nodes and tabs, a labelled pill in
 // the status bar and forms. Untagged is never shown — the default is Production.
 
 import type { EnvTag as Tag } from "../lib/ipc/connections";

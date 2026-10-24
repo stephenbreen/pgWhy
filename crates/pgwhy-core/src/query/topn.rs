@@ -1,4 +1,4 @@
-//! Top-N query builder (U13 / R6): `SELECT … FROM <table> [WHERE criteria] [ORDER BY …]
+//! Top-N query builder: `SELECT … FROM <table> [WHERE criteria] [ORDER BY …]
 //! LIMIT N`, with server-side filtering and sorting so they act on the whole table.
 //!
 //! Safety rules, shared with the edit SQL in [`super::edit`]:
@@ -28,7 +28,7 @@ use futures_util::StreamExt;
 use std::time::Instant;
 use tokio_postgres::types::ToSql;
 
-/// Default N (RV-10).
+/// Default N.
 pub const DEFAULT_TOP_N: u64 = 100;
 
 const BOOL_OID: u32 = 16;

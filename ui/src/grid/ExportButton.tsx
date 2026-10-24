@@ -1,4 +1,4 @@
-// CSV/JSON export, run core-side from the buffer (R8).
+// CSV/JSON export, run core-side from the buffer.
 
 import { useState } from "react";
 import { pickSavePath, resultExport, type ExportFormat } from "../lib/ipc/query";

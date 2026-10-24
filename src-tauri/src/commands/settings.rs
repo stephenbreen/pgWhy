@@ -1,4 +1,4 @@
-//! App settings (R6 top-N, R21 retention, library and tool locations).
+//! App settings (top-N rows, backup retention, library and tool locations).
 
 use crate::state::AppState;
 use pgwhy_core::config::AppSettings;

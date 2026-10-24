@@ -1,5 +1,4 @@
-//! Tolerant parsing of pg_dump/pg_restore `--verbose` stderr into a progress stream (R12,
-//! RV-2).
+//! Tolerant parsing of pg_dump/pg_restore `--verbose` stderr into a progress stream.
 //!
 //! The verbose grammar is not a documented contract, so every rule here is a best-effort
 //! match pinned against real 13–18 output; an unrecognised line is kept as `last_line` and

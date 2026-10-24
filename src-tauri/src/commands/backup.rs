@@ -1,4 +1,4 @@
-//! Standalone backup of any database (R12, EC-20): pg_dump custom format into the
+//! Standalone backup of any database: pg_dump custom format into the
 //! per-connection backup folder, with live progress and retention (keep last K).
 
 use crate::state::AppState;

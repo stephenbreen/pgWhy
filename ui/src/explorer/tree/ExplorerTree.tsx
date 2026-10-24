@@ -1,4 +1,4 @@
-// The SSMS-density object tree (R3, AE1): connections at the root, then databases →
+// The SSMS-density object tree: connections at the root, then databases →
 // schemas → typed folders → relations with their columns and types inline. One virtualized
 // list so thousands of tables stay instant; type-to-filter over loaded nodes; Ctrl/Cmd+P
 // jumps to any object in the connected database; node errors render inline with a retry.

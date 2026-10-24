@@ -1,4 +1,4 @@
-//! Query execution core integration tests against containerized Postgres (U18).
+//! Query execution core integration tests against containerized Postgres.
 
 mod harness;
 

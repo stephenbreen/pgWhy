@@ -189,7 +189,7 @@ fn discovery_finds_stubs_and_selects_versions() {
 }
 
 #[test]
-fn ae5_gate_refuses_with_actionable_message() {
+fn version_gate_refuses_with_actionable_message() {
     let e = env();
     stub(&e.bin, "pg_dump", "15.4", "exit 0");
     let reg = discover(&DiscoveryOptions::isolated(

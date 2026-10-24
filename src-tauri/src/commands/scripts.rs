@@ -1,4 +1,4 @@
-//! Script workbench commands (R9, R10, R11, R22): library CRUD + search, recents, plain-file
+//! Script workbench commands: library CRUD + search, recents, plain-file
 //! open/save with on-disk change detection, and the psql meta-command scan.
 
 use crate::commands::blocking;

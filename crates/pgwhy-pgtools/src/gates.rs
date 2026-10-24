@@ -1,4 +1,4 @@
-//! Version gates (R15, AE5): refuse to start — with a message saying what is wrong, how to
+//! Version gates: refuse to start — with a message saying what is wrong, how to
 //! fix it, and where pgWhy looked — instead of failing mid-backup.
 //!
 //! - pg_dump major must be ≥ the source server major (pg_dump refuses newer servers).
@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn ae5_pg_dump_too_old_refuses_with_exact_message() {
+    fn pg_dump_too_old_refuses_with_exact_message() {
         let err = require_pg_dump(&reg(&[(ToolKind::PgDump, 15)]), 17).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ToolVersion);
         assert_eq!(

@@ -1,4 +1,4 @@
-// Connection list + live status (R1, R2). The status per entry is derived from connect
+// Connection list + live status. The status per entry is derived from connect
 // results and core `conn-event`s; the active connection is what the status bar shows and
 // what new editor tabs inherit.
 

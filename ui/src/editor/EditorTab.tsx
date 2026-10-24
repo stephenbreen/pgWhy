@@ -1,4 +1,4 @@
-// An editor tab (R2, R7, R19): bound to one connection + database from creation, runs the
+// An editor tab: bound to one connection + database from creation, runs the
 // selection or the whole buffer on a dedicated connection, shows results/messages in one
 // pane, decorates errors where Postgres reported them, and never loses an open transaction
 // silently — closing or disconnecting asks to commit or roll back.
@@ -23,7 +23,7 @@ export interface EditorTabData {
   filePath?: string;
   /** library script id when opened from the library */
   scriptId?: string;
-  /** what was on disk when the buffer was loaded/saved (EC-8 change detection) */
+  /** what was on disk when the buffer was loaded/saved (change detection) */
   fingerprint?: scriptsIpc.FileFingerprint;
 }
 
@@ -113,7 +113,7 @@ export function EditorTab({ tab }: { tab: Tab }) {
     if (txn) patch(tab.id, { txn });
   }, [tab.id, patch]);
 
-  // R19: closing with an open transaction asks first
+  // closing with an open transaction asks first
   useEffect(() => {
     setCloseGuard(tab.id, async () => {
       await settle();
@@ -224,7 +224,7 @@ export function EditorTab({ tab }: { tab: Tab }) {
     }
   };
 
-  // EC-8: a clean buffer follows the file on disk; a dirty one asks; a deleted file is marked
+  // a clean buffer follows the file on disk; a dirty one asks; a deleted file is marked
   useEffect(() => {
     const check = async () => {
       if (!data.filePath || !data.fingerprint) return;
@@ -253,7 +253,7 @@ export function EditorTab({ tab }: { tab: Tab }) {
     setDisk(null);
   };
 
-  // R11: switch the receiving connection explicitly; an open transaction is asked about first
+  // switch the receiving connection explicitly; an open transaction is asked about first
   const rebind = async (connectionId: string, database: string) => {
     await settle(); // switching under a running query would orphan it
     const s = useEditors.getState().tabs[tab.id];

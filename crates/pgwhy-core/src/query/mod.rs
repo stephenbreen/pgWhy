@@ -1,5 +1,5 @@
-//! Query execution core (U18): statement splitter, executor, cancel, transaction state; result
-//! buffers (U12); edit SQL (U13).
+//! Query execution core: statement splitter, executor, cancel, transaction state; result
+//! buffers; edit SQL.
 //!
 //! Consumers (editor tabs, grids, run-against, the workflow's post-restore step) hold a
 //! [`QuerySession`] over a dedicated connection and never touch tokio-postgres directly.

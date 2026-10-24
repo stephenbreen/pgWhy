@@ -1,4 +1,4 @@
-//! Introspection service integration tests against containerized Postgres (U8).
+//! Introspection service integration tests against containerized Postgres.
 
 mod harness;
 

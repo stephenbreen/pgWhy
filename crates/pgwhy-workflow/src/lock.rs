@@ -1,7 +1,7 @@
-//! Per-target-server run lock (SM-11): at most one Refresh run — or pending confirmation, or
+//! Per-target-server run lock: at most one Refresh run — or pending confirmation, or
 //! recovery action — touches a server at a time, because two swaps on one server race on
 //! session termination and renames. Process-local by design: it is sound only because the app
-//! enforces a single instance (U3).
+//! enforces a single instance.
 
 use pgwhy_core::config::ServerKey;
 use pgwhy_core::{AppError, AppResult, ErrorKind};

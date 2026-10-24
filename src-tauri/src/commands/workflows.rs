@@ -1,5 +1,5 @@
-//! Refresh workflow definitions (U16 editor side): list/save/delete with the save-time gates —
-//! R18 target tag (AE7), source ≠ target, and R22 attach-time script checks (no psql
+//! Refresh workflow definitions (editor side): list/save/delete with the save-time gates —
+//! target environment tag, source ≠ target, and attach-time script checks (no psql
 //! meta-commands, no explicit transaction control, no-transaction statements need the
 //! no-transaction mode). The engine re-checks all of this at run time (files are editable).
 
@@ -27,7 +27,7 @@ pub struct ScriptCheck {
     pub content_hash: Option<String>,
 }
 
-/// R22 checks for a library script as a post-restore script.
+/// Checks for a library script as a post-restore script.
 pub fn check_script(state: &AppState, id: &ScriptId, mode: ScriptMode) -> AppResult<ScriptCheck> {
     let file = state.with_library(|lib| lib.read(id))?;
     let mut problems = Vec::new();

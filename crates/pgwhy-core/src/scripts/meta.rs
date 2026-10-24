@@ -1,7 +1,7 @@
-//! psql meta-command detection (R22, RV-7).
+//! psql meta-command detection.
 //!
 //! pgWhy executes scripts with its own SQL executor, which does not understand psql
-//! backslash commands (`\c`, `\i`, `\set`, `\copy`, `\gexec`, ...). Workflow attach (U16)
+//! backslash commands (`\c`, `\i`, `\set`, `\copy`, `\gexec`, ...). Workflow attach
 //! refuses scripts containing them and the workbench warns, so detection must not raise
 //! false positives on backslashes that are just data: inside string literals (including
 //! `E'...'` escapes), quoted identifiers, dollar-quoted bodies and comments.

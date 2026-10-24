@@ -151,7 +151,7 @@ if (scene) {
   }
 }
 
-// ?scene=perf-tree: R17 "tree expand/select < 100 ms on cached data" — toggles a loaded
+// ?scene=perf-tree: "tree expand/select < 100 ms on cached data" — toggles a loaded
 // table node repeatedly and records click → next paint; result lands in document.title
 if (scene === "perf-tree") {
   const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));

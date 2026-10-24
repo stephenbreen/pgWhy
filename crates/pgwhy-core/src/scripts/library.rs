@@ -1,8 +1,8 @@
-//! The script library (R10): a directory tree of plain `.sql` files (and `.txt` / `.md` notes
+//! The script library: a directory tree of plain `.sql` files (and `.txt` / `.md` notes
 //! kept alongside them) plus a sidecar index.
 //!
 //! Folders are the organisation; the index ([`INDEX_FILE_NAME`] at the library root) adds what
-//! a filesystem cannot: a stable [`ScriptId`] per script (what workflows reference, EC-9),
+//! a filesystem cannot: a stable [`ScriptId`] per script (what workflows reference),
 //! tags, and the content hash that lets a rescan recognise a script that was renamed or moved
 //! outside the app (`git mv`, Finder) and keep its id.
 //!

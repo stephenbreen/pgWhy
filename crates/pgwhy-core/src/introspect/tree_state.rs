@@ -1,5 +1,5 @@
-//! Persisted tree expansion state (R3: "on connect the tree restores its last expansion
-//! state"). Paths are stored *by name*, not oid, so they survive a Refresh swap that recreates
+//! Persisted tree expansion state: on connect the tree restores its last expansion
+//! state. Paths are stored *by name*, not oid, so they survive a Refresh swap that recreates
 //! every object: `["db:app", "schema:public", "table:users"]`.
 
 use crate::config::{ConfigStore, ConnectionEntry, ConnectionId};

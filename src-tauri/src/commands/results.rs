@@ -1,4 +1,4 @@
-//! Result-set access for the grid (R8): binary windows over a per-result Channel, TSV copy,
+//! Result-set access for the grid: binary windows over a per-result Channel, TSV copy,
 //! CSV/JSON export — all served from the core-side buffer.
 
 use crate::state::AppState;

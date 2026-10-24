@@ -72,7 +72,7 @@ beforeEach(() => {
 });
 
 describe("scripts view", () => {
-  it("reopens yesterday's script with the connection it last ran against (AE3)", async () => {
+  it("reopens yesterday's script with the connection it last ran against", async () => {
     const user = userEvent.setup();
     const calls = backend();
     render(<App />);

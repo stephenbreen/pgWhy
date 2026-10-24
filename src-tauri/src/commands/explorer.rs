@@ -1,4 +1,4 @@
-//! Object explorer commands (R3, R4, AE1) over the introspection cache (U8). DTOs are shaped
+//! Object explorer commands over the introspection cache. DTOs are shaped
 //! for the tree (ui/src/lib/ipc/explorer.ts): flat, display-ready, names unquoted.
 
 use crate::state::AppState;
@@ -395,7 +395,7 @@ pub fn tree_state_set(
     state.expansion.set(&connection_id, paths)
 }
 
-/// Script-as (R5): DML templates from the cache; CREATE via a version-matched `pg_dump -s`.
+/// Script-as: DML templates from the cache; CREATE via a version-matched `pg_dump -s`.
 #[tauri::command]
 pub async fn explorer_script_as(
     state: State<'_, AppState>,
@@ -480,7 +480,7 @@ pub async fn explorer_script_options(
     .collect())
 }
 
-/// Completion namespace for the editor (R7): `{ schema: { relation: [columns] } }` from the
+/// Completion namespace for the editor: `{ schema: { relation: [columns] } }` from the
 /// already-loaded catalog only — never a round trip on keystrokes.
 #[tauri::command]
 pub fn completion_schema(

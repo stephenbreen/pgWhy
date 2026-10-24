@@ -1,4 +1,4 @@
-//! U14 script workbench core: library index, recents, file states, meta-command scan.
+//! Script workbench core: library index, recents, file states, meta-command scan.
 //! Filesystem only (temp dirs); no database.
 
 use pgwhy_core::config::{ConfigStore, ConnectionId};
@@ -273,7 +273,7 @@ fn run_use(path: &Path, conn: &str, db: &str) -> RecentUse {
 
 #[test]
 fn recents_restore_last_connection_across_restart() {
-    // AE3: yesterday's run shows up today and reopens with its last connection.
+    // yesterday's run shows up today and reopens with its last connection.
     let cfg = tempfile::tempdir().unwrap();
     let store = ConfigStore::new(cfg.path());
     let files = tempfile::tempdir().unwrap();
@@ -392,7 +392,7 @@ fn recents_follow_library_moves() {
     assert_eq!(r.entries()[0].path, lib.root().join("moved/x.sql"));
 }
 
-// ---- open-buffer file states (EC-8) ------------------------------------------------------
+// ---- open-buffer file states ----------------------------------------------------------
 
 #[test]
 fn buffer_file_states_outside_library() {
@@ -431,7 +431,7 @@ fn library_read_fingerprint_feeds_check_file() {
     );
 }
 
-// ---- meta-command scan (R22) -------------------------------------------------------------
+// ---- meta-command scan ----------------------------------------------------------------
 
 #[test]
 fn meta_scan_true_and_false_positives() {

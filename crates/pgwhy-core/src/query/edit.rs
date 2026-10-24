@@ -1,4 +1,4 @@
-//! Editable-grid commit engine (U13 / R16 / AE4).
+//! Editable-grid commit engine.
 //!
 //! A grid's pending edits (held in its [`ResultSet`]) become one statement per changed row:
 //!
@@ -194,7 +194,7 @@ impl EditPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitOptions {
-    /// `SET LOCAL lock_timeout` for the commit transaction (EC-21); `0` disables it.
+    /// `SET LOCAL lock_timeout` for the commit transaction; `0` disables it.
     pub lock_timeout_ms: u64,
     /// UPDATEs also require the changed columns to still hold their loaded values.
     pub verify_original_values: bool,

@@ -1,4 +1,4 @@
-//! Connection core integration tests against containerized Postgres (U4).
+//! Connection core integration tests against containerized Postgres.
 
 mod harness;
 

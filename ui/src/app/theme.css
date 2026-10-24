@@ -20,7 +20,7 @@
   --warning: #b7791f;
   --ok: #2f855a;
 
-  /* environment tags (R18): colour bars on tree nodes, tabs, status bar */
+  /* environment tags: colour bars on tree nodes, tabs, status bar */
   --tag-local: #2f855a;
   --tag-dev: #2b6cb0;
   --tag-staging: #b7791f;

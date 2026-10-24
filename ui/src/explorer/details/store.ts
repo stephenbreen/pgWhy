@@ -1,4 +1,4 @@
-// The details dock follows the explorer selection (R4): serve-cached on select, refresh on
+// The details dock follows the explorer selection: serve-cached on select, refresh on
 // demand, "no longer exists" when a refetch misses (post-DDL / post-swap).
 
 import { create } from "zustand";
