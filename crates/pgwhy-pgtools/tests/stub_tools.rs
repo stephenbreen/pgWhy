@@ -31,7 +31,8 @@ done
 env | grep -E '^(PG|LC_|LANGUAGE)' | sed 's/^/ENV:/' >> "$REC"
 if [ -n "$PGPASSFILE" ]; then
   echo "PGPASS_PATH:$PGPASSFILE" >> "$REC"
-  echo "PGPASS_MODE:$(stat -f %Lp "$PGPASSFILE" 2>/dev/null || stat -c %a "$PGPASSFILE")" >> "$REC"
+  # GNU stat first: BSD stat rejects -c, while GNU `stat -f` means "filesystem" and prints a report
+  echo "PGPASS_MODE:$(stat -c %a "$PGPASSFILE" 2>/dev/null || stat -f %Lp "$PGPASSFILE")" >> "$REC"
   printf 'PGPASS:%s\n' "$(cat "$PGPASSFILE")" >> "$REC"
 fi
 {body}
@@ -974,7 +975,7 @@ async fn verify_mode_without_root_cert_gets_system_roots_file() {
     let e = env();
     let body = r#"
 echo "ROOTCERT_PATH:$PGSSLROOTCERT" >> "$REC"
-echo "ROOTCERT_MODE:$(stat -f %Lp "$PGSSLROOTCERT" 2>/dev/null || stat -c %a "$PGSSLROOTCERT")" >> "$REC"
+echo "ROOTCERT_MODE:$(stat -c %a "$PGSSLROOTCERT" 2>/dev/null || stat -f %Lp "$PGSSLROOTCERT")" >> "$REC"
 echo "ROOTCERT_PEM:$(grep -c 'BEGIN CERTIFICATE' "$PGSSLROOTCERT")" >> "$REC"
 printf x > "$OUT"
 "#;
