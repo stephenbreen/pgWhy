@@ -303,10 +303,16 @@ fn recents_restore_last_connection_across_restart() {
 
 #[test]
 fn recents_order_by_last_use_and_cap() {
+    // absolute on every platform: `/scripts` has no drive letter on Windows
+    let dir = PathBuf::from(if cfg!(windows) {
+        r"C:\scripts"
+    } else {
+        "/scripts"
+    });
     let mut r = Recents::default();
     for i in 0..(MAX_RECENT_SCRIPTS + 5) {
         let used = RecentUse {
-            path: PathBuf::from(format!("/scripts/{i}.sql")),
+            path: dir.join(format!("{i}.sql")),
             library_id: None,
             action: RecentAction::Open,
             connection_id: None,
@@ -315,16 +321,16 @@ fn recents_order_by_last_use_and_cap() {
         r.record_at(used, 1000 + i as u64).unwrap();
     }
     assert_eq!(r.entries().len(), MAX_RECENT_SCRIPTS);
-    assert_eq!(r.entries()[0].path, PathBuf::from("/scripts/34.sql"));
+    assert_eq!(r.entries()[0].path, dir.join("34.sql"));
     // Re-using an old one moves it to the front without duplicating it.
-    r.record_at(run_use(Path::new("/scripts/10.sql"), "c", "d"), 5000)
+    r.record_at(run_use(&dir.join("10.sql"), "c", "d"), 5000)
         .unwrap();
-    assert_eq!(r.entries()[0].path, PathBuf::from("/scripts/10.sql"));
+    assert_eq!(r.entries()[0].path, dir.join("10.sql"));
     assert_eq!(r.entries().len(), MAX_RECENT_SCRIPTS);
     assert_eq!(
         r.entries()
             .iter()
-            .filter(|e| e.path == Path::new("/scripts/10.sql"))
+            .filter(|e| e.path == dir.join("10.sql"))
             .count(),
         1
     );
