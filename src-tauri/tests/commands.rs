@@ -52,7 +52,14 @@ fn invoke_on(webview: &WebviewWindow<MockRuntime>, cmd: &str, args: Value) -> Re
             cmd: cmd.into(),
             callback: tauri::ipc::CallbackFn(0),
             error: tauri::ipc::CallbackFn(1),
-            url: "tauri://localhost".parse().unwrap(),
+            // the origin the app is served from: wry serves custom protocols over http on Windows
+            url: if cfg!(windows) {
+                "http://tauri.localhost"
+            } else {
+                "tauri://localhost"
+            }
+            .parse()
+            .unwrap(),
             body: tauri::ipc::InvokeBody::Json(args),
             headers: Default::default(),
             invoke_key: INVOKE_KEY.to_string(),
