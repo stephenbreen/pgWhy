@@ -331,7 +331,7 @@ async fn restore_failure_keeps_target_and_retry_reuses_backup() {
     assert!(enabled_kinds(&rec).contains(&ActionKind::DropStaging));
     assert!(enabled_kinds(&rec).contains(&ActionKind::KeepStaging));
 
-    // AE2: retry from restore reuses the backup and succeeds
+    // retry from restore reuses the backup and succeeds
     let retry = retry_plan(&h, &rec, StepId::Restore);
     let rec2 = h.run(retry).await;
     assert_eq!(rec2.status, RunStatus::Succeeded, "{:?}", rec2.error);

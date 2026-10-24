@@ -1,4 +1,4 @@
-//! SSH tunnels (U5): refcounted russh tunnels per connection entry, known-hosts trust, status
+//! SSH tunnels: refcounted russh tunnels per connection entry, known-hosts trust, status
 //! events.
 //!
 //! Every consumer of a tunneled entry — introspection, editor tabs, grids, pg_dump/pg_restore
@@ -6,7 +6,7 @@
 //! socket becomes its own `direct-tcpip` channel over the entry's single SSH session, so they
 //! all multiplex (plan: "in-process russh tunnels, refcounted per connection entry").
 //!
-//! Lifecycle (plan SM-9): `starting → up`, `up → reconnecting → up` with exponential backoff
+//! Lifecycle: `starting → up`, `up → reconnecting → up` with exponential backoff
 //! while anything still holds a lease (the local port never changes, so leases and child
 //! connection strings stay valid), and `→ down` when the last lease is released, the user
 //! disconnects, or a failure needs the user (host key, credentials). A disconnect request on a
@@ -28,7 +28,7 @@ use crate::AppError;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Tunnel lifecycle state (plan SM-9).
+/// Tunnel lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TunnelState {

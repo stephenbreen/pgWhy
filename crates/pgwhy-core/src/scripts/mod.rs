@@ -1,13 +1,13 @@
-//! Script workbench core (U14): library index with stable ids, recents, open-buffer file
+//! Script workbench core: library index with stable ids, recents, open-buffer file
 //! states, psql meta-command scan.
 //!
 //! - [`Library`]: a directory tree of plain `.sql` files plus a sidecar index
 //!   ([`INDEX_FILE_NAME`]) that gives each script a stable [`ScriptId`] which survives
-//!   renames, moves and git operations. Workflows (U15/U16) reference scripts by that id.
+//!   renames, moves and git operations. Workflows reference scripts by that id.
 //! - [`Recents`]: auto-tracked recently used scripts (library or loose files) with the
 //!   connection + database each last ran against, persisted via [`crate::config::ConfigStore`].
-//! - [`check_file`]: EC-8 change detection for open editor buffers.
-//! - [`scan_meta_commands`]: R22 detection of psql backslash commands outside string,
+//! - [`check_file`]: change detection for open editor buffers.
+//! - [`scan_meta_commands`]: detection of psql backslash commands outside string,
 //!   identifier, dollar-quote and comment context.
 //!
 //! Nothing here touches a database.

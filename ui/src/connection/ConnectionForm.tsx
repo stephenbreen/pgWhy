@@ -1,4 +1,4 @@
-// New/edit connection form (R1, R18). Opens as a main-area tab, not a modal, so the tree
+// New/edit connection form. Opens as a main-area tab, not a modal, so the tree
 // stays usable while it's open. Secrets use blank-with-"unchanged" semantics: the stored
 // password is never sent to the UI; leaving the field blank keeps it.
 

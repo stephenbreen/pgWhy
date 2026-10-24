@@ -1,4 +1,4 @@
-// Typed wrappers over src-tauri/src/commands/grid.rs (top-N view + editable layer, U13).
+// Typed wrappers over src-tauri/src/commands/grid.rs (top-N view + editable layer).
 
 import { invoke } from "@tauri-apps/api/core";
 

@@ -1,11 +1,11 @@
-//! Preflight (SM-2): the ordered gate sequence that resolves everything before the single
+//! Preflight: the ordered gate sequence that resolves everything before the single
 //! confirmation, so a run never prompts mid-way. Nothing destructive happens here.
 //!
-//! Order: run lock (per target server) → R18 tag re-check against the *current* entries →
+//! Order: run lock (per target server) → environment-tag re-check against the *current* entries →
 //! tools → source reachable (+ live catalog facts) → version gates → maintenance DB +
 //! privileges → maintenance ≠ target → prepared transactions → disk space → staging/`_old`
-//! names (marker-verified) → encoding/locale representability → post-restore script (R22) →
-//! credentials (EC-10). Version gates follow the source check because they need its major.
+//! names (marker-verified) → encoding/locale representability → post-restore script →
+//! credentials. Version gates follow the source check because they need its major.
 //!
 //! Every gate produces a [`PreflightCheck`]; a failing one stops the run before the
 //! confirmation (`refused`), and fixable findings carry a [`PreflightFix`].
@@ -128,7 +128,7 @@ pub struct MissingSecret {
     pub reason: String,
 }
 
-/// What the single confirmation shows (R14).
+/// What the single confirmation shows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirmation {
     pub target_db: String,
@@ -534,7 +534,7 @@ pub(crate) async fn run(
         }
     };
 
-    // 2. R18 re-check against the current entries (workflow files and tags are editable
+    // 2. environment-tag re-check against the current entries (workflow files and tags are editable
     // outside the app).
     match definition::validate(wf, &source, &target) {
         Ok(()) => report.checks.push(PreflightCheck::ok(
@@ -1170,7 +1170,7 @@ pub(crate) async fn run(
         ));
     }
 
-    // 12. post-restore script (R22, re-checked against current content)
+    // 12. post-restore script (re-checked against current content)
     let mut script: Option<ScriptRecord> = None;
     match &wf.post_restore_script {
         None => report.checks.push(PreflightCheck::skipped(

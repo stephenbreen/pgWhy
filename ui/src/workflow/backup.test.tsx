@@ -19,7 +19,7 @@ beforeEach(() => {
 });
 
 describe("standalone backup", () => {
-  it("shows live progress and the retained file (R12)", async () => {
+  it("shows live progress and the retained file", async () => {
     let emit: ((e: BackupEvent) => void) | null = null;
     let resolve: (() => void) | null = null;
     const calls: string[] = [];

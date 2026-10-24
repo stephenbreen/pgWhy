@@ -1,4 +1,4 @@
-// Always-visible active connection identity for the status bar (R2, R18).
+// Always-visible active connection identity for the status bar.
 
 import { serverVersionLabel } from "../lib/ipc/connections";
 import { useConnections } from "./store";

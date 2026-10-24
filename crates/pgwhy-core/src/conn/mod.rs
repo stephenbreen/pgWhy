@@ -1,6 +1,6 @@
 //! Connections: TLS, credentials, tunnels (via [`TunnelProvider`]), and the allocation model.
 //!
-//! Allocation model (plan RV-5):
+//! Allocation model:
 //! - one shared, read-only **introspection** connection per (entry, database), transparently
 //!   health-checked and reopened — used by the tree, details panel and completion;
 //! - one **dedicated** connection per editor tab, per open grid, and per workflow step —

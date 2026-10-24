@@ -11,9 +11,9 @@ export interface Tab {
   id: string;
   kind: TabKind;
   title: string;
-  /** connection entry the tab is bound to (R2); absent for app-level tabs */
+  /** connection entry the tab is bound to; absent for app-level tabs */
   connectionId?: string;
-  /** env tag of the bound connection (R18 colour bar on the tab) */
+  /** env tag of the bound connection (colour bar on the tab) */
   tag?: "local" | "dev" | "staging" | "production";
   /** kind-specific payload owned by the feature that opened the tab */
   data?: unknown;

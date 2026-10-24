@@ -1,4 +1,4 @@
-//! The seam between connections and SSH tunnels. The tunnel manager (U5) implements
+//! The seam between connections and SSH tunnels. The tunnel manager implements
 //! [`TunnelProvider`]; connections and pg_dump/pg_restore children only ever see the local
 //! forwarded port it hands out.
 

@@ -51,7 +51,7 @@ beforeEach(() => {
 });
 
 describe("workflow editor", () => {
-  it("AE7: Production and Staging connections can't be chosen as the target", async () => {
+  it("Production and Staging connections can't be chosen as the target", async () => {
     backend();
     render(<App />);
     openWorkflowEditor();
@@ -74,7 +74,7 @@ describe("workflow editor", () => {
     expect(useWorkflows.getState().workflows).toHaveLength(0);
   });
 
-  it("R22: a script with psql meta-commands blocks saving with the reason", async () => {
+  it("a script with psql meta-commands blocks saving with the reason", async () => {
     const user = userEvent.setup();
     const calls = backend();
     render(<App />);

@@ -368,13 +368,13 @@ async fn real_backup_toc_restore_roundtrip() {
 }
 
 #[tokio::test]
-async fn ae5_pg_dump_16_refuses_postgres_17() {
+async fn pg_dump_16_refuses_postgres_17() {
     let Some((_, pg_dump, _)) = real_tools(16) else {
         return;
     };
     if pg_dump.version.major >= 17 {
         eprintln!(
-            "NOTICE: installed pg_dump is {} — AE5 real-tool test needs one older than 17",
+            "NOTICE: installed pg_dump is {} — the version-gate test needs one older than 17",
             pg_dump.version.raw
         );
         return;

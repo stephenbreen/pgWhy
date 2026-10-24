@@ -1,4 +1,4 @@
-// Always-visible status bar (R2). The connection manager (U7) supplies the active connection
+// Always-visible status bar. The connection manager supplies the active connection
 // and its environment tag; until then it reports that nothing is connected.
 
 import type { ReactNode } from "react";

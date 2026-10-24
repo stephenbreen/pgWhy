@@ -364,7 +364,7 @@ impl<'a> Scanner<'a> {
 // Classification
 // ---------------------------------------------------------------------------------------------
 
-/// An explicit transaction-control statement (tracked for R19; refused in R22 scripts).
+/// An explicit transaction-control statement (tracked for the transaction indicator; refused in post-restore scripts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum TxnControl {
@@ -672,8 +672,8 @@ pub fn classify(stmt: &str) -> StatementInfo {
     info
 }
 
-/// R22 checks over a whole script, for U14 (workbench warning), U15 (preflight) and U16
-/// (attach-time refusal). Indices refer to `statements`.
+/// Post-restore script checks over a whole script, for the workbench warning, preflight and
+/// the attach-time refusal. Indices refer to `statements`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScriptAnalysis {
     pub statements: Vec<StatementRange>,

@@ -1,4 +1,4 @@
-//! The Refresh run state machine (SM-1) and the engine API the app wires to.
+//! The Refresh run state machine and the engine API the app wires to.
 //!
 //! Flow: [`Engine::preflight`] runs the gate sequence and parks a *ticket* (resolved plan +
 //! run lock) → the UI shows the single confirmation → [`Engine::start`] spawns the run on a
@@ -38,7 +38,7 @@ pub struct EngineConfig {
     pub runs_dir: PathBuf,
     /// Backups go to `<backup_root>/<workflow-id>/`.
     pub backup_root: PathBuf,
-    /// Backups kept per workflow besides those protected for retry (R21; app setting).
+    /// Backups kept per workflow besides those protected for retry (an app setting).
     pub retention_keep: usize,
     /// How long the swap waits for sessions to end (terminate + poll) before failing
     /// retryably with the blocking sessions named.
@@ -288,7 +288,7 @@ impl Engine {
 
     /// Prepare a retry of a failed/cancelled/interrupted run from `from` (retry matrix): the
     /// prerequisites (backup + verdict, staging state, live reachability) are validated and the
-    /// full gate sequence re-runs (fresh credentials, R18 re-check, current script content).
+    /// full gate sequence re-runs (fresh credentials, environment-tag re-check, current script content).
     /// Confirm with [`start`](Self::start) like any run.
     pub async fn retry(
         &self,

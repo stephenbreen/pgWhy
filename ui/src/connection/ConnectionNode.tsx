@@ -1,6 +1,6 @@
 // One connection entry as a tree root row: tag colour bar, name, live status badge, and an
 // inline (non-modal) password prompt when the server asks for credentials. The object tree
-// (U9) renders these as its root nodes and hangs databases under connected ones.
+// renders these as its root nodes and hangs databases under connected ones.
 
 import { useState, type ReactNode } from "react";
 import { trustHostKey, type ConnectionEntry, type HostKeyPrompt, type TunnelStatus } from "../lib/ipc/connections";

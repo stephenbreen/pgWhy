@@ -3,7 +3,7 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "//": "Golden-flow e2e (plan U17): WebdriverIO + @wdio/tauri-service (embedded driver, macOS-capable) against the real app and a containerized Postgres.",
+  "//": "Golden-flow e2e: WebdriverIO + @wdio/tauri-service (embedded driver, macOS-capable) against the real app and a containerized Postgres.",
   "scripts": {
     "build:app": "cd .. && npx tauri build --debug --no-bundle --features e2e --config src-tauri/tauri.e2e.conf.json",
     "test": "wdio run ./wdio.conf.ts"

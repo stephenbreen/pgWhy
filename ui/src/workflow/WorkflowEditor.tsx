@@ -1,6 +1,6 @@
-// Refresh workflow editor (U16): source and target pickers with env tags, the post-restore
-// script from the library, and the options. Saving enforces the R18 target gate (AE7) and
-// the R22 script checks; both are re-checked at run time.
+// Refresh workflow editor: source and target pickers with env tags, the post-restore
+// script from the library, and the options. Saving enforces the target environment-tag gate
+// and the post-restore script checks; both are re-checked at run time.
 
 import { useEffect, useState, type FormEvent } from "react";
 import { useWorkspace, type Tab } from "../app/workspace";

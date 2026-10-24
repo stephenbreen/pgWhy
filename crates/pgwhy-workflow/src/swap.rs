@@ -1,4 +1,4 @@
-//! Swap sub-steps (SM-4) and the recovery actions that finish or undo an interrupted swap.
+//! Swap sub-steps and the recovery actions that finish or undo an interrupted swap.
 //!
 //! Staging-then-swap: quiesce pgWhy's own connections to target + staging (+ `_old`) →
 //! refuse on prepared transactions / an occupied `_old` name → terminate sessions on target
@@ -7,7 +7,7 @@
 //! its original comment, rename target→`_old` → persist `renames_completed = 1` → rename
 //! staging→target → persist 2 → clear the marker → drop `_old` (marker-verified; a failure is
 //! success-with-cleanup). Renames retry through "being accessed by other users" by
-//! re-terminating until the deadline (reconnecting clients race the rename, EC-7). Cancel is
+//! re-terminating until the deadline (reconnecting clients race the rename). Cancel is
 //! refused from the first rename until the second completes.
 //!
 //! Create-mode: quiesce, drain staging only, rename staging→target, then persist 2.

@@ -1,4 +1,4 @@
-//! Backup retention (R21): keep the newest K backups in a folder (default 3) plus every
+//! Backup retention: keep the newest K backups in a folder (default 3) plus every
 //! backup in the caller's protected set (backups referenced by retryable failed runs —
 //! computed by the workflow layer). Protected backups never count against K and are never
 //! deleted. The planner is pure; [`apply_retention`] does the filesystem work.

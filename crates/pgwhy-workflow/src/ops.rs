@@ -45,8 +45,8 @@ pub struct Resume {
     pub drop_before_create: Vec<String>,
 }
 
-/// Everything a run needs, resolved by preflight before the confirmation (EC-10): entries
-/// and tags snapshotted at run start (SM-13), tools, names, locale, the script snapshot and
+/// Everything a run needs, resolved by preflight before the confirmation: entries
+/// and tags snapshotted at run start, tools, names, locale, the script snapshot and
 /// credentials — held in memory only for the run.
 #[derive(Debug, Clone)]
 pub struct RunPlan {
@@ -152,7 +152,7 @@ impl RunPlan {
     }
 }
 
-/// Live progress of one step (R12: step / object ~x of ~y / bytes / elapsed — no percentage).
+/// Live progress of one step (step / object ~x of ~y / bytes / elapsed — no percentage).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StepProgress {
     #[serde(default, skip_serializing_if = "Option::is_none")]

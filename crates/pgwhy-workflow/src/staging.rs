@@ -8,7 +8,7 @@
 //!   original comment so a rollback is self-describing). Nothing that merely *matches* the
 //!   naming pattern is ever dropped: an unmarked database "may be a real database".
 //! - Locale: staging is created `TEMPLATE template0` with the encoding / collation / ctype /
-//!   provider read from the live source catalog (plan RV-3), in version-appropriate syntax.
+//!   provider read from the live source catalog, in version-appropriate syntax.
 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};

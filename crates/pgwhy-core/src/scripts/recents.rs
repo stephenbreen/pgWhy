@@ -1,4 +1,4 @@
-//! Recently used scripts (R9, AE3).
+//! Recently used scripts.
 //!
 //! Tracked automatically on open/save/run, most recent first, capped at
 //! [`MAX_RECENT_SCRIPTS`]. Each entry remembers the connection and database it last *ran*
@@ -63,7 +63,7 @@ pub struct RecentUse {
     pub database: Option<String>,
 }
 
-/// EC-8 availability of a recent.
+/// Availability of a recent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecentState {

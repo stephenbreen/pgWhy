@@ -23,7 +23,7 @@ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::path::Path;
 use std::sync::Arc;
 
-/// What a live connection's transport actually turned out to be (R2 badge).
+/// What a live connection's transport actually turned out to be (the TLS badge).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsState {

@@ -1,4 +1,4 @@
-//! Statement splitter and classifier (U18, EC-17): naive `;` splitting corrupts function bodies.
+//! Statement splitter and classifier: naive `;` splitting corrupts function bodies.
 
 use pgwhy_core::query::splitter::{
     analyze, analyze_with, classify, split, split_range, split_range_with, split_with,

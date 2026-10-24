@@ -1,4 +1,4 @@
-//! Top-N grid + editable layer (R6, R16, AE4): each grid owns a dedicated connection; sort
+//! Top-N grid + editable layer: each grid owns a dedicated connection; sort
 //! and filter re-query the server; edits stay pending in the core-side result set until a
 //! single-transaction, row-count-verified commit.
 

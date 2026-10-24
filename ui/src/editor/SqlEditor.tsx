@@ -1,4 +1,4 @@
-// CodeMirror 6 SQL editor (R7): PostgreSQL dialect highlighting, keyword + object-name
+// CodeMirror 6 SQL editor: PostgreSQL dialect highlighting, keyword + object-name
 // completion, SSMS key bindings (F5 / Ctrl+Enter run the selection, or the whole buffer when
 // nothing is selected), and error decoration at the server-reported location.
 

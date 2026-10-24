@@ -1,4 +1,4 @@
-//! Result buffers (U12): columnar text storage, the binary window protocol, pending grid
+//! Result buffers: columnar text storage, the binary window protocol, pending grid
 //! edits, TSV copy, CSV/JSON export, and the per-owner retention registry.
 //!
 //! Rows never leave the core as JSON. A [`ResultSet`] keeps every column as one UTF-8 blob
@@ -7,7 +7,7 @@
 //! [`ResultSet::encode_window`] in exactly the layout `ui/src/grid/protocol.ts` decodes.
 //! Windows are pull-based, so the core queue is bounded by construction whatever the UI does.
 //!
-//! Pending grid edits (U13) live here too, as an overlay on the immutable buffer, so the
+//! Pending grid edits live here too, as an overlay on the immutable buffer, so the
 //! grid, copy, export, the SQL preview and the commit all read one truth: the buffer keeps
 //! the *original* values (which the commit needs for its `WHERE` clauses) and every reader
 //! renders the overlay on top.
@@ -28,7 +28,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
-/// Rows a single result set retains before it is flagged `truncated` (plan EC-18).
+/// Rows a single result set retains before it is flagged `truncated`.
 pub const DEFAULT_ROW_CAP: usize = 1_000_000;
 
 /// Bytes a single result set retains before it is flagged `truncated`. A row cap alone does

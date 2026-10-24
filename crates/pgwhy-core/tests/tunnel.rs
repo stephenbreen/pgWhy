@@ -1,4 +1,4 @@
-//! SSH tunnel integration tests (U5): an sshd container and a Postgres container share a
+//! SSH tunnel integration tests: an sshd container and a Postgres container share a
 //! private Docker network, and Postgres publishes no port — so every successful query here
 //! went through the tunnel.
 

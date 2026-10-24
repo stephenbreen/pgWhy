@@ -1,4 +1,4 @@
-// Details dock (R4, AE1): columns with types/nullability/defaults, keys, indexes, size and
+// Details dock: columns with types/nullability/defaults, keys, indexes, size and
 // stats for the selected table — never a dialog. Always serves cached data with an explicit
 // refresh; tells you when the object no longer exists.
 

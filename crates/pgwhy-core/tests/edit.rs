@@ -1,4 +1,4 @@
-//! Top-N grid + edit commit engine integration tests against containerized Postgres (U13).
+//! Top-N grid + edit commit engine integration tests against containerized Postgres.
 
 mod harness;
 
@@ -155,7 +155,7 @@ async fn top_n_edit_commit_end_to_end() {
     let check = env.conn().await;
     let opts = CommitOptions::default();
 
-    // ---- AE4: top-100 of a PK table, two cell edits + one delete, atomic commit
+    // ---- top-100 of a PK table, two cell edits + one delete, atomic commit
     let mut req = env.request("public", "items", DEFAULT_TOP_N).await;
     req.sort = vec![SortKey {
         column: "id".into(),

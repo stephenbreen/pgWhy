@@ -1,4 +1,4 @@
-// The Refresh run view (R13, R14, AE2, AE6): preflight checks and the ONE confirmation up
+// The Refresh run view: preflight checks and the ONE confirmation up
 // front (naming the exact target, server and strategy), then a docked, non-blocking live
 // view with per-step progress, then a state-aware report. Retry and recovery actions come
 // from the engine's offers — the UI never invents one.
@@ -260,7 +260,7 @@ export function RunTab({ tab }: { tab: Tab }) {
       else if (ev.event === "run_started" || ev.event === "run_finished") {
         setPhase({ kind: "run", runId: ev.run_id, record: ev.record });
         if (ev.event === "run_finished" && (ev.status === "succeeded" || ev.status === "succeeded_cleanup_required")) {
-          // EC-1: the explorer re-reads the replaced database
+          // the explorer re-reads the replaced database
           useTrees.getState().invalidate(ev.record.target.connection_id, ev.record.target.database);
         }
       } else {

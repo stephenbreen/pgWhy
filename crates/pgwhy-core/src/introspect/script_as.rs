@@ -1,4 +1,4 @@
-//! Script-as (R5): SELECT / INSERT / UPDATE / DELETE templates generated from the cached
+//! Script-as: SELECT / INSERT / UPDATE / DELETE templates generated from the cached
 //! model. CREATE DDL is not generated here — it comes from `pg_dump -s -t` (version-matched,
 //! correct for every object feature) via pgwhy-pgtools.
 //!

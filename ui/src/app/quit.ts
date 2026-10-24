@@ -1,4 +1,4 @@
-// Quit flow (R19): the native close is intercepted; every tab with an open transaction asks
+// Quit flow: the native close is intercepted; every tab with an open transaction asks
 // (commit / roll back / keep open) before the app exits.
 
 import { invoke } from "@tauri-apps/api/core";

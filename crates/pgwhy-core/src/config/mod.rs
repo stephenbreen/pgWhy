@@ -36,7 +36,7 @@ impl fmt::Display for ConnectionId {
     }
 }
 
-/// Environment tag (R18). Untagged connections are treated as Production.
+/// Environment tag. Untagged connections are treated as Production.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvTag {
@@ -69,7 +69,7 @@ impl EnvTag {
 pub enum SslMode {
     Disable,
     /// Try TLS without verifying the certificate; fall back to plaintext if the server
-    /// doesn't offer TLS. The resulting state is always surfaced (R2 badge).
+    /// doesn't offer TLS. The resulting state is always surfaced (the TLS badge).
     #[default]
     Prefer,
     /// TLS required, certificate not verified. Never falls back.
@@ -134,7 +134,7 @@ fn default_maintenance_db() -> String {
     "postgres".into()
 }
 
-/// A saved connection (R1). The host is always the *real* server hostname — the one TLS
+/// A saved connection. The host is always the *real* server hostname — the one TLS
 /// verifies and pgpass matches — even when the socket goes through a tunnel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionEntry {
@@ -203,9 +203,9 @@ impl fmt::Display for ServerKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
-    /// Rows shown by "View top N rows" (R6).
+    /// Rows shown by "View top N rows".
     pub top_n: u32,
-    /// Backups kept per workflow/connection (R21).
+    /// Backups kept per workflow/connection.
     pub backup_retention: u32,
     /// Root folder for backups. None = `<data dir>/backups`.
     pub backup_dir: Option<PathBuf>,

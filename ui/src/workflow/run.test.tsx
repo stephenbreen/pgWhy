@@ -109,7 +109,7 @@ describe("refresh run view", () => {
     expect(screen.getByRole("button", { name: "Roll back prepared transaction tx1" })).toBeInTheDocument();
   });
 
-  it("prompts for a missing SSH passphrase before the confirmation can run (EC-10)", async () => {
+  it("prompts for a missing SSH passphrase before the confirmation can run", async () => {
     const user = userEvent.setup();
     const { calls } = backend({ ticket: "t1", checks: [], confirmation: conf() as PreflightReport["confirmation"], missing_secrets: [] }, { secretFirst: true });
     render(<App />);

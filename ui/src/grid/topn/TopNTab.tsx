@@ -1,4 +1,4 @@
-// "View top N rows" (R6, R16, AE4, F4): one action from the tree. Sorting and filtering
+// "View top N rows": one action from the tree. Sorting and filtering
 // re-query the server (the whole table, not the loaded rows). Edits stay pending — marked in
 // the grid, previewable as SQL — until committed as one transaction, or discarded.
 

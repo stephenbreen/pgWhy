@@ -1,4 +1,4 @@
-// Built-in explorer actions: New query, Script as (R5), Refresh.
+// Built-in explorer actions: New query, Script as, Refresh.
 
 import { openEditorTab } from "../editor/EditorTab";
 import * as ex from "../lib/ipc/explorer";

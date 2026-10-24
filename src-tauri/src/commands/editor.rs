@@ -1,4 +1,4 @@
-//! Editor tab commands (R2, R7, R19): one dedicated connection + query session per tab,
+//! Editor tab commands: one dedicated connection + query session per tab,
 //! never silently reconnected; runs stream statement events over a Channel while rows go to
 //! core-side result buffers the grid pulls windows from.
 
@@ -145,7 +145,7 @@ pub fn editor_txn_state(state: State<'_, AppState>, tab_id: String) -> AppResult
 }
 
 /// Close a tab's session; `txn` says what to do with an open transaction ("commit" /
-/// "rollback"). Closing with an open transaction and no instruction is refused (R19). A run in
+/// "rollback"). Closing with an open transaction and no instruction is refused. A run in
 /// flight is cancelled first, and whatever it still produces is released when it ends.
 #[tauri::command]
 pub async fn editor_close(

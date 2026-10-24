@@ -248,7 +248,7 @@ async fn editor_run_results_and_grid_edit_round_trip_over_ipc() {
         invoke(&app, "editor_txn_state", json!({ "tabId": "t1" })).unwrap(),
         "in_transaction"
     );
-    // closing with an open transaction needs an explicit choice (R19)
+    // closing with an open transaction needs an explicit choice
     let refused = invoke(&app, "editor_close", json!({ "tabId": "t1", "txn": null })).unwrap_err();
     assert_eq!(refused["kind"], "refused");
     invoke(
@@ -386,7 +386,7 @@ async fn closing_a_tab_mid_run_cancels_the_query_and_releases_its_results() {
     assert_eq!(sleeping, 0, "the server-side query was cancelled");
 }
 
-/// F1 through the command layer: save a workflow (with a library post-restore script),
+/// A Refresh run through the command layer: save a workflow (with a library post-restore script),
 /// preflight, confirm, run, and find the refreshed target in place.
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_workflow_round_trip_over_ipc() {
@@ -434,7 +434,7 @@ async fn refresh_workflow_round_trip_over_ipc() {
     let script = invoke(&app, "script_save", json!({ "path": "post/anonymize", "content": "update customers set email = 'user' || id || '@example.test';" })).unwrap();
     let script_id = script["info"]["id"].as_str().unwrap().to_string();
 
-    // a Production target is refused at save time (AE7)
+    // a Production target is refused at save time
     let bad = json!({
         "id": "w-bad", "name": "bad", "source": {"connection": "c-local", "database": harness::PG_DB},
         "target": {"connection": "c-remote", "database": harness::PG_DB}, "options": {}, "has_succeeded": false

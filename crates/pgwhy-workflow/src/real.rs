@@ -32,7 +32,7 @@ pub struct LoadedScript {
     pub sha256: String,
 }
 
-/// Where scripts come from (U14's library, behind whatever lock the app uses).
+/// Where scripts come from (the script library, behind whatever lock the app uses).
 pub trait ScriptSource: Send + Sync {
     fn load(&self, id: &str) -> AppResult<LoadedScript>;
 }

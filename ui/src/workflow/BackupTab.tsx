@@ -1,4 +1,4 @@
-// Standalone backup run view (R12 / EC-20): a docked, non-blocking tab with live progress.
+// Standalone backup run view: a docked, non-blocking tab with live progress.
 
 import { useState } from "react";
 import { useWorkspace, type Tab } from "../app/workspace";

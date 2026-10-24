@@ -1,4 +1,4 @@
-// Windowed row cache: holds only the visible window plus a prefetch margin (U2 decision),
+// Windowed row cache: holds only the visible window plus a prefetch margin,
 // chunk-aligned, with a bounded number of in-flight window requests.
 
 import type { Chunk } from "./protocol";

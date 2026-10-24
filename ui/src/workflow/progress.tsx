@@ -1,4 +1,4 @@
-// Shared progress readout for pg_dump/pg_restore steps (R12): step, current object, objects
+// Shared progress readout for pg_dump/pg_restore steps: step, current object, objects
 // done of total ("~" when the total is an estimate), bytes written, elapsed. No percentage —
 // the tools don't report a reliable one.
 

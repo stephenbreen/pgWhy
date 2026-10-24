@@ -1,4 +1,4 @@
-//! Connection manager commands (R1, R2, R18).
+//! Connection manager commands.
 //!
 //! Credential flow is one-way: secrets arrive in `SecretInput`s and go straight to the vault;
 //! no response ever carries one back (entries only say whether one is saved).
@@ -32,7 +32,7 @@ pub struct ConnectionsSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct SaveResult {
     pub entry: ConnectionEntry,
-    /// e.g. another entry points at the same server+database with a different env tag (RV-6)
+    /// e.g. another entry points at the same server+database with a different env tag
     pub warnings: Vec<String>,
     /// where the password went, if one was set
     pub password_stored: Option<pgwhy_core::secret::CredentialSource>,

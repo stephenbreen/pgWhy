@@ -1,4 +1,4 @@
-// Scripts sidebar (R9, R10): recents one click away, and the searchable on-disk library
+// Scripts sidebar: recents one click away, and the searchable on-disk library
 // grouped by folder with tags. Rescans when the window regains focus so external edits,
 // renames and git operations show up. "Open…" brings in a .sql / .txt / .md file from
 // anywhere on disk; its tab offers "Add to library" to keep it for later.

@@ -1,4 +1,4 @@
-// The explorer's root level: saved connections by group, recents one action away (R1).
+// The explorer's root level: saved connections by group, recents one action away.
 
 import { useState, type ReactNode } from "react";
 import type { ConnectionEntry } from "../lib/ipc/connections";

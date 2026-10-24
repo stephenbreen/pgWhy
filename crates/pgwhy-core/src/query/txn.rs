@@ -1,4 +1,4 @@
-//! Transaction-state tracking for one connection (R19).
+//! Transaction-state tracking for one connection.
 //!
 //! tokio-postgres swallows the `ReadyForQuery` status byte (libpq's `PQtransactionStatus`), so
 //! the state is *derived*: every statement on the connection goes through the executor, which

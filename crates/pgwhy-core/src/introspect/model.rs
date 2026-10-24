@@ -430,7 +430,7 @@ impl EditKey {
     }
 }
 
-/// Whether (and how) rows of a relation can be edited in the grid (plan R16 / EC-4).
+/// Whether (and how) rows of a relation can be edited in the grid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditProvenance {
     pub key: Option<EditKey>,

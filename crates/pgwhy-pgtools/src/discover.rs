@@ -149,7 +149,7 @@ impl ToolRegistry {
         self.tools.iter().filter(move |t| t.kind == kind)
     }
 
-    /// Selection rule (R15): major ≥ `min_major`; prefer an exact major match (newest minor),
+    /// Selection rule: major ≥ `min_major`; prefer an exact major match (newest minor),
     /// else the highest compatible version.
     pub fn select(&self, kind: ToolKind, min_major: u32) -> Option<&DiscoveredTool> {
         let compatible = || self.of_kind(kind).filter(|t| t.version.major >= min_major);

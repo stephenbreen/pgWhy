@@ -86,7 +86,7 @@ async function editCell(user: ReturnType<typeof userEvent.setup>, text: string, 
 }
 
 describe("top-N grid", () => {
-  it("AE4: two edits + one delete are pending, previewable, and commit atomically", async () => {
+  it("two edits + one delete are pending, previewable, and commit atomically", async () => {
     const user = userEvent.setup();
     const calls = backend();
     await openPeople();

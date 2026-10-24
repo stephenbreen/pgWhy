@@ -1,4 +1,4 @@
-// Typed wrappers over src-tauri/src/commands/runs.rs (Refresh workflow runs, U15/U16).
+// Typed wrappers over src-tauri/src/commands/runs.rs (Refresh workflow runs).
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";

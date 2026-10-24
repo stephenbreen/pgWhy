@@ -1,4 +1,4 @@
-//! Introspection (U8): batched pg_catalog pulls, per-database catalog cache, expansion state.
+//! Introspection: batched pg_catalog pulls, per-database catalog cache, expansion state.
 //!
 //! - [`Introspector`] — the service the tree, details panel, completion, Script-as and the
 //!   grid's edit layer are built against. One round trip per schema expansion; details are

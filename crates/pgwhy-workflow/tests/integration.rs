@@ -1,7 +1,7 @@
 //! End-to-end Refresh runs against two containerized Postgres 16 servers ("remote" source and
-//! "local" target) with the machine's real pg client tools: AE2 happy path + restore failure
-//! and retry, create-mode, drop-first, swap closing pgWhy's own and external sessions (AE6
-//! engine side), preflight refusals (prepared xacts, R18 re-check, COMMIT in the script, run
+//! "local" target) with the machine's real pg client tools: the happy path + restore failure
+//! and retry, create-mode, drop-first, swap closing pgWhy's own and external sessions,
+//! preflight refusals (prepared xacts, environment-tag re-check, COMMIT in the script, run
 //! lock), and a kill between the swap's renames recovered by rollback. History is scanned for
 //! the password. Skips with a NOTICE without Docker or pg tools ≥ 16.
 
@@ -274,9 +274,9 @@ fn check<'a>(r: &'a PreflightReport, id: &str) -> &'a PreflightCheck {
 
 // ---------------------------------------------------------------------------------- tests
 
-/// AE2 happy path + AE6 engine side + no credential in history.
+/// Happy path, sessions closed at the swap, and no credential in history.
 #[tokio::test]
-async fn ae2_staging_swap_with_script_closes_sessions() {
+async fn staging_swap_with_script_closes_sessions() {
     let Some(env) = env().await else { return };
     let wf = env.workflow(
         "shop",
@@ -341,7 +341,7 @@ async fn ae2_staging_swap_with_script_closes_sessions() {
     let comment = strings(&env.local, "postgres", "select coalesce(shobj_description(oid, 'pg_database'), '') from pg_database where datname = 'shop'").await;
     assert_eq!(comment, vec![String::new()]);
 
-    // AE6: pgWhy's own tab closed client-side, the external session terminated
+    // pgWhy's own tab closed client-side, the external session terminated
     assert!(tab.is_closed());
     assert!(external.simple_query("select 1").await.is_err());
 
@@ -390,7 +390,7 @@ async fn ae2_staging_swap_with_script_closes_sessions() {
         .discard_preflight(again.ticket.as_deref().unwrap());
 }
 
-/// AE2 failure half: a failing object → target untouched, report names it; fix, then retry
+/// A failing object → target untouched, report names it; fix, then retry
 /// from restore reusing the validated backup.
 #[tokio::test]
 async fn restore_failure_then_retry_from_restore() {
@@ -587,7 +587,7 @@ async fn preflight_refusals_are_actionable_and_harmless() {
     env.engine
         .discard_preflight(report.ticket.as_deref().unwrap());
 
-    // the target re-tagged Production outside the workflow editor → R18 re-check refuses
+    // the target re-tagged Production outside the workflow editor → the environment-tag re-check refuses
     let mut prod = env.tgt.clone();
     prod.env_tag = EnvTag::Production;
     env.manager.upsert_entry(prod).await;

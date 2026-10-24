@@ -1,4 +1,4 @@
-// Golden flow (F2/F3/F4): create a connection, browse to a table's columns, run a query,
+// Golden flow: create a connection, browse to a table's columns, run a query,
 // view and edit top rows — all through the real UI against a real Postgres.
 
 import { browser, $, expect } from "@wdio/globals";
@@ -26,7 +26,7 @@ describe("pgWhy golden flow", () => {
     await expect($("aria/public.customers")).toBeDisplayed({ wait: 20_000 });
   });
 
-  it("shows a table's columns and types in one click (AE1)", async () => {
+  it("shows a table's columns and types in one click", async () => {
     const node = await $("aria/public.customers");
     await node.$(".twisty").click();
     await expect($("aria/email text")).toBeDisplayed();

@@ -4,8 +4,8 @@
 //! truncate, drop object — goes through this module, so the rules live in one place and are
 //! tested once:
 //!
-//! 1. [`check_target`]: the connection's environment tag must allow destruction (Local or Dev,
-//!    R18). Untagged connections are Production, so they are refused by default.
+//! 1. [`check_target`]: the connection's environment tag must allow destruction (Local or Dev).
+//!    Untagged connections are Production, so they are refused by default.
 //! 2. [`require_typed_name`]: the user must have typed the exact database name. Verified here,
 //!    server-side, so no UI bug can skip it — this is the confirmation that cannot be clicked
 //!    through by accident.
@@ -61,7 +61,7 @@ impl DestructiveContext {
     }
 }
 
-/// Refuse to destroy anything on a connection that is not tagged Local or Dev (R18).
+/// Refuse to destroy anything on a connection that is not tagged Local or Dev.
 ///
 /// There is deliberately no override: the tag is a property of the connection the user saved, not
 /// a checkbox at confirmation time.

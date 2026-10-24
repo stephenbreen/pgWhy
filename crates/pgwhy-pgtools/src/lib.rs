@@ -6,13 +6,13 @@
 //!
 //! 1. [`discover::discover`] once (cheap enough to repeat on a "rescan" click) → [`ToolRegistry`]
 //! 2. [`gates::require_pg_dump`] with the source server's major → the version-matched tool, or
-//!    an actionable refusal (AE5) before anything starts
+//!    an actionable refusal before anything starts
 //! 3. [`ops::backup`] with a [`RunContext`] (pgpass dir + cancel handle) and a progress callback
 //! 4. [`toc::inspect_archive`] to record the dump version + reusability verdict
 //! 5. [`retention::apply_retention`] with the workflow layer's protected set
 //!
 //! Credentials reach children only through a per-run temp `PGPASSFILE` ([`pgpass`]); argv and
-//! the child environment never carry a password (R20, AE8).
+//! the child environment never carry a password.
 
 pub mod discover;
 pub mod endpoint;

@@ -1,4 +1,4 @@
-// Opening scripts into editor tabs with the right connection binding (R9, R11, AE3):
+// Opening scripts into editor tabs with the right connection binding:
 // recents restore the connection they last ran against; library scripts bind to the active
 // connection. The editor shows the binding before anything runs and lets it be switched.
 // Plain-text and Markdown notes (.txt / .md) open in a text tab, which needs no connection.

@@ -1,4 +1,4 @@
-//! EC-8 file states for open editor buffers, and plain read/write of script files that may
+//! File states for open editor buffers, and plain read/write of script files that may
 //! live outside the library.
 //!
 //! The editor remembers the [`FileFingerprint`] of what it loaded (or last saved). On focus it
