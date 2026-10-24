@@ -28,16 +28,17 @@ impl PgFixture {
     }
 }
 
+/// Docker must be up and running Linux containers: the Windows runners have a daemon in
+/// Windows-container mode, which cannot pull the Postgres images.
 fn docker_available() -> bool {
     if std::env::var("PGWHY_SKIP_DOCKER").is_ok_and(|v| v == "1") {
         return false;
     }
     std::process::Command::new("docker")
-        .arg("info")
-        .stdout(std::process::Stdio::null())
+        .args(["info", "--format", "{{.OSType}}"])
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "linux")
 }
 
 pub async fn pg(major: u32) -> Option<PgFixture> {
