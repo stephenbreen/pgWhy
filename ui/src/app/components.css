@@ -113,11 +113,22 @@ button:disabled { opacity: 0.55; }
   position: relative; display: flex; flex-direction: column; justify-content: center; padding: 0 6px; flex: none;
   border-right: 1px solid var(--border); overflow: hidden; white-space: nowrap;
 }
-.grid-col-header[data-sortable] { cursor: pointer; }
+.grid-col-header { cursor: default; }
+.grid-col-header[data-sortable] { padding-right: 22px; }
 .grid-col-header .col-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
 .grid-col-header .col-type { color: var(--fg-muted); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; }
 .sort-mark { position: absolute; right: 8px; top: 4px; font-size: 9px; color: var(--accent); }
-.col-resizer { position: absolute; right: -3px; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 1; }
+/* sort is its own button: faint until the header is hovered, solid while it's the sort column */
+button.sort-button {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%); width: 16px; height: 18px;
+  font-size: 10px; cursor: pointer; opacity: 0;
+}
+.grid-col-header:hover button.sort-button, button.sort-button:focus-visible { opacity: 0.8; }
+.grid-col-header[data-sorted] button.sort-button { opacity: 1; color: var(--accent); }
+button.sort-button:hover { opacity: 1; }
+/* the resize grip sits inside the header (it clips overflow), with a line on hover */
+.col-resizer { position: absolute; right: 0; top: 0; bottom: 0; width: 7px; cursor: col-resize; z-index: 1; }
+.col-resizer:hover { box-shadow: inset -2px 0 0 var(--accent); }
 .grid-gutter {
   flex: none; width: 56px; padding: 0 6px; text-align: right; color: var(--fg-muted); background: var(--bg-sunken);
   border-right: 1px solid var(--border); position: sticky; left: 0; z-index: 1; font-variant-numeric: tabular-nums;
@@ -233,8 +244,8 @@ button:disabled { opacity: 0.55; }
 .goto li[aria-selected="true"] { background: var(--bg-selected); }
 
 /* details dock */
-.shell[data-details="open"] { grid-template-columns: 44px 300px 1fr 340px; grid-template-areas: "activity sidebar main details" "status status status status"; }
-.details-dock { grid-area: details; display: flex; flex-direction: column; min-width: 0; min-height: 0; border-left: 1px solid var(--border); background: var(--bg-raised); }
+.shell[data-details="open"] { grid-template-columns: 44px min(var(--sidebar-w, 300px), 40vw) minmax(0, 1fr) min(var(--details-w, 340px), 40vw); grid-template-areas: "activity sidebar main details" "status status status status"; }
+.details-dock { grid-area: details; position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; border-left: 1px solid var(--border); background: var(--bg-raised); }
 .details-dock .pane-header { text-transform: none; letter-spacing: 0; gap: 4px; }
 .details-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs); color: var(--fg); }
 .pane-header .spacer { flex: 1; }

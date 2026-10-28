@@ -23,6 +23,8 @@ function fakeSource(rows: (string | null)[][], ncols: number) {
 beforeAll(() => {
   Object.defineProperty(HTMLElement.prototype, "offsetHeight", { configurable: true, get: () => 600 });
   Object.defineProperty(HTMLElement.prototype, "offsetWidth", { configurable: true, get: () => 1000 });
+  // no canvas in jsdom: column fitting falls back to its per-character estimate
+  HTMLCanvasElement.prototype.getContext = () => null;
 });
 
 describe("window protocol", () => {
@@ -122,14 +124,54 @@ describe("result grid", () => {
     expect(onEdit).toHaveBeenCalledWith(2, 1, "renamed");
   });
 
-  it("sort headers report clicks and show direction", async () => {
+  it("sorts from the header's sort button and shows direction; a header click selects the column", async () => {
     const user = userEvent.setup();
     const onSort = vi.fn();
     const { store } = fakeSource(rows, 3);
     render(<ResultGrid columns={cols} store={store} rowCount={rows.length} onSort={onSort} sort={{ column: 1, dir: "desc" }} />);
     expect(screen.getByRole("columnheader", { name: /name/ })).toHaveAttribute("aria-sort", "descending");
-    await user.click(screen.getByRole("columnheader", { name: /^id/ }));
+    await user.click(screen.getByRole("button", { name: "Sort by id" }));
     expect(onSort).toHaveBeenCalledWith(0);
+
+    onSort.mockClear();
+    await screen.findByText("name 1");
+    await user.click(screen.getByRole("columnheader", { name: /^id/ }));
+    expect(onSort).not.toHaveBeenCalled();
+    const row1 = screen.getByText("name 1").closest('[role="row"]') as HTMLElement;
+    const cells = within(row1).getAllByRole("gridcell");
+    expect(cells[0]).toHaveAttribute("aria-selected", "true");
+    expect(cells[1]).not.toHaveAttribute("aria-selected");
+  });
+
+  it("resizing a column never sorts it; double-clicking the grip fits the column to its values", async () => {
+    const onSort = vi.fn();
+    const { store } = fakeSource(rows, 3);
+    render(<ResultGrid columns={cols} store={store} rowCount={rows.length} onSort={onSort} />);
+    await screen.findByText("name 1");
+    const header = screen.getByRole("columnheader", { name: /^name/ });
+    const grip = header.querySelector(".col-resizer")!;
+    const w0 = parseFloat(header.style.width);
+
+    // drag, releasing over the header itself: the browser follows with a click on it
+    fireEvent.mouseDown(grip, { clientX: 100 });
+    fireEvent.mouseMove(window, { clientX: 160 });
+    fireEvent.mouseUp(window, { clientX: 160 });
+    fireEvent.click(header);
+    expect(parseFloat(header.style.width)).toBe(w0 + 60);
+    expect(onSort).not.toHaveBeenCalled();
+
+    // a click on the grip without moving doesn't sort either
+    fireEvent.mouseDown(grip, { clientX: 100 });
+    fireEvent.mouseUp(window, { clientX: 100 });
+    fireEvent.click(grip);
+    expect(onSort).not.toHaveBeenCalled();
+
+    fireEvent.doubleClick(grip);
+    // the widest loaded value is "name 300"; it fits within the default, so the column shrinks to it
+    const fitted = parseFloat(header.style.width);
+    expect(fitted).toBeGreaterThan("name 300".length * 7);
+    expect(fitted).toBeLessThan(w0 + 60);
+    expect(onSort).not.toHaveBeenCalled();
   });
 
   it("tsv quoting", () => {

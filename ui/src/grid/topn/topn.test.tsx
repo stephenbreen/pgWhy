@@ -121,11 +121,11 @@ describe("top-N grid", () => {
     const user = userEvent.setup();
     const calls = backend();
     await openPeople();
-    await user.click(screen.getByRole("columnheader", { name: /name/ }));
+    await user.click(screen.getByRole("button", { name: "Sort by name" }));
     expect(calls.find((c) => c.cmd === "grid_requery")?.args.sort).toEqual([{ column: "name", dir: "asc" }]);
 
     await editCell(user, "ada", "ADA");
-    await user.click(screen.getByRole("columnheader", { name: /name/ }));
+    await user.click(screen.getByRole("button", { name: "Sort by name" }));
     const ask = await screen.findByRole("alert");
     expect(ask).toHaveTextContent("discards 1 pending change");
     await user.click(within(ask).getByRole("button", { name: "Keep editing" }));

@@ -1,19 +1,24 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { App } from "./App";
 import { registerView } from "./registry";
 import { useWorkspace } from "./workspace";
 import { initShortcuts } from "./shortcuts";
+import { SIDEBAR_W, useLayout } from "./layout";
 
 const initial = useWorkspace.getState();
+const initialLayout = useLayout.getState();
 
 beforeAll(() => {
   initShortcuts();
+  // jsdom has no pointer capture; the splitters take it on pointerdown
+  Object.assign(HTMLElement.prototype, { setPointerCapture() {}, releasePointerCapture() {}, hasPointerCapture: () => false });
 });
 
 beforeEach(() => {
   useWorkspace.setState(initial, true);
+  useLayout.setState(initialLayout, true);
 });
 
 describe("app shell", () => {
@@ -51,6 +56,42 @@ describe("app shell", () => {
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
     await user.keyboard("{Control>}1{/Control}");
     expect(screen.getByRole("complementary", { name: "Explorer" })).toBeInTheDocument();
+  });
+
+  it("Ctrl/⌘ =, - and 0 zoom in, out and back; the status bar shows a zoom away from 100%", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    const zoomKey = (code: string, key: string) => fireEvent.keyDown(window, { code, key, ctrlKey: true });
+    zoomKey("Equal", "=");
+    zoomKey("Equal", "+");
+    expect(useLayout.getState().zoom).toBe(1.25);
+    const status = screen.getByRole("contentinfo", { name: "Status" });
+    expect(status).toHaveTextContent("Zoom 125%");
+    zoomKey("Minus", "-");
+    expect(useLayout.getState().zoom).toBe(1.1);
+    zoomKey("Digit0", "0");
+    expect(useLayout.getState().zoom).toBe(1);
+    expect(status).not.toHaveTextContent("Zoom");
+    // clicking the readout resets too
+    zoomKey("Minus", "-");
+    await user.click(within(status).getByRole("button", { name: "Zoom 90%" }));
+    expect(useLayout.getState().zoom).toBe(1);
+  });
+
+  it("the sidebar resizes from its splitter, remembers the width, and double-click resets it", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+    const shell = container.querySelector(".shell") as HTMLElement;
+    const splitter = screen.getByRole("separator", { name: "Resize sidebar" });
+    expect(shell.style.getPropertyValue("--sidebar-w")).toBe(`${SIDEBAR_W.default}px`);
+    splitter.focus();
+    await user.keyboard("{ArrowRight}{ArrowRight}");
+    expect(shell.style.getPropertyValue("--sidebar-w")).toBe(`${SIDEBAR_W.default + 32}px`);
+    expect(JSON.parse(localStorage.getItem("pgwhy.layout")!).sidebarWidth).toBe(SIDEBAR_W.default + 32);
+    await user.keyboard("{Home}");
+    expect(splitter).toHaveAttribute("aria-valuenow", String(SIDEBAR_W.min));
+    await user.dblClick(splitter);
+    expect(shell.style.getPropertyValue("--sidebar-w")).toBe(`${SIDEBAR_W.default}px`);
   });
 
   it("opens a workflow run view as a docked tab while the explorer stays interactive", async () => {
