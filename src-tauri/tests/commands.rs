@@ -613,6 +613,144 @@ fn destructive_commands_are_refused_before_any_side_effect() {
     assert_eq!(count_files(&backups), 0, "no backup file was written");
 }
 
+/// "Save as…" only writes where a save dialog pointed, never into the folder retention prunes, and
+/// never over a file. All refused before connecting: this connection points at a closed port, so
+/// reaching the server would be a different error.
+#[test]
+fn save_as_choices_are_refused_before_connecting() {
+    use tauri::Manager;
+    let app = app();
+    save_offline(&app, "dev", "dev");
+    let state = app._app.state::<AppState>();
+    let backup = |path: &std::path::Path| {
+        invoke(
+            &app,
+            "backup_database",
+            json!({
+                "backupId": "b1", "connectionId": "dev", "database": "app",
+                "request": { "save_as": path.display().to_string() },
+                "events": "__CHANNEL__:902"
+            }),
+        )
+        .unwrap_err()
+    };
+
+    let mine = app._dirs.path().join("mine.dump");
+    assert_eq!(backup(&mine)["kind"], "refused");
+
+    let backups = app._dirs.path().join("data").join("backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    let managed = backups.join("x.dump");
+    state.grants.grant_file(&managed);
+    let e = backup(&managed);
+    assert_eq!(e["kind"], "config", "{e}");
+    assert!(e["message"].to_string().contains("backup folder"), "{e}");
+
+    std::fs::write(&mine, "keep me").unwrap();
+    state.grants.grant_file(&mine);
+    let e = backup(&mine);
+    assert_eq!(e["kind"], "config", "{e}");
+    assert!(e["message"].to_string().contains("already exists"), "{e}");
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "keep me");
+}
+
+/// A real backup to a file with no extension, the way pgAdmin names them: it lands exactly there,
+/// reads back as a restorable archive, and retention neither prunes on its behalf nor touches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn save_as_writes_the_chosen_file_and_retention_leaves_it_alone() {
+    use tauri::Manager;
+    let Some(pg) = harness::pg(16).await else {
+        return;
+    };
+    {
+        let (client, conn) = tokio_postgres::connect(&pg.conninfo(), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        client
+            .batch_execute("create table t1 (id int primary key); insert into t1 values (1)")
+            .await
+            .unwrap();
+    }
+    let app = app();
+    invoke(
+        &app,
+        "save_connection",
+        json!({ "entry": entry_json(&pg), "password": {"action":"set","value":harness::PG_PASSWORD,"persist":true}, "sshSecret": {"action":"unchanged"} }),
+    )
+    .expect("save");
+    let state = app._app.state::<AppState>();
+    state.settings.lock().unwrap().backup_retention = 1;
+
+    let backup = |save_as: Option<&std::path::Path>| {
+        invoke(
+            &app,
+            "backup_database",
+            json!({
+                "backupId": "b1", "connectionId": "c-test", "database": harness::PG_DB,
+                "request": { "save_as": save_as.map(|p| p.display().to_string()) },
+                "events": "__CHANNEL__:903"
+            }),
+        )
+        .expect("backup");
+    };
+    let folder = app
+        ._dirs
+        .path()
+        .join("data/backups/Container-c-test")
+        .join(harness::PG_DB);
+    let managed = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(&folder)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "dump"))
+            .collect()
+    };
+
+    backup(None);
+    let first = managed();
+    assert_eq!(first.len(), 1);
+
+    let desktop = app._dirs.path().join("Desktop");
+    std::fs::create_dir_all(&desktop).unwrap();
+    let chosen = desktop.join("mydb");
+    state.grants.grant_file(&chosen);
+    backup(Some(&chosen));
+
+    // only the chosen file, with no partial or log beside it, and nothing pruned on its account
+    let beside: Vec<_> = std::fs::read_dir(&desktop)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(beside, ["mydb"]);
+    assert_eq!(managed(), first);
+
+    let view = invoke(
+        &app,
+        "restore_inspect",
+        json!({ "path": chosen.display().to_string() }),
+    )
+    .expect("inspect");
+    assert_eq!(view["dbname"], harness::PG_DB);
+    assert_eq!(view["blockers"], json!([]), "{view}");
+
+    // history can restore it after the session's dialog grant is gone
+    let history = state.engine().history().list_entries().unwrap();
+    let chosen_norm = chosen.canonicalize().unwrap();
+    assert!(history
+        .iter()
+        .any(|e| e.backup.as_ref().is_some_and(|b| b.path == chosen_norm)));
+
+    // a later managed backup prunes its own folder and leaves the chosen file alone
+    backup(None);
+    let second = managed();
+    assert_eq!(second.len(), 1);
+    assert_ne!(second, first);
+    assert!(chosen.exists());
+}
+
 /// Paths from the webview must have come from a backend dialog (or be inside the library /
 /// backup folders); the folders that pick binaries and write locations likewise.
 #[test]

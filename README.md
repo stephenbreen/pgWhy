@@ -42,9 +42,10 @@ Recent scripts remember which connection they last ran against.
 **Backup and restore.** Back up a database, schema or table with `pg_dump`, in custom or
 directory format, with schema, data or both. Restore into a new database, replace an existing
 one, or restore on top of one. Every backup and restore shows up in History, and any backup
-there can be restored with one click. Custom format is plain `pg_dump --format=custom`, the same
-thing pgAdmin's "Custom" option writes, so pgWhy can restore a pgAdmin backup whatever the file is
-called.
+there can be restored with one click. Backups go to pgWhy's backup folder, which keeps the newest
+few, unless you use **Save as…** to pick your own file, which pgWhy never removes. Custom format
+is plain `pg_dump --format=custom`, the same thing pgAdmin's "Custom" option writes, so pgWhy can
+restore a pgAdmin backup whatever the file is called.
 
 ## Destructive operations
 

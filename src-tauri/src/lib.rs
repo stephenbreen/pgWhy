@@ -81,6 +81,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         commands::databases::db_create,
         commands::databases::db_rename,
         commands::databases::db_drop,
+        commands::backup::pick_backup_path,
         commands::restore::pick_restore_archive,
         commands::restore::restore_inspect,
         commands::restore::restore_start,

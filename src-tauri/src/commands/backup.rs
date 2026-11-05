@@ -1,5 +1,6 @@
-//! Standalone backup of any database: pg_dump custom format into the
-//! per-connection backup folder, with live progress and retention (keep last K).
+//! Standalone backup of any database: pg_dump custom format into the per-connection backup folder,
+//! with live progress and retention (keep last K), or to a file the user chose with "Save as…",
+//! which retention never touches.
 
 use crate::state::AppState;
 use pgwhy_core::config::ConnectionId;
@@ -64,6 +65,8 @@ pub struct BackupRequest {
     /// `all`, `schema_only` or `data_only`.
     pub data: String,
     pub scope: BackupScope,
+    /// Where the user chose to save it (see [`pick_backup_path`]); `None` is the backup folder.
+    pub save_as: Option<PathBuf>,
 }
 
 impl Default for BackupRequest {
@@ -73,6 +76,7 @@ impl Default for BackupRequest {
             jobs: None,
             data: "all".into(),
             scope: BackupScope::Database,
+            save_as: None,
         }
     }
 }
@@ -121,6 +125,32 @@ impl AppState {
         root.join(format!("{}-{short}", sanitize(connection_name)))
             .join(sanitize(database))
     }
+}
+
+/// Native save dialog for "Save as…". No filter: pg_restore goes by a file's contents, so the name
+/// is the user's to choose.
+#[tauri::command]
+pub async fn pick_backup_path<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    database: String,
+    format: String,
+) -> AppResult<Option<PathBuf>> {
+    use tauri_plugin_dialog::DialogExt;
+    let suffix = if format == "directory" { "dir" } else { "dump" };
+    let name = format!("{}_{}.{suffix}", sanitize(&database), chrono_stamp());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&name)
+        .save_file(move |p| {
+            let _ = tx.send(p.and_then(|p| p.into_path().ok()));
+        });
+    let path = rx.await.ok().flatten();
+    if let Some(p) = &path {
+        state.grants.grant_file(p);
+    }
+    Ok(path)
 }
 
 #[tauri::command]
@@ -228,6 +258,12 @@ pub(crate) async fn run_backup(
     request: &BackupRequest,
     events: Option<&Channel<BackupEvent>>,
 ) -> AppResult<BackupDone> {
+    // Before anything connects, so a bad choice can be corrected on the spot.
+    let save_as = request
+        .save_as
+        .as_deref()
+        .map(|p| state.check_save_as_path(p))
+        .transpose()?;
     let entry = state.manager.entry(connection_id)?;
     let conn = state.manager.introspection(connection_id, database).await?;
     let server_major = conn.info.server_major();
@@ -277,7 +313,10 @@ pub(crate) async fn run_backup(
         n += 1;
         stem = format!("{}_{stamp}_{n}", sanitize(database));
     }
-    let out = folder.join(format!("{stem}.{suffix}"));
+    // The log stays in the backup folder either way: "Save as…" shouldn't leave extra files beside
+    // the backup.
+    let retained = save_as.is_none();
+    let out = save_as.unwrap_or_else(|| folder.join(format!("{stem}.{suffix}")));
     let log = folder.join(format!("{stem}.log"));
 
     let (endpoint, password, _lease) = state.tool_endpoint(&entry, database).await?;
@@ -361,14 +400,19 @@ pub(crate) async fn run_backup(
         .unwrap_or_else(|p| p.into_inner())
         .backup_retention
         .max(1) as usize;
-    let plan = pgwhy_pgtools::apply_retention(
-        &folder,
-        &RetentionPolicy {
-            keep_last: keep,
-            suffixes: vec![".dump".into(), ".dir".into()],
-        },
-        &HashSet::new(),
-    )?;
+    let removed_by_retention = if retained {
+        pgwhy_pgtools::apply_retention(
+            &folder,
+            &RetentionPolicy {
+                keep_last: keep,
+                suffixes: vec![".dump".into(), ".dir".into()],
+            },
+            &HashSet::new(),
+        )?
+        .delete
+    } else {
+        Vec::new()
+    };
     // logs follow their dumps
     let _ = pgwhy_pgtools::apply_retention(
         &folder,
@@ -382,7 +426,7 @@ pub(crate) async fn run_backup(
         path: outcome.path,
         size_bytes: outcome.size_bytes,
         duration_ms: outcome.run.duration_ms,
-        removed_by_retention: plan.delete,
+        removed_by_retention,
     })
 }
 
