@@ -355,6 +355,7 @@ button.danger { background: var(--danger) !important; border-color: var(--danger
 .modal label span.row input { flex: 1; }
 .backup-form label span.row { display: flex; gap: 6px; align-items: center; }
 .backup-form label span.row input { flex: 1; }
+.update-notes { max-height: 160px; overflow: auto; white-space: pre-wrap; margin: 4px 0; font-size: var(--fs-small); }
 .restore-log {
   max-height: 140px; overflow: auto; margin: 0; padding: 6px; background: var(--bg-sunken);
   border: 1px solid var(--border); border-radius: 4px; font-family: var(--font-mono);

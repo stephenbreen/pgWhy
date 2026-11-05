@@ -11,6 +11,7 @@ import { initQuitHandler } from "./app/quit";
 import { initShortcuts } from "./app/shortcuts";
 import { registerTab } from "./app/registry";
 import { SettingsTab } from "./app/Settings";
+import { useUpdates } from "./app/updates";
 import "./app/theme.css";
 import "./app/components.css";
 
@@ -26,6 +27,7 @@ initWorkflow();
 initQuitHandler();
 initShortcuts();
 registerTab("settings", SettingsTab);
+void useUpdates.getState().check(true);
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

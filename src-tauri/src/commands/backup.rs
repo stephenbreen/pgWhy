@@ -18,6 +18,24 @@ pub struct Backups {
     running: Mutex<HashMap<String, CancelHandle>>,
 }
 
+impl Backups {
+    fn running(&self) -> std::sync::MutexGuard<'_, HashMap<String, CancelHandle>> {
+        self.running.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub(crate) fn track(&self, backup_id: &str, cancel: CancelHandle) {
+        self.running().insert(backup_id.to_string(), cancel);
+    }
+
+    pub(crate) fn untrack(&self, backup_id: &str) {
+        self.running().remove(backup_id);
+    }
+
+    pub(crate) fn any_running(&self) -> bool {
+        !self.running().is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackupEvent {
@@ -171,12 +189,7 @@ pub async fn backup_database(
         Some(&events),
     )
     .await;
-    state
-        .backups
-        .running
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&backup_id);
+    state.backups.untrack(&backup_id);
     match result {
         Ok(done) => {
             record_backup(&state, &connection_id, &database, &request, &done);
@@ -321,12 +334,7 @@ pub(crate) async fn run_backup(
 
     let (endpoint, password, _lease) = state.tool_endpoint(&entry, database).await?;
     let ctx = state.run_context()?;
-    state
-        .backups
-        .running
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(backup_id.to_string(), ctx.cancel.clone());
+    state.backups.track(backup_id, ctx.cancel.clone());
     send(
         events,
         BackupEvent::Started {
@@ -432,13 +440,7 @@ pub(crate) async fn run_backup(
 
 #[tauri::command]
 pub fn backup_cancel(state: State<'_, AppState>, backup_id: String) {
-    if let Some(c) = state
-        .backups
-        .running
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&backup_id)
-    {
+    if let Some(c) = state.backups.running().get(&backup_id) {
         c.cancel();
     }
 }

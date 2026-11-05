@@ -82,6 +82,9 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         commands::databases::db_rename,
         commands::databases::db_drop,
         commands::backup::pick_backup_path,
+        commands::updates::update_check,
+        commands::updates::update_download,
+        commands::updates::update_restart,
         commands::restore::pick_restore_archive,
         commands::restore::restore_inspect,
         commands::restore::restore_start,
@@ -149,9 +152,9 @@ static CLOSE_GATE: CloseGate = CloseGate {
     acked: std::sync::atomic::AtomicBool::new(false),
 };
 
-/// Stop children and tunnels, then exit. Open transactions end with their connections: the
-/// server rolls them back when the process goes.
-async fn shutdown_and_exit<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+/// Stop children and tunnels. Open transactions end with their connections: the server rolls them
+/// back when the process goes.
+pub(crate) async fn stop_background_work<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(state) = app.try_state::<state::AppState>() {
         // quitting mid-run kills the children and records the run as Interrupted
         let _ = state
@@ -160,6 +163,10 @@ async fn shutdown_and_exit<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
             .await;
         state.tunnels.close_all();
     }
+}
+
+async fn shutdown_and_exit<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+    stop_background_work(&app).await;
     app.exit(0);
 }
 
@@ -335,6 +342,7 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 on_close_requested(window, api);

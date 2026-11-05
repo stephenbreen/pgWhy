@@ -90,6 +90,12 @@ There are no prebuilt releases yet; see [Building](#building). Builds are unsign
 - **Windows:** SmartScreen will say "Windows protected your PC". Click More info, then Run
   anyway.
 
+### Updates
+
+pgWhy looks for a new GitHub release when it starts, and the status bar says when there is one.
+Installing it asks about open transactions first, and it waits for any running backup, restore or
+workflow. The check only asks GitHub for the latest version; you can turn it off in Settings.
+
 ### pg_dump and pg_restore
 
 Backup, restore and "Script as CREATE" use the Postgres client tools installed on your machine.

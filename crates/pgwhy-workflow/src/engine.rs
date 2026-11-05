@@ -602,6 +602,11 @@ impl Engine {
         lock(&self.inner.operation_cancels).remove(id);
     }
 
+    /// Whether a one-off operation that can be cancelled (a restore) is running.
+    pub fn has_active_operations(&self) -> bool {
+        !lock(&self.inner.operation_cancels).is_empty()
+    }
+
     /// Cancel a running one-off operation. Returns whether one was running under `id`.
     pub fn cancel_operation(&self, id: &RunId) -> bool {
         match lock(&self.inner.operation_cancels).get(id) {
