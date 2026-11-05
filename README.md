@@ -148,6 +148,37 @@ npm run dev                  # run the app with hot reload
 npm run build                # build installers for your OS
 ```
 
+### Releasing
+
+Pushing a version tag builds signed installers for macOS (Apple Silicon and Intel) and Windows into
+a draft GitHub release. Nothing is public until you publish the draft.
+
+```bash
+# after setting the new version in Cargo.toml, src-tauri/tauri.conf.json and ui/package.json
+scripts/check-release-version.sh v0.2.0
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The Mac builds need these repository secrets, and the workflow stops if any are missing:
+
+| Secret | Value |
+| --- | --- |
+| `APPLE_CERTIFICATE` | Your **Developer ID Application** certificate exported as a `.p12`, then base64: `openssl base64 -A -in cert.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | The password you set when exporting the `.p12` |
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Your Name (TEAMID)` |
+| `APPLE_ID` | Your Apple account email |
+| `APPLE_PASSWORD` | An [app-specific password](https://support.apple.com/102654), not your account password |
+| `APPLE_TEAM_ID` | Your 10-character Team ID |
+| `TAURI_SIGNING_PRIVATE_KEY` | The updater's private key file contents |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | That key's password |
+
+Windows builds aren't signed yet, so SmartScreen warns on those.
+
+The updater key is separate from the Apple certificate: installed copies only accept updates signed
+with it, using the public key in `src-tauri/tauri.conf.json`. Keep a backup. If it's lost, every
+installed copy has to be reinstalled by hand.
+
 ### Tests
 
 ```bash

@@ -1,0 +1,174 @@
+name: release
+
+# Pushing a version tag builds signed installers into a draft GitHub release. Nothing is public
+# until someone reads the draft, tries a download and clicks Publish. See "Releasing" in the README.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.id }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/check-release-version.sh "$GITHUB_REF_NAME"
+      # Up front, so a missing secret costs seconds rather than a half-built draft. An unsigned Mac
+      # build opens as "damaged" once downloaded, and an unsigned one can't reach the updater.
+      - name: Check the signing secrets are set
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID != '' }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD != '' }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' }}
+        run: |
+          missing=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID \
+            TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            if [ "${!name}" != "true" ]; then
+              echo "::error::Repository secret $name is not set (see Releasing in the README)"
+              missing=1
+            fi
+          done
+          exit "$missing"
+      # One draft up front, because build jobs that each create their own can race into duplicates.
+      # Reuses this tag's draft so re-running the whole workflow doesn't leave a second one.
+      - id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" \
+            --jq ".[] | select(.draft and .tag_name == \"$GITHUB_REF_NAME\") | .id" | head -n 1)
+          if [ -z "$id" ]; then
+            id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$GITHUB_REF_NAME" \
+              -f name="pgWhy $GITHUB_REF_NAME" \
+              -F draft=true \
+              -F generate_release_notes=true \
+              --jq .id)
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+      - run: npm ci
+      - run: npm ci
+        working-directory: ui
+
+      # Two steps so the Apple secrets only ever reach the Mac runners.
+      - name: Build, sign and notarize
+        if: runner.os == 'macOS'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          # also sets the URLs in latest.json, which would otherwise point at whatever is newest
+          tagName: ${{ github.ref_name }}
+          updaterJsonPreferNsis: true
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
+      - name: Build
+        if: runner.os == 'Windows'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          # also sets the URLs in latest.json, which would otherwise point at whatever is newest
+          tagName: ${{ github.ref_name }}
+          updaterJsonPreferNsis: true
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
+
+      # Fails the run if Gatekeeper would turn the app away, while the release is still a draft.
+      - name: Check Gatekeeper accepts the app
+        if: runner.os == 'macOS'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          app="target/$TARGET/release/bundle/macos/pgWhy.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+
+  # The build jobs each add their platform to latest.json, so check the merged result. A published
+  # release with a platform missing would break updates for everyone, since the updater validates
+  # the whole file before looking at the version.
+  check-updater-manifest:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: |
+          asset=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            --jq '.[] | select(.name == "latest.json") | .id')
+          if [ -z "$asset" ]; then
+            echo "::error::The draft release has no latest.json"
+            exit 1
+          fi
+          gh api -H "Accept: application/octet-stream" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$asset" > latest.json
+          status=0
+          for platform in darwin-aarch64 darwin-x86_64 windows-x86_64; do
+            url=$(jq -r ".platforms[\"$platform\"].url // empty" latest.json)
+            signature=$(jq -r ".platforms[\"$platform\"].signature // empty" latest.json)
+            if [ -z "$signature" ] || [[ "$url" != *"/releases/download/$GITHUB_REF_NAME/"* ]]; then
+              echo "::error::latest.json is wrong for $platform (url: ${url:-none})"
+              status=1
+            fi
+          done
+          exit "$status"
