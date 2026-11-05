@@ -262,7 +262,7 @@ export function RestoreDialog() {
             <label>
               Archive
               <span className="row">
-                <input aria-label="Archive" value={archive ?? ""} readOnly placeholder="choose a .dump file" />
+                <input aria-label="Archive" value={archive ?? ""} readOnly placeholder="choose a backup file" />
                 <button type="button" onClick={() => void pick()} disabled={busy}>
                   Choose…
                 </button>
@@ -272,7 +272,8 @@ export function RestoreDialog() {
               <p className="note">
                 {inspection.dbname ? `database ${inspection.dbname}` : "unknown database"} · dumped by
                 pg_dump {inspection.dumped_by ?? "?"} ({inspection.dumped_from ?? "?"}) ·{" "}
-                {inspection.toc_entries ?? "?"} items · restores with {inspection.tool}
+                {inspection.toc_entries ?? "?"} items
+                {blockers.length === 0 && ` · restores with ${inspection.tool}`}
               </p>
             )}
             {blockers.map((b) => (

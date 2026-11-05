@@ -108,6 +108,32 @@ impl AppState {
         }
     }
 
+    /// Accept `path` as a new backup file chosen with "Save as…", or refuse it. Stricter than
+    /// [`check_path`](Self::check_path): only a save dialog can name a place to write a database
+    /// dump. The app's own backup folder is refused because retention deletes old backups there,
+    /// and a file the user placed by hand must never be one of them.
+    pub fn check_save_as_path(&self, path: &Path) -> AppResult<PathBuf> {
+        let norm = normalize(path);
+        if !self.grants.has_file(&norm) {
+            return Err(refused(path));
+        }
+        if norm.starts_with(normalize(&self.backup_dir())) {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                "Save as can't use pgWhy's backup folder, where old backups are removed automatically",
+            )
+            .with_hint("Choose another folder, or use the default location"));
+        }
+        if norm.exists() {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                format!("A backup already exists at {}", norm.display()),
+            )
+            .with_hint("Choose a new file name; pgWhy never overwrites an existing backup"));
+        }
+        Ok(norm)
+    }
+
     /// True when a history record owns the backup at `norm`: the app wrote both, so "Restore
     /// backup…" and "Reveal" keep working after the backup folder moves. Only consulted once the
     /// cheap checks have failed, because it reads the history folder.

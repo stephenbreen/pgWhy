@@ -7,7 +7,10 @@ use crate::commands::backup::{chrono_stamp, run_backup};
 use crate::state::AppState;
 use pgwhy_core::config::ConnectionId;
 use pgwhy_core::{AppError, AppResult, ErrorKind};
-use pgwhy_pgtools::{ArchiveCheck, ArchiveInspection, DiscoveredTool, ToolKind};
+use pgwhy_pgtools::{
+    ArchiveCheck, ArchiveHeader, ArchiveInspection, DiscoveredTool, FailureCause, PgVersion,
+    ToolKind, ToolRegistry,
+};
 use pgwhy_workflow::restore::{RestoreEvent, RestoreSettings};
 use pgwhy_workflow::{check_target, require_typed_name, RestoreMode, RestoreRequest, RunId};
 use serde::Serialize;
@@ -43,7 +46,58 @@ fn plain_sql(path: &Path) -> bool {
     !text.starts_with("PGDMP") && text.contains("PostgreSQL database dump")
 }
 
-/// Native file picker for a restore source.
+/// The tools to read an archive with. A too-old refusal tells the user to install newer tools and
+/// that pgWhy will find them, so look again before refusing rather than trusting the cached list.
+async fn registry_for_archive(
+    state: &AppState,
+    header: Option<&ArchiveHeader>,
+) -> Arc<ToolRegistry> {
+    let registry = state.tool_registry(false).await;
+    match header.and_then(|h| h.dumped_by.as_ref()) {
+        Some(v) if registry.select(ToolKind::PgRestore, v.major).is_none() => {
+            state.tool_registry(true).await
+        }
+        _ => registry,
+    }
+}
+
+/// The pg_restore for an archive, plus what stops it being restored. When the version gate refuses,
+/// its message replaces pg_restore's own "unsupported version": same problem, but it says what to
+/// install.
+fn gate_archive(
+    registry: &ToolRegistry,
+    dumped_by: Option<&PgVersion>,
+    inspection: &ArchiveInspection,
+) -> (Option<DiscoveredTool>, Vec<String>) {
+    let mut blockers = Vec::new();
+    let gate = dumped_by.map(|v| pgwhy_pgtools::require_pg_restore(registry, v));
+    let superseded =
+        matches!(gate, Some(Err(_))) && inspection.cause == Some(FailureCause::VersionMismatch);
+    if !(inspection.reusable || superseded) {
+        blockers.push(
+            inspection
+                .reason
+                .clone()
+                .unwrap_or_else(|| "pg_restore could not read this archive".into()),
+        );
+    }
+    let tool = match gate {
+        Some(Ok(tool)) => Some(tool),
+        Some(Err(e)) => {
+            blockers.push(match e.hint {
+                Some(hint) => format!("{}. {hint}", e.message),
+                None => e.message,
+            });
+            registry.highest(ToolKind::PgRestore).cloned()
+        }
+        None => registry.highest(ToolKind::PgRestore).cloned(),
+    };
+    (tool, blockers)
+}
+
+/// Native file picker for a restore source. Deliberately unfiltered: pg_dump and pgAdmin don't add
+/// an extension, so a good archive can be called anything, and macOS would grey out every name a
+/// filter doesn't list. The file's contents decide, in [`restore_inspect`].
 #[tauri::command]
 pub async fn pick_restore_archive<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -51,12 +105,9 @@ pub async fn pick_restore_archive<R: tauri::Runtime>(
 ) -> AppResult<Option<PathBuf>> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .add_filter("PostgreSQL archives", &["dump", "backup", "tar", "gz"])
-        .pick_file(move |p| {
-            let _ = tx.send(p.and_then(|p| p.into_path().ok()));
-        });
+    app.dialog().file().pick_file(move |p| {
+        let _ = tx.send(p.and_then(|p| p.into_path().ok()));
+    });
     let path = rx.await.ok().flatten();
     if let Some(p) = &path {
         state.grants.grant_file(p);
@@ -80,7 +131,8 @@ pub async fn restore_inspect(
                 .to_string(),
         );
     }
-    let registry = state.tool_registry(false).await;
+    let file_header = pgwhy_pgtools::read_archive_header(&path);
+    let registry = registry_for_archive(&state, file_header.as_ref()).await;
     let inspect_tool = registry
         .highest(ToolKind::PgRestore)
         .cloned()
@@ -102,28 +154,14 @@ pub async fn restore_inspect(
                 .to_string(),
         );
     }
-    if !inspection.reusable {
-        blockers.push(
-            inspection
-                .reason
-                .clone()
-                .unwrap_or_else(|| "pg_restore could not read this archive".into()),
-        );
-    }
-
+    // A pg_restore too old to list the archive leaves no TOC header; ours still names the versions.
     let header = inspection.toc.as_ref().map(|t| &t.header);
-    let dumped_by = header.and_then(|h| h.dumped_by.clone());
+    let dumped_by = header
+        .and_then(|h| h.dumped_by.clone())
+        .or_else(|| file_header.as_ref().and_then(|h| h.dumped_by.clone()));
     // The gate: pg_restore must be at least the pg_dump that wrote the archive.
-    let tool = match &dumped_by {
-        Some(v) => match pgwhy_pgtools::require_pg_restore(&registry, v) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                blockers.push(e.message.clone());
-                registry.highest(ToolKind::PgRestore).cloned()
-            }
-        },
-        None => registry.highest(ToolKind::PgRestore).cloned(),
-    };
+    let (tool, gate_blockers) = gate_archive(&registry, dumped_by.as_ref(), &inspection);
+    blockers.extend(gate_blockers);
     let tool = tool.ok_or_else(|| {
         AppError::new(
             ErrorKind::ToolMissing,
@@ -134,8 +172,13 @@ pub async fn restore_inspect(
     Ok(RestoreInspectionView {
         archive: inspection.clone(),
         tool: format!("{} {}", tool.path.display(), tool.version),
-        dbname: header.and_then(|h| h.dbname.clone()),
-        dumped_from: header.and_then(|h| h.dumped_from.as_ref().map(|v| v.raw.clone())),
+        dbname: header
+            .and_then(|h| h.dbname.clone())
+            .or_else(|| file_header.as_ref().and_then(|h| h.dbname.clone())),
+        dumped_from: header
+            .and_then(|h| h.dumped_from.as_ref())
+            .or_else(|| file_header.as_ref().and_then(|h| h.dumped_from.as_ref()))
+            .map(|v| v.raw.clone()),
         dumped_by: dumped_by.map(|v| v.raw),
         toc_entries: header.and_then(|h| h.toc_entries),
         blockers,
@@ -194,7 +237,12 @@ pub async fn restore_start(
     // the target to disk, which a refused restore must never do. Re-checked inside the engine.
     check_restore(&entry, &request)?;
     let request_path = state.check_path(&request.path, false)?;
-    let registry = state.tool_registry(false).await;
+    let file_header = pgwhy_pgtools::read_archive_header(&request_path);
+    let registry = registry_for_archive(&state, file_header.as_ref()).await;
+    // Before the inspection, whose failure could only say the archive can't be read.
+    if let Some(v) = file_header.as_ref().and_then(|h| h.dumped_by.as_ref()) {
+        pgwhy_pgtools::require_pg_restore(&registry, v)?;
+    }
     let inspect_tool = registry
         .highest(ToolKind::PgRestore)
         .cloned()
@@ -328,4 +376,70 @@ pub struct RestoreTargets {
     pub databases: Vec<String>,
     pub can_create_database: bool,
     pub capabilities_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pgwhy_pgtools::discover::DiscoverySource;
+
+    fn registry(major: u32) -> ToolRegistry {
+        ToolRegistry {
+            tools: vec![DiscoveredTool {
+                kind: ToolKind::PgRestore,
+                path: PathBuf::from(format!("/opt/pg{major}/bin/pg_restore")),
+                version: PgVersion::parse(&format!("{major}.15")).unwrap(),
+                source: DiscoverySource::Standard,
+            }],
+            searched: Vec::new(),
+        }
+    }
+
+    fn unreadable(cause: FailureCause, reason: &str) -> ArchiveInspection {
+        ArchiveInspection {
+            path: PathBuf::from("/tmp/appdb"),
+            size_bytes: Some(1),
+            reusable: false,
+            reason: Some(reason.into()),
+            cause: Some(cause),
+            toc: None,
+        }
+    }
+
+    #[test]
+    fn too_new_archive_says_what_to_install_instead_of_unsupported_version() {
+        let inspection = unreadable(
+            FailureCause::VersionMismatch,
+            "pg_restore is too old: unsupported version (1.16) in file header",
+        );
+        let v18 = PgVersion::parse("18.6").unwrap();
+        let (_, blockers) = gate_archive(&registry(16), Some(&v18), &inspection);
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(
+            blockers[0].starts_with("pg_restore 16 cannot restore a backup made by pg_dump 18."),
+            "{}",
+            blockers[0]
+        );
+        assert!(
+            blockers[0].contains("PostgreSQL 18 client tools"),
+            "{}",
+            blockers[0]
+        );
+    }
+
+    #[test]
+    fn a_damaged_archive_is_still_reported_when_the_version_is_fine() {
+        let inspection = unreadable(FailureCause::ArchiveCorrupt, "truncated");
+        let v16 = PgVersion::parse("16.15").unwrap();
+        let (tool, blockers) = gate_archive(&registry(16), Some(&v16), &inspection);
+        assert_eq!(blockers, ["truncated"]);
+        assert_eq!(tool.unwrap().version.major, 16);
+    }
+
+    #[test]
+    fn an_archive_with_no_readable_header_keeps_the_tools_own_reason() {
+        let inspection = unreadable(FailureCause::VersionMismatch, "unsupported version (1.99)");
+        let (_, blockers) = gate_archive(&registry(16), None, &inspection);
+        assert_eq!(blockers, ["unsupported version (1.99)"]);
+    }
 }

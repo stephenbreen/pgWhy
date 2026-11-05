@@ -222,6 +222,8 @@ pub struct AppSettings {
     /// Megabytes one result set retains before it is marked truncated (default 256). A row cap
     /// alone does not bound memory: wide rows can cost gigabytes long before it is reached.
     pub result_byte_cap_mb: u64,
+    /// Look for a new pgWhy release when the app starts.
+    pub check_for_updates: bool,
 }
 
 impl Default for AppSettings {
@@ -237,6 +239,7 @@ impl Default for AppSettings {
             // same defaults as pgwhy_core::query::{DEFAULT_ROW_CAP, DEFAULT_BYTE_CAP}
             result_row_cap: 1_000_000,
             result_byte_cap_mb: 256,
+            check_for_updates: true,
         }
     }
 }

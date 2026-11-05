@@ -66,6 +66,16 @@ test("an archive with a blocker cannot be restored", async () => {
   expect(screen.getByRole("button", { name: /^restore$/i })).toBeDisabled();
 });
 
+test("an archive the local pg_restore can't read doesn't claim that pg_restore will restore it", async () => {
+  backend({ blockers: ["pg_restore 16 cannot restore a backup made by pg_dump 18"] });
+  open("local");
+  render(<RestoreDialog />);
+  await userEvent.click(await screen.findByRole("button", { name: /choose/i }));
+
+  expect(await screen.findByText(/cannot restore a backup made by pg_dump 18/)).toBeInTheDocument();
+  expect(screen.getByText(/dumped by pg_dump/)).not.toHaveTextContent(/restores with/);
+});
+
 test("a readable archive enables Start, and a production tag blocks it again", async () => {
   const calls = backend();
   open("local");
@@ -73,7 +83,7 @@ test("a readable archive enables Start, and a production tag blocks it again", a
   await userEvent.click(await screen.findByRole("button", { name: /choose/i }));
   // the header is shown and Start becomes available
   const start = await screen.findByRole("button", { name: /^restore$/i });
-  expect(await screen.findByText(/dumped by pg_dump 16\.15/)).toBeInTheDocument();
+  expect(await screen.findByText(/dumped by pg_dump 16\.15/)).toHaveTextContent(/restores with .*pg_restore 16\.15/);
   expect(start).toBeEnabled();
 
   useRestore.setState({ envTag: "production" });

@@ -3,6 +3,8 @@ import { ErrorBoundary } from "./ErrorBoundary";
 import { MainArea } from "./MainArea";
 import { Sidebar } from "./Sidebar";
 import { StatusBar } from "./StatusBar";
+import { openSettings } from "./Settings";
+import { useUpdates } from "./updates";
 import { useWorkspace } from "./workspace";
 import { StatusBarConnection } from "../connection/StatusBarConnection";
 import { DetailsPanel } from "../explorer/details/DetailsPanel";
@@ -18,6 +20,7 @@ export function App() {
   const detailsVisible = useDetails((s) => s.visible);
   const hasTarget = useDetails((s) => s.target !== null);
   // the details dock belongs to the explorer; it shows once something is selected
+  const update = useUpdates((s) => s.available);
   const details = detailsVisible && hasTarget && sidebarVisible && activeView === "explorer";
   return (
     <div className="shell" data-sidebar={sidebarVisible ? "open" : "closed"} data-details={details ? "open" : "closed"}>
@@ -33,11 +36,18 @@ export function App() {
       <StatusBar
         connection={<StatusBarConnection />}
         right={
-          !details && hasTarget ? (
-            <button type="button" className="link" onClick={() => useDetails.getState().show(true)}>
-              Show details
-            </button>
-          ) : null
+          <>
+            {update && (
+              <button type="button" className="link" onClick={openSettings}>
+                pgWhy {update.version} is available
+              </button>
+            )}
+            {!details && hasTarget && (
+              <button type="button" className="link" onClick={() => useDetails.getState().show(true)}>
+                Show details
+              </button>
+            )}
+          </>
         }
       />
     </div>
