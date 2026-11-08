@@ -1,8 +1,10 @@
-// Settings tab: top-N rows, backup retention and folders, script library, pg tool search dirs.
+// Settings tab: zoom, top-N rows, backup retention and folders, script library, pg tool search dirs.
 
 import { useEffect, useState, type FormEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useWorkspace, type Tab } from "./workspace";
+import { ZOOM_STEPS, useLayout } from "./layout";
+import { shortcut } from "./keys";
 import { ErrorNote } from "../connection/ErrorNote";
 import { toAppError, type AppError } from "../lib/ipc/errors";
 
@@ -36,6 +38,8 @@ export function SettingsTab({ tab }: { tab: Tab }) {
   const [error, setError] = useState<AppError | null>(null);
   const [saved, setSaved] = useState(false);
   const closeTab = useWorkspace((x) => x.closeTab);
+  const zoom = useLayout((x) => x.zoom);
+  const setZoom = useLayout((x) => x.setZoom);
 
   const apply = (v: SettingsView) => {
     setView(v);
@@ -81,6 +85,22 @@ export function SettingsTab({ tab }: { tab: Tab }) {
   return (
     <form className="form-page" aria-label="Settings" onSubmit={onSubmit}>
       <h2>Settings</h2>
+      <fieldset>
+        <legend>Appearance</legend>
+        <label className="narrow">
+          Zoom
+          <select value={zoom} onChange={(e) => setZoom(Number(e.target.value))}>
+            {ZOOM_STEPS.map((z) => (
+              <option key={z} value={z}>
+                {Math.round(z * 100)}%
+              </option>
+            ))}
+          </select>
+        </label>
+        <p className="note">
+          Applies straight away. {shortcut("=")} and {shortcut("-")} step it, {shortcut("0")} resets.
+        </p>
+      </fieldset>
       <fieldset>
         <legend>Data</legend>
         <div className="row">

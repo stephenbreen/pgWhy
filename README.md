@@ -21,7 +21,8 @@ with no tag is treated as Production.
 **Explorer.** Server, databases, schemas, then tables with their columns and types inline. The
 details panel shows keys, indexes, sizes and stats. You can filter the tree (⇧⌘P / Ctrl+Shift+P)
 or jump to any object (⌘P / Ctrl+P). Right-click a table to script it as SELECT, INSERT,
-UPDATE, DELETE or CREATE.
+UPDATE, DELETE or CREATE. Drag the edge of the explorer or details pane to resize it, and
+zoom the whole window with ⌘= / ⌘- / ⌘0 (Ctrl on Windows and Linux).
 
 **Editor.** PostgreSQL highlighting and completion from the catalog. F5 or Ctrl+Enter runs the
 selection, or everything if nothing is selected. Esc cancels. Errors are underlined where the
@@ -29,10 +30,11 @@ server reported them. Tabs autocommit. If you run `BEGIN`, the tab shows that a 
 open, and closing the tab or quitting asks whether to commit or roll back.
 
 **Results.** Large results stream into the backend and scroll in a virtualized grid; a million
-rows is fine. You can copy as TSV or export to CSV or JSON.
+rows is fine. Drag a column's edge to resize it, or double-click the edge to fit the column to
+its values. Click a header to select the column. You can copy as TSV or export to CSV or JSON.
 
-**Editing rows.** Double-click a table to see its top rows, with server-side sorting and
-filtering. Tables with a primary key (or a unique, non-null key) can be edited. Changes stay
+**Editing rows.** Double-click a table to see its top rows, with server-side sorting (the
+arrow in each header) and filtering. Tables with a primary key (or a unique, non-null key) can be edited. Changes stay
 pending until you commit. You can preview the SQL first. The commit runs in one transaction and
 fails if any statement doesn't touch exactly one row.
 

@@ -9,6 +9,7 @@ import { initGrid } from "./grid";
 import { initWorkflow } from "./workflow";
 import { initQuitHandler } from "./app/quit";
 import { initShortcuts } from "./app/shortcuts";
+import { initZoom } from "./app/layout";
 import { registerTab } from "./app/registry";
 import { SettingsTab } from "./app/Settings";
 import "./app/theme.css";
@@ -25,6 +26,7 @@ initGrid();
 initWorkflow();
 initQuitHandler();
 initShortcuts();
+initZoom();
 registerTab("settings", SettingsTab);
 
 createRoot(document.getElementById("root")!).render(
