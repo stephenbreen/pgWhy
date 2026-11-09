@@ -730,6 +730,150 @@ exit 1
     );
 }
 
+/// pg_restore 17+ against a server before 17: its opening `SET transaction_timeout` fails.
+const SETTING_FAILS: &str = r#"
+echo 'pg_restore: connecting to database for restore' >&2
+echo 'pg_restore: while INITIALIZING:' >&2
+echo 'pg_restore: error: could not execute query: ERROR:  unrecognized configuration parameter "transaction_timeout"' >&2
+echo 'Command was: SET transaction_timeout = 0;' >&2
+"#;
+
+/// The stub stops there under `--exit-on-error`, as pg_restore does; otherwise `rest` runs.
+fn older_server_stub(e: &Env, rest: &str) -> DiscoveredTool {
+    let body = format!(
+        r#"{SETTING_FAILS}
+case " $* " in *" --exit-on-error "*) exit 1;; esac
+{rest}"#
+    );
+    let bin = stub(&e.bin, "pg_restore", "18.6", &body);
+    tool(&bin, ToolKind::PgRestore, 18)
+}
+
+async fn restore_with(
+    e: &Env,
+    tool: &DiscoveredTool,
+    policy: ErrorPolicy,
+) -> AppResult<RestoreOutcome> {
+    let archive = e.out.join("r.dump");
+    std::fs::create_dir_all(&e.out).unwrap();
+    std::fs::write(&archive, "PGDMP").unwrap();
+    let opts = RestoreOptions {
+        error_policy: policy,
+        ..Default::default()
+    };
+    restore(tool, &endpoint(), None, &archive, &opts, &ctx(e), |_| {}).await
+}
+
+#[tokio::test]
+async fn a_server_without_transaction_timeout_restores_in_full() {
+    let e = env();
+    // as real pg_restore 18.6 prints it with --jobs: each worker's connection fails the same SET,
+    // reported against the item it was starting
+    let rest = r#"
+echo 'pg_restore: creating TABLE "public.t1"' >&2
+echo 'pg_restore: entering main parallel loop' >&2
+for w in 1 2 3; do
+  echo 'pg_restore: while PROCESSING TOC:' >&2
+  echo 'pg_restore: from TOC entry 215; 1259 16385 TABLE t1 app' >&2
+  echo 'pg_restore: error: could not execute query: ERROR:  unrecognized configuration parameter "transaction_timeout"' >&2
+done
+echo 'pg_restore: processing data for table "public.t1"' >&2
+echo 'pg_restore: finished main parallel loop' >&2
+echo 'pg_restore: warning: errors ignored on restore: 4' >&2
+exit 1
+"#;
+    let tool = older_server_stub(&e, rest);
+    let out = restore_with(&e, &tool, ErrorPolicy::ExitOnError)
+        .await
+        .unwrap();
+    assert!(out.run.success);
+    assert!(out.run.failed_items.is_empty());
+    // stopped before restoring anything, then run again without --exit-on-error
+    let runs = records(&e.bin, "pg_restore");
+    assert_eq!(runs.len(), 2);
+    let with_flag = runs
+        .iter()
+        .filter(|r| args_of(r).contains(&"--exit-on-error"))
+        .count();
+    assert_eq!(with_flag, 1);
+
+    // continue-on-error never had the flag, so it's one run
+    let e = env();
+    let tool = older_server_stub(&e, rest);
+    let out = restore_with(&e, &tool, ErrorPolicy::ContinueOnError)
+        .await
+        .unwrap();
+    assert!(out.run.success);
+    assert_eq!(records(&e.bin, "pg_restore").len(), 1);
+}
+
+#[tokio::test]
+async fn any_other_failure_still_stops_the_restore_at_once() {
+    let e = env();
+    let rest = r#"
+echo 'pg_restore: creating INDEX "public.t1_v_idx"' >&2
+echo 'pg_restore: error: could not execute query: ERROR:  relation "t1_v_idx" already exists' >&2
+echo 'Command was: CREATE INDEX t1_v_idx ON public.t1 USING btree (v);' >&2
+sleep 30
+echo 'pg_restore: creating TABLE "public.after"' >&2
+exit 1
+"#;
+    let tool = older_server_stub(&e, rest);
+    let started = Instant::now();
+    let err = restore_with(&e, &tool, ErrorPolicy::ExitOnError)
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "stopped at the failure rather than waiting for pg_restore"
+    );
+    assert_eq!(
+        FailureCause::from_error(&err),
+        Some(FailureCause::ObjectErrors)
+    );
+    let data = err.data.unwrap();
+    let items = data["failed_items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["object"], "INDEX public.t1_v_idx");
+    assert!(!data["stderr_tail"].to_string().contains("public.after"));
+}
+
+#[tokio::test]
+async fn other_failures_under_continue_on_error_are_still_reported() {
+    let e = env();
+    let rest = r#"
+echo 'pg_restore: creating INDEX "public.t1_v_idx"' >&2
+echo 'pg_restore: error: could not execute query: ERROR:  relation "t1_v_idx" already exists' >&2
+echo 'Command was: CREATE INDEX t1_v_idx ON public.t1 USING btree (v);' >&2
+echo 'pg_restore: warning: errors ignored on restore: 2' >&2
+exit 1
+"#;
+    let tool = older_server_stub(&e, rest);
+    let err = restore_with(&e, &tool, ErrorPolicy::ContinueOnError)
+        .await
+        .unwrap_err();
+    let data = err.data.unwrap();
+    let items = data["failed_items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only the real failure is named: {items:?}");
+    assert_eq!(items[0]["object"], "INDEX public.t1_v_idx");
+    assert_eq!(data["errors_ignored"], 1);
+
+    // a failure that isn't an item (here a lost connection) is never turned into success
+    let e = env();
+    let rest = r#"
+echo 'pg_restore: error: connection to server lost' >&2
+echo 'pg_restore: warning: errors ignored on restore: 1' >&2
+exit 1
+"#;
+    let tool = older_server_stub(&e, rest);
+    assert!(restore_with(&e, &tool, ErrorPolicy::ContinueOnError)
+        .await
+        .is_err());
+    assert!(restore_with(&e, &tool, ErrorPolicy::ExitOnError)
+        .await
+        .is_err());
+}
+
 #[tokio::test]
 async fn inspect_archive_verdicts() {
     let e = env();

@@ -6,7 +6,9 @@
 use crate::discover::{DiscoveredTool, PgVersion, ToolKind};
 use crate::endpoint::{table_pattern, ToolEndpoint, ToolPassword};
 use crate::progress::ProgressEvent;
-use crate::runner::{dbname_arg, run_child, ChildSpec, FailureCause, RunContext, ToolRun};
+use crate::runner::{
+    dbname_arg, run_child, ChildSpec, FailedItem, FailureCause, RunContext, ToolRun,
+};
 use pgwhy_errors::{AppError, AppResult, ErrorKind};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -229,6 +231,12 @@ pub struct RestoreOutcome {
 /// the workflow layer). Success means exit 0 *and* no failed items; under continue-on-error,
 /// failed items are a failure naming the objects (`data.failed_items`). An unreadable archive
 /// fails with cause `archive_corrupt` (backup non-reusable).
+///
+/// pg_restore 17 and later begin with `SET transaction_timeout = 0`, which servers before 17
+/// don't have. That statement restores nothing, so its failure is let through (see
+/// [`unsupported_session_setting`]). With `--exit-on-error` pg_restore stops at it before
+/// restoring anything, so that case runs again without the flag, and pgWhy stops it at the
+/// first other failure instead.
 pub async fn restore(
     pg_restore: &DiscoveredTool,
     endpoint: &ToolEndpoint,
@@ -247,6 +255,31 @@ pub async fn restore(
         .with_hint("Take a new backup")
         .with_data(json!({ "tool": "pg_restore", "cause": FailureCause::ArchiveCorrupt })));
     }
+    let exit_on_error = opts.error_policy == ErrorPolicy::ExitOnError;
+    let spec = restore_spec(pg_restore, endpoint, password, archive, opts, exit_on_error);
+    let mut run = run_child(&spec, ctx, &mut on_progress).await?;
+    if exit_on_error && stopped_before_restoring_on_session_setting(&run) {
+        let mut spec = restore_spec(pg_restore, endpoint, password, archive, opts, false);
+        spec.stop_on_failure = Some(|item| !unsupported_session_setting(item));
+        run = run_child(&spec, ctx, &mut on_progress).await?;
+    }
+    let_through_unsupported_session_settings(&mut run);
+    if run.success && (!run.failed_items.is_empty() || run.errors_ignored.is_some_and(|n| n > 0)) {
+        run.success = false;
+    }
+    Ok(RestoreOutcome {
+        run: run.into_result()?,
+    })
+}
+
+fn restore_spec(
+    pg_restore: &DiscoveredTool,
+    endpoint: &ToolEndpoint,
+    password: Option<&ToolPassword>,
+    archive: &Path,
+    opts: &RestoreOptions,
+    exit_on_error: bool,
+) -> ChildSpec {
     let mut args: Vec<OsString> = vec!["--verbose".into()];
     if opts.no_owner {
         args.push("--no-owner".into());
@@ -254,7 +287,7 @@ pub async fn restore(
     if opts.no_privileges {
         args.push("--no-privileges".into());
     }
-    if opts.error_policy == ErrorPolicy::ExitOnError {
+    if exit_on_error {
         args.push("--exit-on-error".into());
     }
     if let Some(j) = opts.jobs.filter(|&j| j > 1) {
@@ -270,14 +303,64 @@ pub async fn restore(
     spec.log_path = opts.log_path.clone();
     spec.total_objects = opts.total_items;
     spec.total_is_estimate = false;
+    spec
+}
 
-    let mut run = run_child(&spec, ctx, &mut on_progress).await?;
-    if run.success && (!run.failed_items.is_empty() || run.errors_ignored.is_some_and(|n| n > 0)) {
-        run.success = false;
+/// A session setting pg_restore sets before restoring, which this server doesn't have. Only
+/// `transaction_timeout` (PostgreSQL 17) so far: the others pg_restore sets are older than any
+/// server it can restore into.
+fn unsupported_session_setting(item: &FailedItem) -> bool {
+    item.error
+        .contains(r#"unrecognized configuration parameter "transaction_timeout""#)
+}
+
+/// pg_restore under `--exit-on-error` gave up on its opening session setting, so nothing was
+/// restored and running it again is safe.
+fn stopped_before_restoring_on_session_setting(run: &ToolRun) -> bool {
+    !run.success
+        && !run.cancelled
+        && run.failed_items.len() == 1
+        && unsupported_session_setting(&run.failed_items[0])
+        && run
+            .stderr_tail
+            .iter()
+            .any(|l| l.contains("while INITIALIZING"))
+}
+
+/// Drop the unsupported-setting failures: one per connection, so one per worker under `--jobs`,
+/// each reported against whatever item that worker was starting. When they were every error
+/// pg_restore printed, its exit 1 for "errors ignored" is a success. A run that failed some other
+/// way keeps its record untouched, so its cause isn't hidden.
+fn let_through_unsupported_session_settings(run: &mut ToolRun) {
+    let let_through = run
+        .failed_items
+        .iter()
+        .filter(|i| unsupported_session_setting(i))
+        .count() as u32;
+    if let_through == 0 {
+        return;
     }
-    Ok(RestoreOutcome {
-        run: run.into_result()?,
-    })
+    let others: Vec<FailedItem> = run
+        .failed_items
+        .iter()
+        .filter(|i| !unsupported_session_setting(i))
+        .cloned()
+        .collect();
+    if !others.is_empty() {
+        run.failed_items = others;
+        run.errors_ignored = run
+            .errors_ignored
+            .map(|n| n.saturating_sub(let_through))
+            .filter(|&n| n > 0);
+    } else if !run.success
+        && !run.cancelled
+        && run.exit_code == Some(1)
+        && run.error_lines == let_through
+    {
+        run.failed_items.clear();
+        run.errors_ignored = None;
+        run.success = true;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
