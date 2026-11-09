@@ -146,6 +146,9 @@ pub struct ToolRun {
     pub failed_items: Vec<FailedItem>,
     /// `pg_restore: warning: errors ignored on restore: N`
     pub errors_ignored: Option<u32>,
+    /// Every `error:` line the tool printed, item or not.
+    #[serde(default)]
+    pub error_lines: u32,
     pub objects_done: u64,
     #[serde(skip)]
     pub stdout: Option<Vec<u8>>,
@@ -179,6 +182,9 @@ pub struct ChildSpec {
     pub log_path: Option<PathBuf>,
     pub total_objects: Option<u64>,
     pub total_is_estimate: bool,
+    /// Stop the child at the first failed item this returns true for: pg_restore's
+    /// `--exit-on-error`, done here instead so that some failures can be let through.
+    pub stop_on_failure: Option<fn(&FailedItem) -> bool>,
 }
 
 /// `--dbname=<conninfo>`: one argv element, so nothing in the conninfo can be read as a flag.
@@ -198,6 +204,7 @@ impl ChildSpec {
             log_path: None,
             total_objects: None,
             total_is_estimate: false,
+            stop_on_failure: None,
         }
     }
 
@@ -344,6 +351,8 @@ pub async fn run_child(
     let mut term_sent_at: Option<Instant> = None;
     let mut killed_hard = false;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
+    let mut failures_seen = 0;
+    let mut stopped_at_failure = false;
     // A cancel that landed between the entry check and subscribe() is already "seen".
     if *cancel_rx.borrow() {
         cancelled = true;
@@ -365,6 +374,14 @@ pub async fn run_child(
                     }
                     let ev = tracker.feed(&line);
                     failures.observe(&line, &ev, tracker.current());
+                    if let Some(stop) = spec.stop_on_failure {
+                        let fresh = &failures.items[failures_seen..];
+                        if !stopped_at_failure && fresh.iter().any(stop) {
+                            stopped_at_failure = true;
+                            kill_requested = true;
+                        }
+                        failures_seen = failures.items.len();
+                    }
                     if tail.len() == TAIL_LINES {
                         tail.pop_front();
                     }
@@ -432,7 +449,7 @@ pub async fn run_child(
 
     let status = status.and_then(|s| s.ok());
     let exit_code = status.and_then(|s| s.code());
-    let success = !cancelled && status.is_some_and(|s| s.success());
+    let success = !cancelled && !stopped_at_failure && status.is_some_and(|s| s.success());
     Ok(ToolRun {
         tool: kind,
         tool_path: spec.tool.path.clone(),
@@ -450,6 +467,7 @@ pub async fn run_child(
         log_path: spec.log_path.clone(),
         failed_items: failures.items,
         errors_ignored: failures.errors_ignored,
+        error_lines: failures.error_lines,
         objects_done: tracker.objects_done(),
         stdout,
     })
@@ -575,6 +593,7 @@ struct FailureCollector {
     pending_toc: Option<String>,
     awaiting_command: bool,
     errors_ignored: Option<u32>,
+    error_lines: u32,
 }
 
 impl FailureCollector {
@@ -598,6 +617,7 @@ impl FailureCollector {
             }
         }
         if let LineEvent::Error(e) = ev {
+            self.error_lines += 1;
             // Item failures: "could not execute query: ERROR: ...", "COPY failed for table
             // ...", or any error directly preceded by "from TOC entry ...".
             let query = e.strip_prefix("could not execute query: ");
@@ -890,6 +910,7 @@ mod tests {
             log_path: None,
             failed_items: fc.items,
             errors_ignored: fc.errors_ignored,
+            error_lines: 0,
             objects_done: 0,
             stdout: None,
         }

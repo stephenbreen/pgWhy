@@ -347,16 +347,12 @@ async fn staging_swap_with_script_closes_sessions() {
 
     // report fields
     assert_eq!(rec.renames_completed, 2);
-    assert!(rec
-        .tools
-        .pg_dump
-        .as_ref()
-        .unwrap()
-        .version
-        .starts_with("16"));
+    // the servers are 16; pg_dump may be any version from there up
+    let pg_dump = &rec.tools.pg_dump.as_ref().unwrap().version;
+    assert!(major(pg_dump) >= 16, "{pg_dump}");
     let b = rec.backup.as_ref().unwrap();
     assert!(b.path.exists() && b.size_bytes > 0 && b.reusable);
-    assert!(b.dumped_by.as_deref().unwrap().starts_with("16"));
+    assert_eq!(b.dumped_by.as_deref().map(major), Some(major(pg_dump)));
     assert!(b.toc_items.unwrap() > 0);
     assert_eq!(rec.script.as_ref().unwrap().sha256.len(), 64);
     assert_eq!(rec.locale.as_ref().unwrap().encoding, "UTF8");
@@ -853,4 +849,13 @@ async fn kill_between_renames_recovers_by_rollback() {
     assert!(!databases(&env.local).await.contains(&staging));
     assert!(rec.actions.iter().any(|a| a.kind == ActionKind::Retry));
     assert_no_password_under(&env.dir.path().join("runs"));
+}
+
+/// The major version from a version string like `16.15 (Homebrew)`.
+fn major(version: &str) -> u32 {
+    version
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
 }
