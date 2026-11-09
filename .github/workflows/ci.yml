@@ -15,7 +15,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ubuntu-latest became 26.04, which ships only Postgres 18 client tools. pg_restore 17+ sends
+        # SET transaction_timeout, which the Postgres 16 test servers reject, so the refresh test
+        # fails there. Stay on 24.04 until pgWhy handles that (it affects real restores too).
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
