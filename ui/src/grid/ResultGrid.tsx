@@ -1,6 +1,7 @@
 // The results grid: rows windowed from the core, slot-recycled DOM rows, cell-range selection
 // with TSV copy, NULL distinct from empty, pending-edit marks, optional in-place editing and
-// sortable headers for the top-N view.
+// sortable headers for the top-N view. A header click selects the column; sorting has its own
+// button, so resizing a column (drag, or double-click to fit) never re-sorts it.
 
 import {
   memo,
@@ -38,13 +39,36 @@ const GUTTER_W = 56;
 
 const NUMERIC = /^(smallint|integer|bigint|numeric|real|double precision|money|int[248]?|float[48]|decimal)/;
 
+const MIN_COL_W = 40;
+const MAX_FIT_W = 800;
+// rows kept resident either side of the viewport; "fit to contents" measures the same span
+const PREFETCH_BEFORE = 128;
+const PREFETCH_AFTER = 512;
+
+let measureCtx: CanvasRenderingContext2D | null | undefined;
+/** Text width in px for a CSS font; a per-character estimate where canvas isn't available (jsdom). */
+function textWidth(text: string, font: string): number {
+  if (measureCtx === undefined) {
+    try {
+      measureCtx = document.createElement("canvas").getContext("2d");
+    } catch {
+      measureCtx = null;
+    }
+  }
+  if (!measureCtx) return text.length * 7.5;
+  measureCtx.font = font;
+  return measureCtx.measureText(text).width;
+}
+
 function defaultWidth(c: GridColumn): number {
-  if (c.type && NUMERIC.test(c.type)) return 100;
-  if (c.type === "boolean") return 70;
-  if (c.type?.startsWith("timestamp")) return 190;
-  if (c.type === "date") return 100;
-  if (c.type === "uuid") return 290;
-  return Math.min(320, Math.max(110, c.name.length * 8 + 30));
+  // wide enough for the header name, the key mark and the sort button
+  const header = Math.min(320, c.name.length * 8 + (c.key ? 34 : 0) + 34);
+  if (c.type && NUMERIC.test(c.type)) return Math.max(100, header);
+  if (c.type === "boolean") return Math.max(70, header);
+  if (c.type?.startsWith("timestamp")) return Math.max(190, header);
+  if (c.type === "date") return Math.max(100, header);
+  if (c.type === "uuid") return Math.max(290, header);
+  return Math.max(110, header);
 }
 
 interface Selection {
@@ -199,6 +223,8 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
   const [copyError, setCopyError] = useState<string | null>(null);
   const dragging = useRef(false);
+  // a column resize that ends over its header must not also count as a click on it
+  const suppressHeaderClick = useRef(false);
 
   useEffect(() => setWidths(columns.map(defaultWidth)), [columns]);
   // Any store change can make the visible window re-fetchable (invalidate, a new partial chunk);
@@ -224,7 +250,7 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
   const last = items[items.length - 1]?.index ?? 0;
   // re-ensured after every store change too, so an invalidated window refetches in place
   useEffect(() => {
-    store.ensureRange(first - 128, last + 512);
+    store.ensureRange(first - PREFETCH_BEFORE, last + PREFETCH_AFTER);
   }, [store, first, last, rowCount, revision]);
 
   const sel = selection ? norm(selection) : null;
@@ -327,13 +353,47 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
     e.stopPropagation();
     const x0 = e.clientX;
     const w0 = widths[col];
-    const onMove = (ev: MouseEvent) => setWidths((w) => w.map((x, i) => (i === col ? Math.max(40, w0 + ev.clientX - x0) : x)));
+    const onMove = (ev: MouseEvent) => {
+      if (ev.clientX !== x0) suppressHeaderClick.current = true;
+      setWidths((w) => w.map((x, i) => (i === col ? Math.max(MIN_COL_W, w0 + ev.clientX - x0) : x)));
+    };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      // the click (if any) is dispatched right after this mouseup
+      setTimeout(() => (suppressHeaderClick.current = false), 0);
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
+  };
+
+  /** Widen (or narrow) a column to its header and the values loaded around the viewport. */
+  const fitColumn = (col: number) => {
+    const root = getComputedStyle(scrollRef.current ?? document.documentElement);
+    const mono = root.getPropertyValue("--font-mono") || "monospace";
+    const ui = root.getPropertyValue("--font-ui") || "sans-serif";
+    const small = root.getPropertyValue("--fs-small") || "11.5px";
+    const c = columns[col];
+    // header: name (bold) or type, plus room for the key mark and sort button
+    let w = Math.max(textWidth(c.name, `600 ${small} ${ui}`) + (c.key ? 34 : 0) + (onSort ? 18 : 0), textWidth(c.type ?? "", `10.5px ${ui}`));
+    const r1 = Math.min(rowCount - 1, last + PREFETCH_AFTER);
+    for (let r = Math.max(0, first - PREFETCH_BEFORE); r <= r1; r++) {
+      const v = store.cell(r, col);
+      if (v === undefined) continue;
+      w = Math.max(w, v === null ? textWidth("NULL", `italic 11px ${ui}`) : textWidth(v, `12px ${mono}`));
+    }
+    // cell padding (6 + 6), the border, and a pixel against sub-pixel rounding
+    const fitted = Math.min(MAX_FIT_W, Math.max(MIN_COL_W, Math.ceil(w) + 14));
+    setWidths((ws) => ws.map((x, i) => (i === col ? fitted : x)));
+  };
+
+  const selectColumn = (col: number, extend: boolean) => {
+    if (suppressHeaderClick.current || rowCount === 0) return;
+    scrollRef.current?.focus({ preventScroll: true });
+    const lastRow = rowCount - 1;
+    setSelection((s) =>
+      extend && s ? { anchor: { row: 0, col: s.anchor.col }, focus: { row: lastRow, col } } : { anchor: { row: 0, col }, focus: { row: lastRow, col } },
+    );
   };
 
   return (
@@ -357,16 +417,41 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
               style={{ width: widths[i] }}
               title={c.type ? `${c.name} — ${c.type}` : c.name}
               aria-sort={sort?.column === i ? (sort.dir === "asc" ? "ascending" : "descending") : undefined}
-              onClick={() => onSort?.(i)}
+              onClick={(e) => selectColumn(i, e.shiftKey)}
               data-sortable={!!onSort || undefined}
+              data-sorted={sort?.column === i || undefined}
             >
               <span className="col-name">
                 {c.key && <span className="key-mark" title="row key">KEY</span>}
                 {c.name}
               </span>
               {c.type && <span className="col-type">{c.type}</span>}
-              {sort?.column === i && <span className="sort-mark">{sort.dir === "asc" ? "▲" : "▼"}</span>}
-              <span className="col-resizer" onMouseDown={(e) => startResize(i, e)} />
+              {onSort && (
+                <button
+                  type="button"
+                  className="icon sort-button"
+                  aria-label={`Sort by ${c.name}`}
+                  title={sort?.column !== i ? "Sort ascending" : sort.dir === "asc" ? "Sort descending" : "Clear sort"}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSort(i);
+                  }}
+                >
+                  {sort?.column === i ? (sort.dir === "asc" ? "▲" : "▼") : "⇅"}
+                </button>
+              )}
+              {!onSort && sort?.column === i && <span className="sort-mark">{sort.dir === "asc" ? "▲" : "▼"}</span>}
+              <span
+                className="col-resizer"
+                title="Drag to resize, double-click to fit"
+                onMouseDown={(e) => startResize(i, e)}
+                onClick={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  fitColumn(i);
+                }}
+              />
             </span>
           ))}
         </div>

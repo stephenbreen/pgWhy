@@ -7,6 +7,8 @@ import { ErrorNote } from "../../connection/ErrorNote";
 import type { ConstraintInfo, RelationDetails } from "../../lib/ipc/explorer";
 import { actionsFor } from "../actions";
 import { useDetails } from "./store";
+import { DETAILS_W, maxPaneWidth, useLayout } from "../../app/layout";
+import { Splitter } from "../../app/Splitter";
 
 function bytes(n?: number | null): string {
   if (n == null) return "—";
@@ -153,8 +155,20 @@ export function DetailsPanel() {
   const title =
     target?.type === "relation" ? `${target.rel.schema}.${target.rel.name}` : target?.type === "routine" ? `${target.routine.name}(${target.routine.identity_args})` : target?.type === "database" ? target.db.name : target?.type === "schema" ? target.schema : "Details";
   const actions = target ? actionsFor(target).filter((a) => !a.group) : [];
+  const width = useLayout((s) => s.detailsWidth);
+  const setWidth = useLayout((s) => s.setDetailsWidth);
   return (
     <aside className="details-dock" aria-label="Details">
+      <Splitter
+        label="Resize details"
+        edge="left"
+        width={width}
+        min={DETAILS_W.min}
+        // the dock only shows beside the explorer, so the sidebar is always open with it
+        max={() => maxPaneWidth(DETAILS_W, useLayout.getState().sidebarWidth)}
+        defaultWidth={DETAILS_W.default}
+        onResize={setWidth}
+      />
       <header className="pane-header">
         <span className="details-title" title={title}>{title}</span>
         <span className="spacer" />

@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import { ActivityBar } from "./ActivityBar";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { MainArea } from "./MainArea";
@@ -6,6 +7,8 @@ import { StatusBar } from "./StatusBar";
 import { openSettings } from "./Settings";
 import { useUpdates } from "./updates";
 import { useWorkspace } from "./workspace";
+import { useLayout } from "./layout";
+import { ZoomIndicator } from "./ZoomIndicator";
 import { StatusBarConnection } from "../connection/StatusBarConnection";
 import { DetailsPanel } from "../explorer/details/DetailsPanel";
 import { useDetails } from "../explorer/details/store";
@@ -22,10 +25,13 @@ export function App() {
   // the details dock belongs to the explorer; it shows once something is selected
   const update = useUpdates((s) => s.available);
   const details = detailsVisible && hasTarget && sidebarVisible && activeView === "explorer";
+  const sidebarWidth = useLayout((s) => s.sidebarWidth);
+  const detailsWidth = useLayout((s) => s.detailsWidth);
+  const paneWidths = { "--sidebar-w": `${sidebarWidth}px`, "--details-w": `${detailsWidth}px` } as CSSProperties;
   return (
-    <div className="shell" data-sidebar={sidebarVisible ? "open" : "closed"} data-details={details ? "open" : "closed"}>
+    <div className="shell" style={paneWidths} data-sidebar={sidebarVisible ? "open" : "closed"} data-details={details ? "open" : "closed"}>
       <ActivityBar />
-      {sidebarVisible && <Sidebar />}
+      {sidebarVisible && <Sidebar detailsOpen={details} />}
       <ErrorBoundary>
         <MainArea />
       </ErrorBoundary>
@@ -42,6 +48,7 @@ export function App() {
                 pgWhy {update.version} is available
               </button>
             )}
+            <ZoomIndicator />
             {!details && hasTarget && (
               <button type="button" className="link" onClick={() => useDetails.getState().show(true)}>
                 Show details

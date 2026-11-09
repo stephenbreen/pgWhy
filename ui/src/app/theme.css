@@ -85,13 +85,15 @@ input, select, textarea { font: inherit; color: inherit; }
 
 .shell {
   display: grid;
-  grid-template-columns: 44px 300px 1fr;
+  /* pane widths come from the splitters (--sidebar-w / --details-w); min() keeps a stored
+     width from crowding out the main area on a smaller window */
+  grid-template-columns: 44px min(var(--sidebar-w, 300px), 50vw) minmax(0, 1fr);
   /* minmax(0, …): grid items default to min-height:auto and would grow past the window */
   grid-template-rows: minmax(0, 1fr) 24px;
   grid-template-areas: "activity sidebar main" "status status status";
   height: 100%;
 }
-.shell[data-sidebar="closed"] { grid-template-columns: 44px 1fr; grid-template-areas: "activity main" "status status"; }
+.shell[data-sidebar="closed"] { grid-template-columns: 44px minmax(0, 1fr); grid-template-areas: "activity main" "status status"; }
 
 .activity-bar {
   grid-area: activity;
@@ -115,6 +117,7 @@ input, select, textarea { font: inherit; color: inherit; }
 
 .sidebar {
   grid-area: sidebar;
+  position: relative;
   min-height: 0;
   overflow: hidden;
   display: flex;
@@ -135,6 +138,14 @@ input, select, textarea { font: inherit; color: inherit; }
   border-bottom: 1px solid var(--border);
   flex: none;
 }
+/* drag handle on a pane's inner edge; the accent line shows on hover, focus and drag */
+.pane-splitter { position: absolute; top: 0; bottom: 0; width: 6px; z-index: 5; cursor: col-resize; touch-action: none; outline: none; }
+.pane-splitter[data-edge="right"] { right: 0; }
+.pane-splitter[data-edge="left"] { left: 0; }
+.pane-splitter::after { content: ""; position: absolute; top: 0; bottom: 0; width: 2px; background: transparent; transition: background 0.1s 0.15s; }
+.pane-splitter[data-edge="right"]::after { right: 0; }
+.pane-splitter[data-edge="left"]::after { left: 0; }
+.pane-splitter:hover::after, .pane-splitter:focus-visible::after, .pane-splitter:active::after { background: var(--accent); }
 .sidebar-body { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
 .sidebar-body > * { flex: none; }
 
