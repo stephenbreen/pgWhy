@@ -36,6 +36,9 @@ pub use pgpass::{sweep_stale_pgpass, PgPassDir, PgPassFile};
 pub use progress::{ProgressEvent, ProgressPhase};
 pub use retention::{apply_retention, plan_retention, RetentionPlan, RetentionPolicy};
 pub use runner::{CancelHandle, FailureCause, RunContext, ToolRun};
-pub use toc::{inspect_archive, parse_toc, ArchiveCheck, ArchiveInspection, Toc, TocEntry};
+pub use toc::{
+    inspect_archive, parse_archive_header, parse_toc, read_archive_header, ArchiveCheck,
+    ArchiveHeader, ArchiveInspection, Toc, TocEntry,
+};
 
 pub use pgwhy_errors::{AppError, AppResult, ErrorClass, ErrorKind};

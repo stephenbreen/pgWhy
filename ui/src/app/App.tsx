@@ -4,6 +4,8 @@ import { ErrorBoundary } from "./ErrorBoundary";
 import { MainArea } from "./MainArea";
 import { Sidebar } from "./Sidebar";
 import { StatusBar } from "./StatusBar";
+import { openSettings } from "./Settings";
+import { useUpdates } from "./updates";
 import { useWorkspace } from "./workspace";
 import { useLayout } from "./layout";
 import { ZoomIndicator } from "./ZoomIndicator";
@@ -21,6 +23,7 @@ export function App() {
   const detailsVisible = useDetails((s) => s.visible);
   const hasTarget = useDetails((s) => s.target !== null);
   // the details dock belongs to the explorer; it shows once something is selected
+  const update = useUpdates((s) => s.available);
   const details = detailsVisible && hasTarget && sidebarVisible && activeView === "explorer";
   const sidebarWidth = useLayout((s) => s.sidebarWidth);
   const detailsWidth = useLayout((s) => s.detailsWidth);
@@ -40,6 +43,11 @@ export function App() {
         connection={<StatusBarConnection />}
         right={
           <>
+            {update && (
+              <button type="button" className="link" onClick={openSettings}>
+                pgWhy {update.version} is available
+              </button>
+            )}
             <ZoomIndicator />
             {!details && hasTarget && (
               <button type="button" className="link" onClick={() => useDetails.getState().show(true)}>

@@ -44,7 +44,10 @@ Recent scripts remember which connection they last ran against.
 **Backup and restore.** Back up a database, schema or table with `pg_dump`, in custom or
 directory format, with schema, data or both. Restore into a new database, replace an existing
 one, or restore on top of one. Every backup and restore shows up in History, and any backup
-there can be restored with one click.
+there can be restored with one click. Backups go to pgWhy's backup folder, which keeps the newest
+few, unless you use **Save as…** to pick your own file, which pgWhy never removes. Custom format
+is plain `pg_dump --format=custom`, the same thing pgAdmin's "Custom" option writes, so pgWhy can
+restore a pgAdmin backup whatever the file is called.
 
 ## Destructive operations
 
@@ -89,6 +92,12 @@ There are no prebuilt releases yet; see [Building](#building). Builds are unsign
 - **Windows:** SmartScreen will say "Windows protected your PC". Click More info, then Run
   anyway.
 
+### Updates
+
+pgWhy looks for a new GitHub release when it starts, and the status bar says when there is one.
+Installing it asks about open transactions first, and it waits for any running backup, restore or
+workflow. The check only asks GitHub for the latest version; you can turn it off in Settings.
+
 ### pg_dump and pg_restore
 
 Backup, restore and "Script as CREATE" use the Postgres client tools installed on your machine.
@@ -126,6 +135,9 @@ that only you can read, not on the command line.
   the old copy. You can drop it from History later.
 - **A `.sql` file is refused for restore:** plain SQL dumps need `psql`, which pgWhy doesn't
   use. Back up in custom format (the default) instead.
+- **"pg_restore 16 cannot restore a backup made by pg_dump 18":** the backup came from newer
+  tools than you have installed. pgAdmin bundles its own, so this is common with its backups.
+  Install that version's client tools and choose the file again.
 
 ## Building
 
@@ -137,6 +149,37 @@ npm --prefix ui install
 npm run dev                  # run the app with hot reload
 npm run build                # build installers for your OS
 ```
+
+### Releasing
+
+Pushing a version tag builds signed installers for macOS (Apple Silicon and Intel) and Windows into
+a draft GitHub release. Nothing is public until you publish the draft.
+
+```bash
+# after setting the new version in Cargo.toml, src-tauri/tauri.conf.json and ui/package.json
+scripts/check-release-version.sh v0.2.0
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The Mac builds need these repository secrets, and the workflow stops if any are missing:
+
+| Secret | Value |
+| --- | --- |
+| `APPLE_CERTIFICATE` | Your **Developer ID Application** certificate exported as a `.p12`, then base64: `openssl base64 -A -in cert.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | The password you set when exporting the `.p12` |
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Your Name (TEAMID)` |
+| `APPLE_ID` | Your Apple account email |
+| `APPLE_PASSWORD` | An [app-specific password](https://support.apple.com/102654), not your account password |
+| `APPLE_TEAM_ID` | Your 10-character Team ID |
+| `TAURI_SIGNING_PRIVATE_KEY` | The updater's private key file contents |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | That key's password |
+
+Windows builds aren't signed yet, so SmartScreen warns on those.
+
+The updater key is separate from the Apple certificate: installed copies only accept updates signed
+with it, using the public key in `src-tauri/tauri.conf.json`. Keep a backup. If it's lost, every
+installed copy has to be reinstalled by hand.
 
 ### Tests
 
