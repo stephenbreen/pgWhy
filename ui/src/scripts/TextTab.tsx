@@ -36,7 +36,7 @@ function withExt(path: string, ext: string): string {
   return /\.(sql|txt|md)$/i.test(path) ? path : `${path}${ext}`;
 }
 
-function PlainEditor({ initialText, onChange, onSave, viewRef }: { initialText: string; onChange: (t: string) => void; onSave: () => void; viewRef: { current: EditorView | null } }) {
+function PlainEditor({ initialText, onChange, onSave, viewRef }: { initialText: string; onChange: () => void; onSave: () => void; viewRef: { current: EditorView | null } }) {
   const host = useRef<HTMLDivElement>(null);
   const callbacks = useRef({ onChange, onSave });
   callbacks.current = { onChange, onSave };
@@ -61,7 +61,7 @@ function PlainEditor({ initialText, onChange, onSave, viewRef }: { initialText: 
             ...historyKeymap,
           ]),
           EditorView.updateListener.of((u) => {
-            if (u.docChanged) callbacks.current.onChange(u.state.doc.toString());
+            if (u.docChanged) callbacks.current.onChange();
           }),
           editorTheme,
         ],
@@ -94,7 +94,8 @@ export function TextTab({ tab }: { tab: Tab }) {
 
   const save = async (asPath?: string) => {
     setError(null);
-    const text = textRef.current;
+    // read from the editor at save time rather than copying the document on every keystroke
+    const text = viewRef.current?.state.doc.toString() ?? textRef.current;
     try {
       if (asPath) {
         const opened = await ipc.scriptSave(withExt(asPath, ext), text);
@@ -195,10 +196,7 @@ export function TextTab({ tab }: { tab: Tab }) {
           viewRef={viewRef}
           initialText={textRef.current}
           onSave={() => void save()}
-          onChange={(t) => {
-            textRef.current = t;
-            setDirty(true);
-          }}
+          onChange={() => setDirty(true)}
         />
       </div>
     </div>

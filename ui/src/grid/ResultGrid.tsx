@@ -96,11 +96,17 @@ export function toTsv(rows: (string | null | undefined)[][], header?: string[]):
   return lines.join("\n");
 }
 
+// Cells take their width from a per-column CSS variable set on the grid body, so resizing a
+// column restyles the cells without re-rendering any row.
+const cellStyles: CSSProperties[] = [];
+function cellStyle(col: number): CSSProperties {
+  return (cellStyles[col] ??= { width: `var(--col-${col})` });
+}
+
 const Row = memo(function Row({
   index,
   top,
   cols,
-  widths,
   store,
   sel,
   editing,
@@ -112,7 +118,6 @@ const Row = memo(function Row({
   index: number;
   top: number;
   cols: number;
-  widths: number[];
   store: RowStore;
   sel: { r0: number; r1: number; c0: number; c1: number } | null;
   editing: { row: number; col: number } | null;
@@ -134,13 +139,12 @@ const Row = memo(function Row({
         const v = store.cell(index, c);
         const selected = sel && index >= sel.r0 && index <= sel.r1 && c >= sel.c0 && c <= sel.c1;
         const isEditing = editing && editing.row === index && editing.col === c;
-        const style: CSSProperties = { width: widths[c] };
         return (
           <span
             key={c}
             role="gridcell"
             className="grid-cell"
-            style={style}
+            style={cellStyle(c)}
             data-null={v === null || undefined}
             data-numeric={numeric[c] || undefined}
             data-pending={store.pending(index, c) || undefined}
@@ -234,6 +238,7 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
 
   const numeric = useMemo(() => columns.map((c) => !!c.type && NUMERIC.test(c.type)), [columns]);
   const totalWidth = GUTTER_W + widths.reduce((a, b) => a + b, 0);
+  const colVars = useMemo(() => Object.fromEntries(widths.map((w, i) => [`--col-${i}`, `${w}px`])), [widths]);
 
   const virtualizer = useVirtualizer({
     count: rowCount,
@@ -455,14 +460,13 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
             </span>
           ))}
         </div>
-        <div className="grid-body" style={{ height: virtualizer.getTotalSize(), width: totalWidth }}>
+        <div className="grid-body" style={{ height: virtualizer.getTotalSize(), width: totalWidth, ...colVars }}>
           {items.map((vi) => (
             <Row
               key={vi.index % SLOTS}
               index={vi.index}
               top={vi.start}
               cols={columns.length}
-              widths={widths}
               store={store}
               sel={sel && vi.index >= sel.r0 && vi.index <= sel.r1 ? sel : null}
               editing={editing && editing.row === vi.index ? editing : null}
