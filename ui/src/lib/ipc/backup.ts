@@ -36,6 +36,8 @@ export interface BackupRequest {
   jobs: number | null;
   data: BackupData;
   scope: BackupScope;
+  /** A file chosen with "Save as…", which retention never touches; null is the backup folder. */
+  save_as: string | null;
 }
 
 export const defaultBackupRequest = (scope: BackupScope): BackupRequest => ({
@@ -43,7 +45,11 @@ export const defaultBackupRequest = (scope: BackupScope): BackupRequest => ({
   jobs: null,
   data: "all",
   scope,
+  save_as: null,
 });
+
+export const pickBackupPath = (database: string, format: BackupFormat) =>
+  invoke<string | null>("pick_backup_path", { database, format });
 
 export function backupDatabase(
   backupId: string,

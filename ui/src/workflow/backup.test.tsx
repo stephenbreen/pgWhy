@@ -98,3 +98,101 @@ describe("backup options", () => {
     await act(async () => finish!());
   });
 });
+
+describe("save as", () => {
+  function backend(picked: string | null, onBackup?: (args: Record<string, unknown>) => unknown) {
+    const sent: Record<string, unknown>[] = [];
+    mockIPC((cmd, args) => {
+      if (cmd === "pick_backup_path") return picked;
+      if (cmd === "backup_database") {
+        sent.push(args as Record<string, unknown>);
+        return onBackup ? onBackup(args as Record<string, unknown>) : new Promise<void>(() => {});
+      }
+      return null;
+    });
+    return sent;
+  }
+
+  async function openForm() {
+    render(<App />);
+    act(() => openBackup("c1", "app"));
+    await screen.findByText(/Backing up/);
+  }
+
+  it("defaults to the backup folder and sends no path", async () => {
+    const sent = backend(null);
+    await openForm();
+    expect(screen.getByLabelText(/backup location/i)).toHaveValue("pgWhy's backup folder");
+    expect(screen.getByText(/removes the oldest backups/i)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /^back up$/i }));
+    expect(sent[0]).toMatchObject({ request: { save_as: null } });
+  });
+
+  it("sends the chosen file and says pgWhy won't remove it", async () => {
+    const sent = backend("/Users/me/Desktop/mydb");
+    await openForm();
+    await userEvent.click(screen.getByRole("button", { name: /save as/i }));
+    expect(await screen.findByDisplayValue("/Users/me/Desktop/mydb")).toBeInTheDocument();
+    expect(screen.getByText(/never removes this file/i)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /^back up$/i }));
+    expect(sent[0]).toMatchObject({ request: { save_as: "/Users/me/Desktop/mydb" } });
+  });
+
+  it("keeps the current location when the dialog is cancelled", async () => {
+    backend(null);
+    await openForm();
+    await userEvent.click(screen.getByRole("button", { name: /save as/i }));
+    expect(screen.getByLabelText(/backup location/i)).toHaveValue("pgWhy's backup folder");
+    expect(screen.queryByRole("button", { name: /use backup folder/i })).not.toBeInTheDocument();
+  });
+
+  it("can go back to the backup folder, and a format change clears the choice", async () => {
+    backend("/Users/me/mydb.dump");
+    await openForm();
+    const user = userEvent.setup();
+    const location = screen.getByLabelText(/backup location/i);
+
+    await user.click(screen.getByRole("button", { name: /save as/i }));
+    await screen.findByDisplayValue("/Users/me/mydb.dump");
+    await user.click(screen.getByRole("button", { name: /use backup folder/i }));
+    expect(location).toHaveValue("pgWhy's backup folder");
+
+    await user.click(screen.getByRole("button", { name: /save as/i }));
+    await screen.findByDisplayValue("/Users/me/mydb.dump");
+    await user.selectOptions(screen.getByLabelText(/backup format/i), "directory");
+    expect(location).toHaveValue("pgWhy's backup folder");
+  });
+
+  it("brings the form back when the choice is refused, so it can be corrected", async () => {
+    backend("/Users/me/taken.dump", () =>
+      Promise.reject({ kind: "config", class: "fix_then_retry", message: "A backup already exists at /Users/me/taken.dump" }),
+    );
+    await openForm();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /save as/i }));
+    await screen.findByDisplayValue("/Users/me/taken.dump");
+    await user.click(screen.getByRole("button", { name: /^back up$/i }));
+
+    expect(await screen.findAllByText(/already exists/)).toHaveLength(1);
+    expect(screen.getByRole("button", { name: /^back up$/i })).toBeEnabled();
+    expect(screen.getByLabelText(/backup location/i)).toHaveValue("/Users/me/taken.dump");
+  });
+
+  it("offers the chosen file's folder when it finishes", async () => {
+    backend("/Users/me/mydb", (args) => {
+      const events = args.events as { onmessage: (e: BackupEvent) => void };
+      events.onmessage({ type: "started", path: "/Users/me/mydb", pg_dump: "pg_dump 16.15", server_version: "16.4" });
+      events.onmessage({ type: "finished", path: "/Users/me/mydb", size_bytes: 1024, duration_ms: 1000, removed_by_retention: [] });
+      return null;
+    });
+    await openForm();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /save as/i }));
+    await screen.findByDisplayValue("/Users/me/mydb");
+    await user.click(screen.getByRole("button", { name: /^back up$/i }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("/Users/me/mydb");
+    expect(screen.getByRole("button", { name: "Open folder" })).toBeInTheDocument();
+    expect(screen.queryByText(/Removed \d+ older/)).not.toBeInTheDocument();
+  });
+});

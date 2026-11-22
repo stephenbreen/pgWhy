@@ -12,6 +12,7 @@ import { initShortcuts } from "./app/shortcuts";
 import { initZoom } from "./app/layout";
 import { registerTab } from "./app/registry";
 import { SettingsTab } from "./app/Settings";
+import { useUpdates } from "./app/updates";
 import "./app/theme.css";
 import "./app/components.css";
 
@@ -28,6 +29,7 @@ initQuitHandler();
 initShortcuts();
 initZoom();
 registerTab("settings", SettingsTab);
+void useUpdates.getState().check(true);
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

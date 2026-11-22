@@ -47,10 +47,20 @@ export function BackupTab({ tab }: { tab: Tab }) {
   const [done, setDone] = useState<Extract<b.BackupEvent, { type: "finished" }> | null>(null);
   const [error, setError] = useState<AppError | null>(null);
   const [running, setRunning] = useState(false);
-  const [startedOnce, setStartedOnce] = useState(false);
+
+  // A backup refused before it started (the chosen file exists, say) can be corrected here.
+  const showForm = !running && !started && !done;
+
+  const chooseLocation = () => {
+    setError(null);
+    b.pickBackupPath(data.database, request.format)
+      .then((path) => {
+        if (path) setRequest((r) => ({ ...r, save_as: path }));
+      })
+      .catch((e) => setError(toAppError(e)));
+  };
 
   const start = () => {
-    setStartedOnce(true);
     setRunning(true);
     setError(null);
     b.backupDatabase(tab.id, data.connectionId, data.database, request, (ev) => {
@@ -75,7 +85,7 @@ export function BackupTab({ tab }: { tab: Tab }) {
           </button>
         )}
       </header>
-      {!startedOnce && (
+      {showForm && (
         <form
           className="backup-form"
           onSubmit={(e) => {
@@ -91,7 +101,8 @@ export function BackupTab({ tab }: { tab: Tab }) {
             <select
               aria-label="Backup format"
               value={request.format}
-              onChange={(e) => setRequest({ ...request, format: e.target.value as b.BackupFormat })}
+              // a chosen name was suggested for the old format, so it's chosen again
+              onChange={(e) => setRequest({ ...request, format: e.target.value as b.BackupFormat, save_as: null })}
             >
               <option value="custom">Custom (single file, restorable, compressed)</option>
               <option value="directory">Directory (parallel, larger)</option>
@@ -124,6 +135,25 @@ export function BackupTab({ tab }: { tab: Tab }) {
               <option value="data_only">Data only (no DDL)</option>
             </select>
           </label>
+          <label>
+            Save to
+            <span className="row">
+              <input aria-label="Backup location" readOnly value={request.save_as ?? "pgWhy's backup folder"} />
+              <button type="button" onClick={chooseLocation}>
+                Save as…
+              </button>
+              {request.save_as && (
+                <button type="button" onClick={() => setRequest({ ...request, save_as: null })}>
+                  Use backup folder
+                </button>
+              )}
+            </span>
+          </label>
+          <p className="note">
+            {request.save_as
+              ? "pgWhy never removes this file. It's yours to keep or delete."
+              : "pgWhy removes the oldest backups here automatically (see Settings)."}
+          </p>
           {error && <ErrorNote error={error} />}
           <div className="modal-actions">
             <button type="submit">Back up</button>
@@ -144,11 +174,11 @@ export function BackupTab({ tab }: { tab: Tab }) {
           </p>
           {done.removed_by_retention.length > 0 && <p className="muted">Removed {done.removed_by_retention.length} older backup(s) per retention.</p>}
           <button type="button" onClick={() => void b.revealPath(done.path)}>
-            Open backup folder
+            {request.save_as ? "Open folder" : "Open backup folder"}
           </button>
         </div>
       )}
-      {error && <ErrorNote error={error} />}
+      {error && !showForm && <ErrorNote error={error} />}
     </div>
   );
 }

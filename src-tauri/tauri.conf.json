@@ -54,5 +54,13 @@
     "category": "DeveloperTool",
     "shortDescription": "Postgres desktop tool with a one-action local refresh",
     "copyright": "pgWhy"
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERDMzk0OTg1QzM1NEJBNkMKUldSc3VsVERoVWs1M05LMXJQcXJnRzhNQWRLSXNySlBVNnlwVWpNbHFXK3BsQkZING96QU0wN1gK",
+      "endpoints": [
+        "https://github.com/stephenbreen/pgWhy/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

@@ -1,4 +1,5 @@
-// Settings tab: zoom, top-N rows, backup retention and folders, script library, pg tool search dirs.
+// Settings tab: zoom, top-N rows, updates, backup retention and folders, script library, pg tool
+// search dirs.
 
 import { useEffect, useState, type FormEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -7,6 +8,8 @@ import { ZOOM_STEPS, useLayout } from "./layout";
 import { shortcut } from "./keys";
 import { ErrorNote } from "../connection/ErrorNote";
 import { toAppError, type AppError } from "../lib/ipc/errors";
+import { appInfo } from "../lib/ipc/app";
+import { UpdatesSection } from "./updates";
 
 interface AppSettings {
   top_n: number;
@@ -20,6 +23,7 @@ interface AppSettings {
   result_row_cap: number;
   /** megabytes one result set keeps before it is marked truncated */
   result_byte_cap_mb: number;
+  check_for_updates: boolean;
 }
 
 interface SettingsView {
@@ -37,6 +41,7 @@ export function SettingsTab({ tab }: { tab: Tab }) {
   const [s, setS] = useState<AppSettings | null>(null);
   const [error, setError] = useState<AppError | null>(null);
   const [saved, setSaved] = useState(false);
+  const [version, setVersion] = useState<string>();
   const closeTab = useWorkspace((x) => x.closeTab);
   const zoom = useLayout((x) => x.zoom);
   const setZoom = useLayout((x) => x.setZoom);
@@ -48,6 +53,7 @@ export function SettingsTab({ tab }: { tab: Tab }) {
 
   useEffect(() => {
     void invoke<SettingsView>("settings_get", { rescanTools: false }).then(apply).catch((e) => setError(toAppError(e)));
+    void appInfo().then((info) => setVersion(info?.version)).catch(() => {});
   }, []);
 
   if (!s || !view) return error ? <ErrorNote error={error} /> : <p className="empty">Loading…</p>;
@@ -128,6 +134,11 @@ export function SettingsTab({ tab }: { tab: Tab }) {
           32 MB — use export for more.
         </p>
       </fieldset>
+      <UpdatesSection currentVersion={version} />
+      <label className="check">
+        <input type="checkbox" checked={s.check_for_updates} onChange={(e) => set("check_for_updates", e.target.checked)} />
+        Check for updates when pgWhy starts
+      </label>
       <fieldset>
         <legend>Backups</legend>
         <label className="narrow">

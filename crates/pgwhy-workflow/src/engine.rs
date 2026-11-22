@@ -602,6 +602,11 @@ impl Engine {
         lock(&self.inner.operation_cancels).remove(id);
     }
 
+    /// Whether a one-off operation that can be cancelled (a restore) is running.
+    pub fn has_active_operations(&self) -> bool {
+        !lock(&self.inner.operation_cancels).is_empty()
+    }
+
     /// Cancel a running one-off operation. Returns whether one was running under `id`.
     pub fn cancel_operation(&self, id: &RunId) -> bool {
         match lock(&self.inner.operation_cancels).get(id) {
@@ -1215,8 +1220,8 @@ impl Runner {
 
     async fn dump(&mut self) -> AppResult<()> {
         let ts = staging::compact_timestamp(SystemTime::now());
-        let file = format!("{}_{}.dump", sanitize(self.plan.source_db()), ts);
-        let out = self.plan.backup_dir.join(file);
+        let stem = format!("{}_{}", sanitize(self.plan.source_db()), ts);
+        let out = unique_dump_path(&self.plan.backup_dir, &stem);
         let log_dir = self.inner.history.log_dir(&self.rec.run_id);
         std::fs::create_dir_all(&log_dir).map_err(|e| {
             AppError::new(ErrorKind::Disk, "could not create the run's log folder")
@@ -1523,6 +1528,18 @@ impl Runner {
     }
 }
 
+/// `<stem>.dump`, numbered when taken. Names are second-granular, so two runs of a workflow inside
+/// one second would otherwise stop on "a backup already exists".
+fn unique_dump_path(dir: &std::path::Path, stem: &str) -> PathBuf {
+    let mut path = dir.join(format!("{stem}.dump"));
+    let mut n = 1;
+    while path.exists() {
+        n += 1;
+        path = dir.join(format!("{stem}_{n}.dump"));
+    }
+    path
+}
+
 /// File-name-safe rendering of a database name.
 fn sanitize(name: &str) -> String {
     let s: String = name
@@ -1546,4 +1563,20 @@ fn sanitize(name: &str) -> String {
 /// The run lock key for a connection id via the real manager (helper for the app layer).
 pub fn server_key_of(deps: &RealDeps, id: &ConnectionId) -> AppResult<ServerKey> {
     Ok(deps.manager.entry(id)?.server_key())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dump_names_are_numbered_when_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = || unique_dump_path(dir.path(), "shop_20261105_120000");
+        assert_eq!(name(), dir.path().join("shop_20261105_120000.dump"));
+        std::fs::write(name(), "").unwrap();
+        assert_eq!(name(), dir.path().join("shop_20261105_120000_2.dump"));
+        std::fs::write(name(), "").unwrap();
+        assert_eq!(name(), dir.path().join("shop_20261105_120000_3.dump"));
+    }
 }

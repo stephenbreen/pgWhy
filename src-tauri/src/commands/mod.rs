@@ -14,6 +14,7 @@ pub mod runs;
 pub mod scripts;
 pub mod settings;
 pub mod tunnels;
+pub mod updates;
 pub mod workflows;
 
 /// Run blocking work (file and library I/O) off the main thread. Sync commands run on it and

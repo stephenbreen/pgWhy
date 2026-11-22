@@ -9,6 +9,7 @@ use crate::runner::{run_child, ChildSpec, FailureCause, RunContext};
 use pgwhy_errors::{AppError, AppResult, ErrorKind};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Header fields from the `;`-comment block of `pg_restore -l`.
@@ -173,6 +174,116 @@ fn parse_entry(line: &str) -> Option<TocEntry> {
     })
 }
 
+/// The fixed header of a custom-format archive (`pg_dump --format=custom`, which is what pgAdmin's
+/// "Custom" backup format runs).
+///
+/// pgWhy reads this itself because `pg_restore` can't: one older than the archive stops at
+/// "unsupported version" without saying which pg_dump wrote it, and that version is what the user
+/// has to install. Everything else about an archive still comes from `pg_restore --list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveHeader {
+    /// Archive format version (`1.16-0`).
+    pub dump_version: String,
+    pub dbname: Option<String>,
+    pub dumped_from: Option<PgVersion>,
+    pub dumped_by: Option<PgVersion>,
+}
+
+/// Enough for the header: its only variable parts are a database name and two version strings.
+const ARCHIVE_HEADER_LIMIT: u64 = 4096;
+
+/// [`parse_archive_header`] on the start of `path`. `None` for anything unreadable.
+pub fn read_archive_header(path: &Path) -> Option<ArchiveHeader> {
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(ARCHIVE_HEADER_LIMIT)
+        .read_to_end(&mut head)
+        .ok()?;
+    parse_archive_header(&head)
+}
+
+/// Parse the header written by pg_dump's `WriteHead`. `None` when these bytes aren't one: the file
+/// can be anything the user picked, and `pg_restore` has the final say on what it can read.
+pub fn parse_archive_header(bytes: &[u8]) -> Option<ArchiveHeader> {
+    let mut r = HeaderReader { bytes, int_size: 0 };
+    if r.take(5)? != b"PGDMP" {
+        return None;
+    }
+    let (major, minor, rev) = (r.byte()?, r.byte()?, r.byte()?);
+    // The layout below has been stable since 1.4 (PostgreSQL 7.x).
+    if (major, minor) < (1, 4) {
+        return None;
+    }
+    r.int_size = usize::from(r.byte()?);
+    if !(1..=8).contains(&r.int_size) {
+        return None;
+    }
+    let _offset_size = r.byte()?;
+    let _format = r.byte()?;
+    // Compression: an algorithm byte since 1.15 (PostgreSQL 16), a level before that.
+    if (major, minor) >= (1, 15) {
+        r.byte()?;
+    } else {
+        r.int()?;
+    }
+    // Creation time: sec, min, hour, mday, mon, year, isdst.
+    for _ in 0..7 {
+        r.int()?;
+    }
+    let dbname = r.string()?;
+    let dumped_from = r.string()?;
+    let dumped_by = r.string()?;
+    Some(ArchiveHeader {
+        dump_version: format!("{major}.{minor}-{rev}"),
+        dbname: Some(dbname).filter(|d| !d.is_empty()),
+        dumped_from: PgVersion::parse(&dumped_from),
+        dumped_by: PgVersion::parse(&dumped_by),
+    })
+}
+
+struct HeaderReader<'a> {
+    bytes: &'a [u8],
+    int_size: usize,
+}
+
+impl<'a> HeaderReader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if n > self.bytes.len() {
+            return None;
+        }
+        let (head, tail) = self.bytes.split_at(n);
+        self.bytes = tail;
+        Some(head)
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+
+    /// A sign byte, then `int_size` little-endian magnitude bytes.
+    fn int(&mut self) -> Option<i64> {
+        let negative = self.byte()? != 0;
+        let magnitude = self
+            .take(self.int_size)?
+            .iter()
+            .rev()
+            .fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
+        let value = i64::try_from(magnitude).ok()?;
+        Some(if negative { -value } else { value })
+    }
+
+    /// A length (negative for a null string), then that many bytes.
+    fn string(&mut self) -> Option<String> {
+        let len = self.int()?;
+        if len <= 0 {
+            return Some(String::new());
+        }
+        let raw = self.take(usize::try_from(len).ok()?)?;
+        Some(String::from_utf8_lossy(raw).into_owned())
+    }
+}
+
 /// How hard to look at an archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -327,6 +438,57 @@ mod tests {
         assert_eq!(toc.entries[0].schema, None);
         assert_eq!(toc.entries[7].desc, "SEQUENCE SET");
         assert_eq!(toc.restorable_count(true), 10);
+    }
+
+    const PG14: &[u8] = include_bytes!("../tests/fixtures/custom-header-pg14.bin");
+    const PG16: &[u8] = include_bytes!("../tests/fixtures/custom-header-pg16.bin");
+    const PG18: &[u8] = include_bytes!("../tests/fixtures/custom-header-pg18.bin");
+
+    /// Real archives from each side of the 1.15 layout change, cut off after the header.
+    #[test]
+    fn reads_real_custom_format_headers() {
+        for (bytes, version, major, minor) in [
+            (PG14, "1.14-0", 14, 24),
+            (PG16, "1.15-0", 16, 15),
+            (PG18, "1.16-0", 18, 6),
+        ] {
+            let h = parse_archive_header(bytes).unwrap();
+            assert_eq!(h.dump_version, version);
+            assert_eq!(h.dbname.as_deref(), Some("appdb"));
+            let by = h.dumped_by.unwrap();
+            assert_eq!((by.major, by.minor), (major, minor));
+            assert_eq!(h.dumped_from.unwrap().major, major);
+        }
+    }
+
+    #[test]
+    fn anything_else_is_not_a_header() {
+        assert_eq!(parse_archive_header(b""), None);
+        assert_eq!(
+            parse_archive_header(b"--\n-- PostgreSQL database dump\n"),
+            None
+        );
+        // a too-old format, and an integer size that can't be real
+        assert_eq!(parse_archive_header(b"PGDMP\x01\x03\x00\x04\x08\x01"), None);
+        assert_eq!(parse_archive_header(b"PGDMP\x01\x10\x00\x09\x08\x01"), None);
+        // cut off anywhere inside the header, it never panics and never half-parses
+        const PG18_HEADER_LEN: usize = 125;
+        for n in 0..PG18_HEADER_LEN {
+            assert_eq!(parse_archive_header(&PG18[..n]), None, "{n} bytes");
+        }
+        assert!(parse_archive_header(&PG18[..PG18_HEADER_LEN]).is_some());
+    }
+
+    #[test]
+    fn hostile_string_lengths_are_refused() {
+        // version 1.15, 8-byte ints, then a database name claiming to be i64::MAX bytes long
+        let mut b = b"PGDMP\x01\x0f\x00\x08\x08\x01\x01".to_vec();
+        for _ in 0..7 {
+            b.extend_from_slice(&[0; 9]);
+        }
+        b.push(0);
+        b.extend_from_slice(&i64::MAX.to_le_bytes());
+        assert_eq!(parse_archive_header(&b), None);
     }
 
     #[test]
