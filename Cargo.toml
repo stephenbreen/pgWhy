@@ -42,3 +42,11 @@ testcontainers = "=0.28.0"
 
 # pgwhy-pgtools: process-group signalling for child cancellation (POSIX)
 libc = "=0.2.190"
+
+# Shipped builds: about half the binary size of Cargo's defaults for a slower link. Speed-optimised
+# (opt-level 3) and unwinding panics are kept on purpose: a panicking task must not take the app,
+# and its open transactions, down with it.
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1

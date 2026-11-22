@@ -70,6 +70,7 @@ export function EditorTab({ tab }: { tab: Tab }) {
   const init = useEditors((s) => s.init);
   const patch = useEditors((s) => s.patch);
   const state = useEditors((s) => s.tabs[tab.id]);
+  // seeds the editor; once mounted, the editor's own document is the text (see currentText)
   const textRef = useRef(data.text ?? "");
   const [openError, setOpenError] = useState<AppError | null>(null);
   const [policy, setPolicy] = useState<q.ErrorPolicy>("stop");
@@ -78,6 +79,7 @@ export function EditorTab({ tab }: { tab: Tab }) {
   const [saveAs, setSaveAs] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<AppError | null>(null);
   const editorHandle = useRef<SqlEditorHandle | null>(null);
+  const currentText = () => editorHandle.current?.view.state.doc.toString() ?? textRef.current;
   /** a run request is on its way to the core (blocks a double submit before `running` is set) */
   const starting = useRef(false);
   const entries = useConnections((s) => s.entries);
@@ -198,7 +200,7 @@ export function EditorTab({ tab }: { tab: Tab }) {
 
   const save = async (asPath?: string) => {
     setSaveError(null);
-    const text = textRef.current;
+    const text = currentText();
     try {
       if (asPath) {
         const opened = await scriptsIpc.scriptSave(asPath, text);
@@ -287,7 +289,10 @@ export function EditorTab({ tab }: { tab: Tab }) {
   return (
     <div className="editor-tab" data-tag={entry?.env_tag}>
       <div className="editor-toolbar" role="toolbar" aria-label="Editor">
-        <button type="button" className="primary" disabled={state.running} onClick={() => run({ text: textRef.current, from: 0, to: textRef.current.length, selection: false })} title="Run (F5 / Ctrl+Enter) — runs the selection when there is one">
+        <button type="button" className="primary" disabled={state.running} onClick={() => {
+          const text = currentText();
+          run({ text, from: 0, to: text.length, selection: false });
+        }} title="Run (F5 / Ctrl+Enter) — runs the selection when there is one">
           ▶ Run
         </button>
         <button type="button" disabled={!state.running} onClick={() => void q.editorCancel(tab.id)} title="Cancel (Esc)">
@@ -401,8 +406,7 @@ export function EditorTab({ tab }: { tab: Tab }) {
             initialText={textRef.current}
             schema={schema}
             error={errorDecoration}
-            onChange={(t) => {
-              textRef.current = t;
+            onChange={() => {
               if (!state.dirty) patch(tab.id, { dirty: true });
             }}
             onRun={run}

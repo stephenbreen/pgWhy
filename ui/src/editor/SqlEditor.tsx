@@ -90,7 +90,8 @@ export function SqlEditor({
   schema?: SQLNamespace;
   readOnly?: boolean;
   error?: EditorError | null;
-  onChange?: (text: string) => void;
+  /** the document changed; read the text from the view when it is needed, not per keystroke */
+  onChange?: () => void;
   onRun: (req: RunRequest) => void;
   onCancel?: () => void;
   onSave?: () => void;
@@ -140,7 +141,7 @@ export function SqlEditor({
         indentWithTab,
       ]),
       EditorView.updateListener.of((u) => {
-        if (u.docChanged) callbacks.current.onChange?.(u.state.doc.toString());
+        if (u.docChanged) callbacks.current.onChange?.();
       }),
       editorTheme,
     ];

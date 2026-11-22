@@ -158,6 +158,12 @@ describe("result grid", () => {
     fireEvent.mouseUp(window, { clientX: 160 });
     fireEvent.click(header);
     expect(parseFloat(header.style.width)).toBe(w0 + 60);
+    // cells size from the column's CSS variable, so they follow without re-rendering
+    const cell = screen.getByText("name 1");
+    const body = cell.closest<HTMLElement>(".grid-body")!;
+    const col = cols.findIndex((c) => c.name === "name");
+    expect(cell.style.width).toBe(`var(--col-${col})`);
+    expect(body.style.getPropertyValue(`--col-${col}`)).toBe(`${w0 + 60}px`);
     expect(onSort).not.toHaveBeenCalled();
 
     // a click on the grip without moving doesn't sort either
