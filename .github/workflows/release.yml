@@ -1,7 +1,7 @@
 name: release
 
 # Pushing a version tag builds signed installers into a draft GitHub release. Nothing is public
-# until someone reads the draft, tries a download and clicks Publish. See "Releasing" in the README.
+# until someone reads the draft, tries a download and clicks Publish.
 on:
   push:
     tags: ["v*.*.*"]
@@ -37,7 +37,7 @@ jobs:
             APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID \
             TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
             if [ "${!name}" != "true" ]; then
-              echo "::error::Repository secret $name is not set (see Releasing in the README)"
+              echo "::error::Repository secret $name is not set"
               missing=1
             fi
           done
