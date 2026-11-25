@@ -7,3 +7,5 @@ src-tauri/gen/
 *.log
 # local prototypes, not part of the app
 spikes/
+# local task notes (release steps and the like)
+TASKS.md
