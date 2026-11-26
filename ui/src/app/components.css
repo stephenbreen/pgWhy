@@ -16,7 +16,10 @@
 [data-tag="production"] { --tag: var(--tag-production); }
 
 /* status bar: the active connection's tag colours the bar's top edge */
-.status-bar:has(.status-conn) { box-shadow: inset 0 2px 0 var(--status-tag, transparent); }
+.status-bar:has(.status-conn[data-tag="local"]) { box-shadow: inset 0 2px 0 var(--tag-local); }
+.status-bar:has(.status-conn[data-tag="dev"]) { box-shadow: inset 0 2px 0 var(--tag-dev); }
+.status-bar:has(.status-conn[data-tag="staging"]) { box-shadow: inset 0 2px 0 var(--tag-staging); }
+.status-bar:has(.status-conn[data-tag="production"]) { box-shadow: inset 0 2px 0 var(--tag-production); }
 .status-conn { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
 .status-name { font-weight: 600; }
 .status-error { color: var(--danger); }

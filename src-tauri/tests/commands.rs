@@ -816,3 +816,109 @@ fn unpicked_paths_and_folders_are_refused() {
     state.grants.grant_dir(&tools);
     invoke(&app, "settings_set", json!({ "settings": s2 })).expect("picked folder");
 }
+
+#[test]
+fn path_traversal_and_read_only_grants_and_bad_ids_are_refused() {
+    use tauri::Manager;
+    let app = app();
+    let state = app.webview.app_handle().state::<AppState>();
+
+    // Nonexistent intermediate directory + .. must not escape the script library.
+    let lib_dir = app._dirs.path().join("data").join("scripts");
+    std::fs::create_dir_all(&lib_dir).unwrap();
+    let escaped = lib_dir
+        .join("nonexistent")
+        .join("..")
+        .join("..")
+        .join("pwn.sql");
+    let e = invoke(
+        &app,
+        "file_write",
+        json!({ "path": escaped.display().to_string(), "content": "boom" }),
+    )
+    .unwrap_err();
+    assert_eq!(e["kind"], "refused", "{e}");
+    assert!(!app._dirs.path().join("data").join("pwn.sql").exists());
+
+    // Backup folder and read-only restore archive grants cannot be overwritten via file_write.
+    let backup = app._dirs.path().join("data").join("backups").join("b.dump");
+    std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+    std::fs::write(&backup, "PGDMP").unwrap();
+    assert_eq!(
+        invoke(
+            &app,
+            "file_write",
+            json!({ "path": backup.display().to_string(), "content": "clobber" }),
+        )
+        .unwrap_err()["kind"],
+        "refused"
+    );
+    let ro_archive = app._dirs.path().join("picked.dump");
+    std::fs::write(&ro_archive, "PGDMP").unwrap();
+    state.grants.grant_read_file(&ro_archive);
+    assert_eq!(
+        invoke(
+            &app,
+            "file_write",
+            json!({ "path": ro_archive.display().to_string(), "content": "clobber" }),
+        )
+        .unwrap_err()["kind"],
+        "refused"
+    );
+
+    // Temporary pgpass directory must never be admitted by reveal_path.
+    let pgpass_file = app
+        ._dirs
+        .path()
+        .join("data")
+        .join("pgpass")
+        .join("x.pgpass");
+    assert_eq!(
+        invoke(
+            &app,
+            "reveal_path",
+            json!({ "path": pgpass_file.display().to_string() }),
+        )
+        .unwrap_err()["kind"],
+        "refused"
+    );
+
+    // Path-traversal IDs are refused for workflows, runs, and connections.
+    assert_eq!(
+        invoke(&app, "workflow_delete", json!({ "id": "../escape" })).unwrap_err()["kind"],
+        "config"
+    );
+    assert_eq!(
+        invoke(&app, "run_get", json!({ "runId": "../escape" })).unwrap_err()["kind"],
+        "config"
+    );
+    assert_eq!(
+        invoke(&app, "operation_get", json!({ "id": "../escape" })).unwrap_err()["kind"],
+        "config"
+    );
+    let bad_conn = json!({
+        "id": "../escape",
+        "name": "Bad",
+        "host": "localhost",
+        "port": 5432,
+        "database": "postgres",
+        "user": "postgres",
+        "maintenance_db": "postgres",
+        "sslmode": "prefer",
+        "env_tag": "local",
+        "password_saved": false
+    });
+    assert_eq!(
+        invoke(
+            &app,
+            "save_connection",
+            json!({
+                "entry": bad_conn,
+                "password": { "action": "unchanged" },
+                "sshSecret": { "action": "unchanged" }
+            })
+        )
+        .unwrap_err()["kind"],
+        "config"
+    );
+}

@@ -225,12 +225,24 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
   const [widths, setWidths] = useState(() => columns.map(defaultWidth));
   const [selection, setSelection] = useState<Selection | null>(null);
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
+  const editingRef = useRef<{ row: number; col: number } | null>(null);
+  editingRef.current = editing;
   const [copyError, setCopyError] = useState<string | null>(null);
   const dragging = useRef(false);
   // a column resize that ends over its header must not also count as a click on it
   const suppressHeaderClick = useRef(false);
 
-  useEffect(() => setWidths(columns.map(defaultWidth)), [columns]);
+  const colSig = useMemo(
+    () => columns.map((c) => `${c.name}\0${c.type ?? ""}\0${c.key ? 1 : 0}`).join("\x1f"),
+    [columns],
+  );
+  const prevColSig = useRef(colSig);
+  useEffect(() => {
+    if (prevColSig.current !== colSig) {
+      prevColSig.current = colSig;
+      setWidths(columns.map(defaultWidth));
+    }
+  }, [colSig, columns]);
   // Any store change can make the visible window re-fetchable (invalidate, a new partial chunk);
   // the rows themselves subscribe for their content.
   const revision = useSyncExternalStore(store.subscribe, () => store.revision);
@@ -258,7 +270,7 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
     store.ensureRange(first - PREFETCH_BEFORE, last + PREFETCH_AFTER);
   }, [store, first, last, rowCount, revision]);
 
-  const sel = selection ? norm(selection) : null;
+  const sel = useMemo(() => (selection ? norm(selection) : null), [selection]);
   useEffect(() => onSelectionChange?.(sel ? [sel.r0, sel.r1] : null), [sel?.r0, sel?.r1]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const onCellDown = useCallback((row: number, col: number, shift: boolean) => {
@@ -275,10 +287,12 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
   );
   const onEditDone = useCallback(
     (value: string | null, commit: boolean) => {
-      setEditing((ed) => {
-        if (ed && commit && onEditCell && value !== store.cell(ed.row, ed.col)) onEditCell(ed.row, ed.col, value);
-        return null;
-      });
+      const ed = editingRef.current;
+      editingRef.current = null;
+      setEditing(null);
+      if (ed && commit && onEditCell && value !== store.cell(ed.row, ed.col)) {
+        onEditCell(ed.row, ed.col, value);
+      }
       scrollRef.current?.focus();
     },
     [onEditCell, store],
@@ -461,21 +475,24 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
           ))}
         </div>
         <div className="grid-body" style={{ height: virtualizer.getTotalSize(), width: totalWidth, ...colVars }}>
-          {items.map((vi) => (
-            <Row
-              key={vi.index % SLOTS}
-              index={vi.index}
-              top={vi.start}
-              cols={columns.length}
-              store={store}
-              sel={sel && vi.index >= sel.r0 && vi.index <= sel.r1 ? sel : null}
-              editing={editing && editing.row === vi.index ? editing : null}
-              numeric={numeric}
-              onCellDown={onCellDown}
-              onCellDouble={onCellDouble}
-              onEditDone={onEditDone}
-            />
-          ))}
+          {(() => {
+            const slots = Math.max(SLOTS, items.length);
+            return items.map((vi) => (
+              <Row
+                key={vi.index % slots}
+                index={vi.index}
+                top={vi.start}
+                cols={columns.length}
+                store={store}
+                sel={sel && vi.index >= sel.r0 && vi.index <= sel.r1 ? sel : null}
+                editing={editing && editing.row === vi.index ? editing : null}
+                numeric={numeric}
+                onCellDown={onCellDown}
+                onCellDouble={onCellDouble}
+                onEditDone={onEditDone}
+              />
+            ));
+          })()}
         </div>
       </div>
     </div>

@@ -179,3 +179,18 @@ pub async fn run_action(
     }
     Ok(rec)
 }
+
+#[tauri::command]
+pub async fn operation_action(
+    state: State<'_, AppState>,
+    id: RunId,
+    action: ActionKind,
+) -> AppResult<OperationRecord> {
+    let rec = state.engine().perform_operation(&id, action).await?;
+    if let pgwhy_workflow::OperationDetail::Restore(r) = &rec.detail {
+        state
+            .introspector
+            .invalidate_server(&r.target.connection_id);
+    }
+    Ok(rec)
+}

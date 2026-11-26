@@ -141,9 +141,11 @@ impl AppState {
 
     /// Run `f` with the library open (creating its folder on first use).
     pub fn with_library<T>(&self, f: impl FnOnce(&mut Library) -> AppResult<T>) -> AppResult<T> {
+        // Resolve the path before acquiring `self.library` so `settings` and `library` are never nested.
+        let dir = self.library_dir();
         let mut guard = self.library.lock().unwrap_or_else(|p| p.into_inner());
         if guard.is_none() {
-            *guard = Some(Library::create(self.library_dir())?);
+            *guard = Some(Library::create(dir)?);
         }
         f(guard.as_mut().expect("library opened above"))
     }
@@ -191,14 +193,14 @@ fn build_engine(
         let settings = settings.clone();
         let default_dir = data_dir.join("scripts");
         move |id: &str| -> AppResult<pgwhy_workflow::LoadedScript> {
+            let dir = settings
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .script_library_dir
+                .clone()
+                .unwrap_or_else(|| default_dir.clone());
             let mut guard = lib.lock().unwrap_or_else(|p| p.into_inner());
             if guard.is_none() {
-                let dir = settings
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .script_library_dir
-                    .clone()
-                    .unwrap_or_else(|| default_dir.clone());
                 *guard = Some(Library::create(dir)?);
             }
             let library = guard.as_ref().expect("opened above");

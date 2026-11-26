@@ -110,7 +110,7 @@ pub async fn pick_restore_archive<R: tauri::Runtime>(
     });
     let path = rx.await.ok().flatten();
     if let Some(p) = &path {
-        state.grants.grant_file(p);
+        state.grants.grant_read_file(p);
     }
     Ok(path)
 }

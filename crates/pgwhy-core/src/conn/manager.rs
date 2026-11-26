@@ -311,6 +311,17 @@ impl ConnectionManager {
         entry: &ConnectionEntry,
         password: Option<Secret>,
     ) -> AppResult<ConnInfo> {
+        self.test_with_ssh_secret(entry, password, None).await
+    }
+
+    /// Connect with an unsaved entry and explicit DB / SSH secrets using an ephemeral tunnel so
+    /// testing an edited connection never tears down live tunnels on the saved connection.
+    pub async fn test_with_ssh_secret(
+        &self,
+        entry: &ConnectionEntry,
+        password: Option<Secret>,
+        ssh_secret: Option<Secret>,
+    ) -> AppResult<ConnInfo> {
         let password = match password {
             Some(p) => Some(p),
             None => {
@@ -320,9 +331,24 @@ impl ConnectionManager {
                     .0
             }
         };
-        let conn = self
-            .connect_entry(entry, &entry.database, Purpose::Test, password.as_ref())
-            .await?;
+        let lease = match &entry.tunnel {
+            Some(_) => Some(
+                self.inner
+                    .tunnels
+                    .acquire_ephemeral(entry, ssh_secret.as_ref())
+                    .await?,
+            ),
+            None => None,
+        };
+        let conn = PgConn::connect(
+            entry,
+            &entry.database,
+            Purpose::Test,
+            password.as_ref(),
+            lease,
+            None,
+        )
+        .await?;
         Ok(conn.info.clone())
     }
 

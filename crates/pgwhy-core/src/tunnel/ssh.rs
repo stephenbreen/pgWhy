@@ -25,10 +25,25 @@ pub(super) enum AuthMaterial {
 /// A missing passphrase/password is a `Credentials` error with a `data` payload the UI turns
 /// into a prompt; nothing is attempted against the server.
 pub(super) fn resolve_auth(entry: &ConnectionEntry, vault: &Vault) -> AppResult<AuthMaterial> {
+    resolve_auth_with_override(entry, vault, None)
+}
+
+pub(super) fn resolve_auth_with_override(
+    entry: &ConnectionEntry,
+    vault: &Vault,
+    override_secret: Option<&Secret>,
+) -> AppResult<AuthMaterial> {
     let tunnel = tunnel_config(entry)?;
     match &tunnel.auth {
         TunnelAuth::Password { .. } => {
-            let (pw, _) = vault.resolve(&SecretKey::new(&entry.id, SecretKind::SshPassword))?;
+            let pw = match override_secret {
+                Some(s) => Some(s.clone()),
+                None => {
+                    vault
+                        .resolve(&SecretKey::new(&entry.id, SecretKind::SshPassword))?
+                        .0
+                }
+            };
             match pw {
                 Some(pw) => Ok(AuthMaterial::Password(pw)),
                 None => Err(missing_secret(entry, tunnel, SecretKind::SshPassword)),
@@ -46,8 +61,14 @@ pub(super) fn resolve_auth(entry: &ConnectionEntry, vault: &Vault) -> AppResult<
             match russh::keys::decode_secret_key(&text, None) {
                 Ok(key) => checked_user_key(key, key_path),
                 Err(e) if looks_encrypted(&e, &text) => {
-                    let (pass, _) =
-                        vault.resolve(&SecretKey::new(&entry.id, SecretKind::SshKeyPassphrase))?;
+                    let pass = match override_secret {
+                        Some(s) => Some(s.clone()),
+                        None => {
+                            vault
+                                .resolve(&SecretKey::new(&entry.id, SecretKind::SshKeyPassphrase))?
+                                .0
+                        }
+                    };
                     let Some(pass) = pass else {
                         return Err(missing_secret(entry, tunnel, SecretKind::SshKeyPassphrase));
                     };

@@ -1,12 +1,14 @@
+import { memo } from "react";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { tabRenderer } from "./registry";
 import { requestCloseTab, useWorkspace, type Tab } from "./workspace";
 import { Welcome } from "./Welcome";
 
-function TabContent({ tab }: { tab: Tab }) {
+const TabContent = memo(function TabContent({ tab }: { tab: Tab }) {
   if (tab.kind === "welcome") return <Welcome />;
   const Renderer = tabRenderer(tab.kind);
   return Renderer ? <Renderer tab={tab} /> : <p className="empty">No view for {tab.kind} tabs yet.</p>;
-}
+});
 
 export function MainArea() {
   const tabs = useWorkspace((s) => s.tabs);
@@ -50,7 +52,9 @@ export function MainArea() {
           run views keep their state while another tab is in front. */}
       {tabs.map((t) => (
         <section key={t.id} role="tabpanel" className="tab-panel" hidden={t.id !== active?.id} aria-label={t.title}>
-          <TabContent tab={t} />
+          <ErrorBoundary>
+            <TabContent tab={t} />
+          </ErrorBoundary>
         </section>
       ))}
       {tabs.length === 0 && <p className="empty">No open tabs.</p>}

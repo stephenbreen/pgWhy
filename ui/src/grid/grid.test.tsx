@@ -180,6 +180,23 @@ describe("result grid", () => {
     expect(onSort).not.toHaveBeenCalled();
   });
 
+  it("preserves user-resized column widths when rerendered with a new columns array reference", async () => {
+    const { store } = fakeSource(rows, 3);
+    const { rerender } = render(<ResultGrid columns={cols.map((c) => ({ ...c }))} store={store} rowCount={rows.length} />);
+    await screen.findByText("name 1");
+    const header = screen.getByRole("columnheader", { name: /^name/ });
+    const grip = header.querySelector(".col-resizer")!;
+    const w0 = parseFloat(header.style.width);
+
+    fireEvent.mouseDown(grip, { clientX: 100 });
+    fireEvent.mouseMove(window, { clientX: 175 });
+    fireEvent.mouseUp(window, { clientX: 175 });
+    expect(parseFloat(header.style.width)).toBe(w0 + 75);
+
+    rerender(<ResultGrid columns={cols.map((c) => ({ ...c }))} store={store} rowCount={rows.length} />);
+    expect(parseFloat(screen.getByRole("columnheader", { name: /^name/ }).style.width)).toBe(w0 + 75);
+  });
+
   it("tsv quoting", () => {
     expect(toTsv([["a\tb", 'say "hi"', null]])).toBe('"a\tb"\t"say ""hi"""\t');
   });

@@ -41,7 +41,9 @@ interface StepView {
 }
 
 export function RestoreDialog() {
-  const { connectionId, database, envTag, archive: preselected, close } = useRestore();
+  const { connectionId: initialConnId, database: initialDb, envTag: initialEnvTag, archive: preselected, close } = useRestore();
+  const entries = useConnections((s) => s.entries);
+  const [targetConnId, setTargetConnId] = useState("");
   const [targets, setTargets] = useState<rs.RestoreTargets | null>(null);
   const [archive, setArchive] = useState<string | null>(null);
   const [inspection, setInspection] = useState<rs.RestoreInspection | null>(null);
@@ -63,15 +65,28 @@ export function RestoreDialog() {
   const [runId, setRunId] = useState<string | null>(null);
   const logRef = useRef<HTMLPreElement>(null);
 
-  const open = connectionId !== "";
+  const open = initialConnId !== "";
+  const connectionId = targetConnId || initialConnId;
+  const selectedEntry = entries.find((e) => e.id === connectionId);
+  const envTag = connectionId === initialConnId ? (initialEnvTag ?? selectedEntry?.env_tag) : selectedEntry?.env_tag;
+  const database = connectionId === initialConnId ? initialDb : undefined;
 
   useEffect(() => {
     if (!open) return;
+    // When restoring a backup from History taken on Staging/Production, default to the first
+    // Local/Dev connection if one exists so cross-environment restore works out of the box.
+    const initEntry = useConnections.getState().entries.find((e) => e.id === initialConnId);
+    const initTag = initEntry?.env_tag ?? initialEnvTag;
+    const allowed = (t?: string) => t === undefined || t === "local" || t === "dev";
+    const fallback = !allowed(initTag) && preselected
+      ? useConnections.getState().entries.find((e) => e.env_tag === "local" || e.env_tag === "dev")?.id
+      : undefined;
+    setTargetConnId(fallback ?? initialConnId);
     setArchive(preselected ?? null);
     setInspection(null);
     setMode("new_database");
     setName("");
-    setLocaleFrom(database ?? "");
+    setLocaleFrom(fallback ? "" : (initialDb ?? ""));
     setTyped("");
     setBackupFirst(true);
     setBusy(false);
@@ -92,6 +107,15 @@ export function RestoreDialog() {
         })
         .catch((e) => live && setError(toAppError(e)));
     }
+    return () => {
+      live = false;
+    };
+  }, [open, initialConnId, initialDb, initialEnvTag, preselected]);
+
+  useEffect(() => {
+    if (!open || !connectionId) return;
+    setTargets(null);
+    let live = true;
     void rs
       .restoreTargets(connectionId)
       .then((t) => {
@@ -103,7 +127,7 @@ export function RestoreDialog() {
     return () => {
       live = false;
     };
-  }, [open, connectionId, database, preselected]);
+  }, [open, connectionId]);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -134,7 +158,7 @@ export function RestoreDialog() {
       const view = await rs.restoreInspect(path);
       setInspection(view);
       if (view.dbname) {
-        setName(view.dbname === database ? `${view.dbname}_restore` : `${view.dbname}_restore`);
+        setName(view.dbname === database ? `${view.dbname}_restore` : view.dbname);
         if (!localeFrom) setLocaleFrom(view.dbname);
       }
     } catch (e) {
@@ -174,10 +198,11 @@ export function RestoreDialog() {
             return;
           }
           if (e.type === "step") {
-            setSteps((s) => {
-              const next = s.filter((x) => x.id !== e.id);
-              return [...next, { id: e.id, label: e.label, status: e.status }];
-            });
+            setSteps((s) =>
+              s.some((x) => x.id === e.id)
+                ? s.map((x) => (x.id === e.id ? { id: e.id, label: e.label, status: e.status } : x))
+                : [...s, { id: e.id, label: e.label, status: e.status }],
+            );
             return;
           }
           if (e.type === "progress") {
@@ -259,6 +284,28 @@ export function RestoreDialog() {
               void start();
             }}
           >
+            {entries.length > 0 && (
+              <label>
+                Target connection
+                <select
+                  aria-label="Target connection"
+                  value={connectionId}
+                  disabled={busy}
+                  onChange={(e) => {
+                    setTargetConnId(e.target.value);
+                    setMode("new_database");
+                    setTyped("");
+                    setLocaleFrom("");
+                  }}
+                >
+                  {entries.map((e) => (
+                    <option key={e.id} value={e.id}>
+                      {e.name} ({e.env_tag})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <label>
               Archive
               <span className="row">

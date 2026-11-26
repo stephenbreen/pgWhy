@@ -158,14 +158,14 @@ mod tests {
         .unwrap();
         assert!(refuse_if_busy(&state).is_ok());
 
-        state
+        let guard = state
             .backups
-            .track("b1", state.run_context().unwrap().cancel.clone());
+            .track_guard("b1", state.run_context().unwrap().cancel.clone());
         let e = refuse_if_busy(&state).unwrap_err();
         assert_eq!(e.kind, ErrorKind::Refused);
         assert!(e.message.contains("a backup is running"), "{}", e.message);
 
-        state.backups.untrack("b1");
+        drop(guard);
         assert!(refuse_if_busy(&state).is_ok());
     }
 }

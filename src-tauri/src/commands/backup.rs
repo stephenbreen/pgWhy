@@ -18,17 +18,43 @@ pub struct Backups {
     running: Mutex<HashMap<String, CancelHandle>>,
 }
 
+/// Drops the tracked backup entry when `run_backup` finishes, errors, or is cancelled.
+pub(crate) struct BackupTrackGuard<'a> {
+    backups: &'a Backups,
+    id: String,
+}
+
+impl Drop for BackupTrackGuard<'_> {
+    fn drop(&mut self) {
+        self.backups.untrack(&self.id);
+    }
+}
+
 impl Backups {
     fn running(&self) -> std::sync::MutexGuard<'_, HashMap<String, CancelHandle>> {
         self.running.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    pub(crate) fn track(&self, backup_id: &str, cancel: CancelHandle) {
+    pub(crate) fn track_guard<'a>(
+        &'a self,
+        backup_id: &str,
+        cancel: CancelHandle,
+    ) -> BackupTrackGuard<'a> {
         self.running().insert(backup_id.to_string(), cancel);
+        BackupTrackGuard {
+            backups: self,
+            id: backup_id.to_string(),
+        }
     }
 
     pub(crate) fn untrack(&self, backup_id: &str) {
         self.running().remove(backup_id);
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        for cancel in self.running().values() {
+            cancel.cancel();
+        }
     }
 
     pub(crate) fn any_running(&self) -> bool {
@@ -130,8 +156,7 @@ pub(crate) fn sanitize(name: &str) -> String {
 }
 
 impl AppState {
-    /// `<backup root>/<connection>-<id8>/<database>/` — shared with workflow backups so one
-    /// retention policy covers both.
+    /// `<backup root>/<connection>-<id8>/<database>/` for standalone backups.
     pub fn backup_folder(
         &self,
         id: &ConnectionId,
@@ -139,7 +164,8 @@ impl AppState {
         database: &str,
     ) -> PathBuf {
         let root = self.backup_dir();
-        let short: String = id.0.chars().take(8).collect();
+        let short_raw: String = id.0.chars().take(8).collect();
+        let short = sanitize(&short_raw);
         root.join(format!("{}-{short}", sanitize(connection_name)))
             .join(sanitize(database))
     }
@@ -189,7 +215,6 @@ pub async fn backup_database(
         Some(&events),
     )
     .await;
-    state.backups.untrack(&backup_id);
     match result {
         Ok(done) => {
             record_backup(&state, &connection_id, &database, &request, &done);
@@ -332,9 +357,20 @@ pub(crate) async fn run_backup(
     let out = save_as.unwrap_or_else(|| folder.join(format!("{stem}.{suffix}")));
     let log = folder.join(format!("{stem}.log"));
 
+    let (schema_only, data_only) = match request.data.as_str() {
+        "all" => (false, false),
+        "schema_only" => (true, false),
+        "data_only" => (false, true),
+        other => {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                format!("unknown backup contents {other}"),
+            ))
+        }
+    };
     let (endpoint, password, _lease) = state.tool_endpoint(&entry, database).await?;
     let ctx = state.run_context()?;
-    state.backups.track(backup_id, ctx.cancel.clone());
+    let _track_guard = state.backups.track_guard(backup_id, ctx.cancel.clone());
     send(
         events,
         BackupEvent::Started {
@@ -360,17 +396,6 @@ pub(crate) async fn run_backup(
         ),
     };
     let scoped = !schemas.is_empty() || !tables.is_empty();
-    let (schema_only, data_only) = match request.data.as_str() {
-        "all" => (false, false),
-        "schema_only" => (true, false),
-        "data_only" => (false, true),
-        other => {
-            return Err(AppError::new(
-                ErrorKind::Config,
-                format!("unknown backup contents {other}"),
-            ))
-        }
-    };
     let opts = BackupOptions {
         format,
         exclude_table_data: Vec::new(),

@@ -55,9 +55,13 @@ function Grid({ view, gridId, onEdit, onSelectRows, sort, onSort, refresh }: {
   }, [refresh, store]);
   const s = sort[0];
   const col = s ? view.columns.findIndex((c) => c.name === s.column) : -1;
+  const columns = useMemo(
+    () => view.columns.map((c) => ({ name: c.name, type: c.type, key: c.key })),
+    [view.columns],
+  );
   return (
     <ResultGrid
-      columns={view.columns.map((c) => ({ name: c.name, type: c.type, key: c.key }))}
+      columns={columns}
       store={store}
       rowCount={view.row_count}
       label={view.sql}

@@ -17,9 +17,9 @@ use tauri::State;
 const MAX_COPY_BYTES: usize = 32 * 1024 * 1024;
 
 /// The grid's binary channel per result id.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ResultChannels {
-    channels: Mutex<HashMap<String, Channel<InvokeResponseBody>>>,
+    channels: std::sync::Arc<Mutex<HashMap<String, Channel<InvokeResponseBody>>>>,
 }
 
 impl ResultChannels {
@@ -144,8 +144,8 @@ pub async fn result_export(
     mut options: ExportOptions,
 ) -> AppResult<pgwhy_core::query::ExportReport> {
     let set = state.results.require(&result_id)?;
-    // Only a path from the backend's save dialog (or inside the backup/library folders).
-    options.path = state.check_path(&options.path, false)?;
+    // Only a path from the backend's save dialog (or inside the script library).
+    options.path = state.check_write_path(&options.path)?;
     tokio::task::spawn_blocking(move || match options.format.as_str() {
         "csv" => set.export_csv(
             &options.path,

@@ -261,7 +261,7 @@ pub async fn file_write<R: tauri::Runtime>(
     content: String,
 ) -> AppResult<FileFingerprint> {
     blocking(app, move |state| {
-        scripts::write_script_file(&state.check_path(&path, false)?, &content)
+        scripts::write_script_file(&state.check_write_path(&path)?, &content)
     })
     .await
 }

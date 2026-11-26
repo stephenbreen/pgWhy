@@ -56,8 +56,8 @@ export function ExplorerTree() {
   const trees = useTrees((s) => s.trees);
   const openDbs = useConnections((s) => s.openDbs);
   const selected = useTrees((s) => s.selected);
-  const { toggle, select, restore } = useTrees.getState();
-  const [openConns, setOpenConns] = useState<Record<string, boolean>>({});
+  const openConns = useTrees((s) => s.openConns);
+  const { toggle, select, restore, setConnOpen } = useTrees.getState();
   const [filter, setFilter] = useState("");
   const [menu, setMenu] = useState<{ target: NodeTarget; x: number; y: number } | null>(null);
   const [goTo, setGoTo] = useState(false);
@@ -68,10 +68,10 @@ export function ExplorerTree() {
     for (const e of entries) {
       if (status[e.id]?.state === "connected" && !trees[e.id]?.restored) {
         void restore(e.id, e.database);
-        setOpenConns((o) => (e.id in o ? o : { ...o, [e.id]: true }));
+        if (!(e.id in useTrees.getState().openConns)) setConnOpen(e.id, true);
       }
     }
-  }, [entries, status, trees, restore]);
+  }, [entries, status, trees, restore, setConnOpen]);
 
   const f = filter.trim().toLowerCase();
   const rows: Row[] = useMemo(() => {
@@ -95,7 +95,10 @@ export function ExplorerTree() {
     getScrollElement: () => scrollRef.current,
     estimateSize: (i) => (rows[i]?.kind === "group" ? 24 : 22),
     overscan: 20,
-    getItemKey: (i) => rows[i].id,
+    getItemKey: (i) => {
+      const r = rows[i];
+      return "connectionId" in r ? `${r.connectionId}:${r.id}` : r.id;
+    },
     initialRect: { width: 300, height: 800 },
   });
 
@@ -147,7 +150,7 @@ export function ExplorerTree() {
         <ConnectionNode
           entry={row.entry}
           expanded={!!openConns[row.entry.id]}
-          onToggle={(open) => setOpenConns((o) => ({ ...o, [row.entry.id]: open ?? !o[row.entry.id] }))}
+          onToggle={(open) => setConnOpen(row.entry.id, open ?? !openConns[row.entry.id])}
         />
       );
     }

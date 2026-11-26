@@ -244,11 +244,16 @@ pub async fn editor_run(
         state.release_result(&id);
     }
     let ch = events.clone();
+    let channels = state.result_channels.clone();
     let mut sink = BufferSink::new(
         state.results.clone(),
         tab_id.clone(),
         buffer_opts,
         move |ev| {
+            if let BufferEvent::Evicted { report } = &ev {
+                let ids: Vec<String> = report.evicted.iter().map(|e| e.result_id.clone()).collect();
+                channels.forget(&ids);
+            }
             let _ = ch.send(ev);
         },
     );

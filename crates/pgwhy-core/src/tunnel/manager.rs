@@ -386,11 +386,103 @@ impl TunnelManager {
             }
         }
     }
+    /// Open an isolated one-off tunnel that is never inserted into the shared map and shuts down
+    /// as soon as the returned lease drops. Used by ConnectionManager::test so testing an edited
+    /// connection never kills live tabs/workflows on the saved connection.
+    pub async fn acquire_ephemeral_lease(
+        &self,
+        entry: &ConnectionEntry,
+        ssh_secret: Option<&crate::secret::Secret>,
+    ) -> AppResult<TunnelLease> {
+        let tunnel_cfg = ssh::tunnel_config(entry)?.clone();
+        let target = TunnelTarget {
+            ssh: tunnel_cfg,
+            host: entry.host.clone(),
+            port: entry.port,
+        };
+        let auth = ssh::resolve_auth_with_override(entry, &self.inner.vault, ssh_secret)?;
+        let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|l| l.set_nonblocking(true).map(|_| l))
+            .map_err(|e| {
+                AppError::new(
+                    ErrorKind::Tunnel,
+                    "could not open a local port for the SSH tunnel",
+                )
+                .with_detail(e.to_string())
+            })?;
+        let listener = TcpListener::from_std(std_listener).map_err(|e| {
+            AppError::internal("could not register the tunnel's local port")
+                .with_detail(e.to_string())
+        })?;
+        let local_port = listener
+            .local_addr()
+            .map_err(|e| {
+                AppError::internal("tunnel listener has no address").with_detail(e.to_string())
+            })?
+            .port();
+        // Isolated broadcast channel so test probes never emit status events for the live entry.
+        let (events, _) = broadcast::channel(8);
+        let tunnel = Arc::new(Tunnel {
+            id: ConnectionId::new(),
+            target,
+            local_port,
+            leases: AtomicUsize::new(1),
+            lease_changed: Notify::new(),
+            closed: AtomicBool::new(false),
+            shutdown: watch::channel(false).0,
+            snapshot: watch::channel(Snapshot {
+                state: TunnelState::Starting,
+                error: None,
+                attempt: None,
+            })
+            .0,
+            events,
+        });
+        let (current_tx, current_rx) = watch::channel::<Option<Arc<SessionSlot>>>(None);
+        let accept = tokio::spawn(accept_loop(
+            listener,
+            current_rx,
+            tunnel.target.host.clone(),
+            tunnel.target.port,
+            self.inner.options.ready_wait,
+        ));
+        tokio::spawn(supervise(
+            Arc::downgrade(&self.inner),
+            tunnel.clone(),
+            auth,
+            current_tx,
+            accept,
+        ));
+        let guard = EphemeralGuard {
+            tunnel: tunnel.clone(),
+        };
+        self.wait_ready(&tunnel).await?;
+        Ok(TunnelLease::new(local_port, guard))
+    }
+}
+
+struct EphemeralGuard {
+    tunnel: Arc<Tunnel>,
+}
+
+impl Drop for EphemeralGuard {
+    fn drop(&mut self) {
+        self.tunnel.closed.store(true, Ordering::Release);
+        self.tunnel.shutdown.send_replace(true);
+    }
 }
 
 impl TunnelProvider for TunnelManager {
     fn acquire<'a>(&'a self, entry: &'a ConnectionEntry) -> BoxFuture<'a, AppResult<TunnelLease>> {
         Box::pin(self.acquire_lease(entry))
+    }
+
+    fn acquire_ephemeral<'a>(
+        &'a self,
+        entry: &'a ConnectionEntry,
+        ssh_secret: Option<&'a crate::secret::Secret>,
+    ) -> BoxFuture<'a, AppResult<TunnelLease>> {
+        Box::pin(self.acquire_ephemeral_lease(entry, ssh_secret))
     }
 }
 
