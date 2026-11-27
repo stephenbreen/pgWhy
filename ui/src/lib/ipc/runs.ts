@@ -1,16 +1,24 @@
-// Typed wrappers over src-tauri/src/commands/runs.rs (Refresh workflow runs).
+// Typed wrappers over src-tauri/src/commands/runs.rs (Refresh & Workflows v2 runs).
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppError } from "./errors";
 import type { EnvTag } from "./connections";
-import type { ReplaceStrategy } from "./workflow";
+import type { ReplaceStrategy, WorkflowParam, WorkflowSource } from "./workflow";
 
 export type CheckStatus = "ok" | "warn" | "fail" | "skipped";
 export type SecretNeed = "db_password" | "ssh_key_passphrase" | "ssh_password";
 export type StepId = "dump" | "drop_target" | "create_database" | "restore" | "post_restore" | "verify" | "swap";
 export type StepStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled" | "skipped" | "reused" | "interrupted";
-export type RunStatus = "running" | "succeeded" | "succeeded_cleanup_required" | "failed_at_step" | "failed_at_swap" | "cancelled" | "interrupted";
+export type RunStatus =
+  | "running"
+  | "succeeded"
+  | "succeeded_cleanup_required"
+  | "paused_for_inspection"
+  | "failed_at_step"
+  | "failed_at_swap"
+  | "cancelled"
+  | "interrupted";
 export type ActionKind = "retry" | "drop_staging" | "keep_staging" | "drop_old" | "rollback_swap" | "complete_swap";
 export type SwapPhase = "quiescing" | "checking_prepared_transactions" | "terminating_sessions" | "renaming_target_to_old" | "renaming_staging_to_target" | "dropping_old" | "done";
 
@@ -36,6 +44,14 @@ export interface MissingSecret {
   reason: string;
 }
 
+export interface PreflightOptions {
+  params?: Record<string, string>;
+  archive_path?: string | null;
+  pause_before_swap?: boolean | null;
+  dry_run?: boolean;
+  pre_run_backup?: boolean | null;
+}
+
 export interface Confirmation {
   target_db: string;
   target_server_label: string;
@@ -48,6 +64,11 @@ export interface Confirmation {
   warnings: string[];
   remembered: boolean;
   can_remember: boolean;
+  requires_typed_name?: boolean;
+  pause_before_swap?: boolean;
+  dry_run?: boolean;
+  source_mode?: WorkflowSource | null;
+  parameters?: WorkflowParam[];
   fingerprint: string;
 }
 
@@ -106,6 +127,16 @@ export interface StepRecord {
   error?: AppError | null;
 }
 
+export interface PipelineStepResult {
+  step_id: string;
+  step_name: string;
+  is_verify: boolean;
+  status: StepStatus;
+  rows_affected?: number | null;
+  summary?: string | null;
+  preview_sql?: string | null;
+}
+
 export interface ActionOffer {
   kind: ActionKind;
   label: string;
@@ -134,11 +165,15 @@ export interface RunRecord {
   status: RunStatus;
   strategy: ReplaceStrategy;
   create_mode: boolean;
+  source_mode?: WorkflowSource | null;
+  pause_before_swap?: boolean;
+  dry_run?: boolean;
   source: EndpointRecord;
   target: EndpointRecord;
   staging_db?: string | null;
   old_db?: string | null;
   steps: StepRecord[];
+  pipeline_steps?: PipelineStepResult[];
   backup?: { path: string; size_bytes: number; dumped_by?: string | null; reusable: boolean; reason?: string | null } | null;
   renames_completed: number;
   swap_phase?: SwapPhase | null;
@@ -169,13 +204,35 @@ export type RunEvent =
   | { event: "step_finished"; run_id: string; step: StepId; status: StepStatus; duration_ms: number; error?: AppError | null }
   | { event: "run_finished"; run_id: string; status: RunStatus; record: RunRecord };
 
-export const preflight = (workflowId: string) => invoke<PreflightReport>("workflow_preflight", { workflowId });
-export const retryPreflight = (runId: string, from: StepId) => invoke<PreflightReport>("workflow_retry_preflight", { runId, from });
+export interface StartRunOptions {
+  typedName?: string;
+  params?: Record<string, string>;
+  secretParams?: Record<string, string>;
+  pauseBeforeSwap?: boolean;
+  dryRun?: boolean;
+}
+
+export const preflight = (workflowId: string, options?: PreflightOptions) =>
+  invoke<PreflightReport>("workflow_preflight", options ? { workflowId, options } : { workflowId });
+
+export const retryPreflight = (runId: string, from: StepId, options?: PreflightOptions) =>
+  invoke<PreflightReport>("workflow_retry_preflight", options ? { runId, from, options } : { runId, from });
+
 export const discardPreflight = (ticket: string) => invoke<void>("workflow_discard_preflight", { ticket });
 export const applyFix = (workflowId: string, fix: PreflightFix) => invoke<void>("workflow_apply_fix", { workflowId, fix });
 export const provideSecret = (connectionId: string, kind: SecretNeed, value: string, persist: boolean) =>
   invoke<void>("workflow_provide_secret", { connectionId, kind, value, persist });
-export const startRun = (ticket: string, fingerprint: string, remember: boolean) => invoke<string>("workflow_start", { ticket, fingerprint, remember });
+
+export const startRun = (ticket: string, fingerprint: string, remember: boolean, opts?: StartRunOptions) => {
+  const args: Record<string, unknown> = { ticket, fingerprint, remember };
+  if (opts?.typedName !== undefined) args.typedName = opts.typedName;
+  if (opts?.params && Object.keys(opts.params).length > 0) args.params = opts.params;
+  if (opts?.secretParams && Object.keys(opts.secretParams).length > 0) args.secretParams = opts.secretParams;
+  if (opts?.pauseBeforeSwap !== undefined) args.pauseBeforeSwap = opts.pauseBeforeSwap;
+  if (opts?.dryRun) args.dryRun = opts.dryRun;
+  return invoke<string>("workflow_start", args);
+};
+
 export const cancelRun = (runId: string) => invoke<void>("workflow_cancel", { runId });
 export const historyList = () => invoke<HistoryEntry[]>("history_list");
 
