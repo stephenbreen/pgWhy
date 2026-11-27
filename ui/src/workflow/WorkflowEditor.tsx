@@ -12,6 +12,9 @@ import * as w from "../lib/ipc/workflow";
 import { pickRestoreArchive } from "../lib/ipc/restore";
 import { libraryList, type ScriptInfo } from "../lib/ipc/scripts";
 import { toAppError, type AppError } from "../lib/ipc/errors";
+import { openLibraryScript } from "../scripts/open";
+import { EditScriptModal, NewScriptModal } from "../scripts/ScriptModals";
+import { useScriptLibrary } from "../scripts/store";
 import { useWorkflows } from "./store";
 import { useCatalogHints } from "./useCatalogHints";
 import { ParamsEditor } from "./ParamsEditor";
@@ -81,14 +84,24 @@ export function WorkflowEditor({ tab }: { tab: Tab }) {
   const [exportToml, setExportToml] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
+  // Inline linked-script authoring modals
+  const [newScriptBind, setNewScriptBind] = useState<((scriptId: string) => void) | null>(null);
+  const [editingScriptId, setEditingScriptId] = useState<string | null>(null);
+  const libVersion = useScriptLibrary((s) => s.version);
+
   const catalog = useCatalogHints(wf);
   const sourceMode = w.effectiveSource(wf);
   const steps = wf.steps ?? [];
   const params = wf.parameters ?? [];
 
+  const scriptFolders = useMemo(
+    () => Array.from(new Set(scripts.map((s) => s.folder).filter(Boolean))).sort(),
+    [scripts],
+  );
+
   useEffect(() => {
     void libraryList().then((l) => setScripts(l?.scripts ?? [])).catch(() => {});
-  }, []);
+  }, [libVersion]);
 
   useEffect(() => {
     if (existing) return;
@@ -102,7 +115,7 @@ export function WorkflowEditor({ tab }: { tab: Tab }) {
       return;
     }
     void w.workflowCheckScript(wf.post_restore_script, wf.options.script_mode).then(setCheck).catch((e) => setError(toAppError(e)));
-  }, [steps.length, wf.post_restore_script, wf.options.script_mode]);
+  }, [steps.length, wf.post_restore_script, wf.options.script_mode, libVersion]);
 
   // Live debounced SQL preview compilation for v2 steps
   useEffect(() => {
@@ -339,7 +352,8 @@ export function WorkflowEditor({ tab }: { tab: Tab }) {
   const saveDisabled = busy || (steps.length === 0 && !!check && !check.ok) || hasStepProblems;
 
   return (
-    <form className="form-page wf-editor" aria-label="Workflow" onSubmit={onSubmit}>
+    <>
+      <form className="form-page wf-editor" aria-label="Workflow" onSubmit={onSubmit}>
       <div className="wf-editor-header">
         <h2>{existing ? `Edit ${existing.name}` : "New workflow"}</h2>
         <div className="wf-editor-tools">
@@ -701,6 +715,15 @@ export function WorkflowEditor({ tab }: { tab: Tab }) {
                 onRemove={() => removeStep(idx)}
                 onConvertToSql={step.kind !== "sql" ? () => convertStepToSql(idx, step.id) : undefined}
                 onRequestPreview={() => setPreviewTick((t) => t + 1)}
+                onOpenScript={(scriptId) => {
+                  setError(null);
+                  const preferred = wf.target.connection
+                    ? { connectionId: wf.target.connection, database: wf.target.database || undefined }
+                    : undefined;
+                  void openLibraryScript(scriptId, preferred).catch((e) => setError(toAppError(e)));
+                }}
+                onEditScript={(scriptId) => setEditingScriptId(scriptId)}
+                onCreateScript={(bind) => setNewScriptBind(() => bind)}
               />
             ))}
           </div>
@@ -709,23 +732,58 @@ export function WorkflowEditor({ tab }: { tab: Tab }) {
             <p className="muted wf-empty-hint">
               Add visual steps above (delete users, insert test users, mask PII, SQL, verify), or attach a single post-restore library script below.
             </p>
-            <label>
-              Post-restore script
-              <select
-                aria-label="Post-restore script"
-                value={wf.post_restore_script ?? ""}
-                onChange={(e) => setWf({ ...wf, post_restore_script: e.target.value || null })}
-              >
-                <option value="">none</option>
-                {scripts
-                  .filter((s) => /\.sql$/i.test(s.path))
-                  .map((s) => (
-                    <option key={s.id} value={s.id} disabled={s.missing}>
-                      {s.path}
-                    </option>
-                  ))}
-              </select>
-            </label>
+            <div className="wf-linked-script-bar">
+              <label className="grow">
+                Post-restore script
+                <select
+                  aria-label="Post-restore script"
+                  value={wf.post_restore_script ?? ""}
+                  onChange={(e) => setWf({ ...wf, post_restore_script: e.target.value || null })}
+                >
+                  <option value="">none</option>
+                  {scripts
+                    .filter((s) => /\.sql$/i.test(s.path))
+                    .map((s) => (
+                      <option key={s.id} value={s.id} disabled={s.missing}>
+                        {s.path}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              <div className="wf-linked-script-actions">
+                <button
+                  type="button"
+                  disabled={!wf.post_restore_script}
+                  onClick={() => wf.post_restore_script && setEditingScriptId(wf.post_restore_script)}
+                >
+                  Edit script
+                </button>
+                <button
+                  type="button"
+                  disabled={!wf.post_restore_script}
+                  onClick={() => {
+                    if (!wf.post_restore_script) return;
+                    setError(null);
+                    const preferred = wf.target.connection
+                      ? { connectionId: wf.target.connection, database: wf.target.database || undefined }
+                      : undefined;
+                    void openLibraryScript(wf.post_restore_script, preferred).catch((e) => setError(toAppError(e)));
+                  }}
+                >
+                  Open tab
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setNewScriptBind(() => (scriptId: string) =>
+                      setWf((x) => ({ ...x, post_restore_script: scriptId })),
+                    )
+                  }
+                >
+                  + New script
+                </button>
+              </div>
+            </div>
             <label>
               Script mode
               <select
@@ -943,7 +1001,38 @@ export function WorkflowEditor({ tab }: { tab: Tab }) {
           </div>
         </div>
       )}
-    </form>
+      </form>
+
+      {newScriptBind && (
+        <NewScriptModal
+          folders={scriptFolders}
+          defaultFolder={scriptFolders.includes("post") ? "post" : ""}
+          sqlOnly
+          initialContent="-- Post-restore SQL script (use {{param_name}} for workflow parameters)\n"
+          onClose={() => setNewScriptBind(null)}
+          onCreated={(opened) => {
+            const bind = newScriptBind;
+            setNewScriptBind(null);
+            setScripts((prev) =>
+              prev.some((s) => s.id === opened.info.id) ? prev : [...prev, opened.info],
+            );
+            bind(opened.info.id);
+            setPreviewTick((t) => t + 1);
+          }}
+        />
+      )}
+
+      {editingScriptId && (
+        <EditScriptModal
+          scriptId={editingScriptId}
+          onClose={() => setEditingScriptId(null)}
+          onSaved={() => {
+            setEditingScriptId(null);
+            setPreviewTick((t) => t + 1);
+          }}
+        />
+      )}
+    </>
   );
 }
 

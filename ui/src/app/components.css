@@ -488,3 +488,37 @@ button.danger { background: var(--danger) !important; border-color: var(--danger
 .run-status[data-status="paused_for_inspection"] { color: var(--warning); border-color: var(--warning); }
 .wf-pipeline-results { margin-top: 4px; }
 
+/* Script Library CRUD & inline linked-script authoring (Phase 1C) */
+.script-tag-filter { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px 8px 4px; }
+.script-tag-chip {
+  height: 20px !important; padding: 0 7px !important; border-radius: 10px !important;
+  font-size: 11px; color: var(--fg-muted); background: var(--bg-raised) !important;
+}
+.script-tag-chip[data-active] {
+  border-color: var(--accent) !important; color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg)) !important; font-weight: 600;
+}
+.folder-toggle {
+  display: flex; align-items: center; justify-content: space-between; width: 100%;
+  border: 0 !important; background: transparent !important; border-radius: 0 !important;
+  height: 22px !important; padding: 0 10px !important; cursor: pointer; text-align: left;
+}
+.folder-toggle:hover { background: var(--bg-hover) !important; }
+.script-row { display: flex; align-items: center; }
+.script-row .script-item { flex: 1; min-width: 0; }
+.script-row-actions {
+  display: flex; gap: 2px; padding-right: 6px; opacity: 0; transition: opacity 0.1s;
+}
+.script-row:hover .script-row-actions,
+.script-row:focus-within .script-row-actions { opacity: 1; }
+.script-row-actions button.icon { width: 20px; height: 20px !important; font-size: 11px; }
+.script-modal { min-width: 480px; max-width: 640px; }
+.wf-linked-script-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+.wf-linked-script-actions { display: flex; flex-wrap: wrap; gap: 4px; padding-bottom: 1px; }
+.wf-linked-script-actions button { height: 24px !important; padding: 0 8px !important; font-size: var(--fs-small); }
+.meta-warn-banner {
+  background: color-mix(in srgb, var(--warning) 14%, var(--bg)) !important;
+  border-left: 3px solid var(--warning); color: var(--fg);
+}
+
+

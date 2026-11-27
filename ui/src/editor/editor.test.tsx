@@ -174,4 +174,18 @@ describe("editor tab", () => {
     expect(screen.getByRole("button", { name: "Reconnect" })).toBeInTheDocument();
     expect(document.querySelector(".cm-content")?.textContent).toContain("select 1 frm t");
   });
+
+  it("shows an inline warning banner when the SQL buffer contains psql meta-commands", async () => {
+    mockIPC((cmd) => {
+      if (cmd === "editor_open")
+        return { handle: 7, connection_id: "c1", database: "app", purpose: "editor_tab", server_version_num: 160000, backend_pid: 9, tls: "plaintext" };
+      if (cmd === "meta_scan")
+        return [{ command: "\\c", line: 1, column: 1, offset: 0, text: "\\c prod", position: "line_start" }];
+      return null;
+    });
+    render(<App />);
+    act(() => void openEditorTab("c1", "app", { text: "\\c prod\nSELECT 1;" }));
+    const banner = await screen.findByRole("status", { name: "psql meta-command warning" });
+    expect(banner).toHaveTextContent(/\\c \(line 1\)/);
+  });
 });

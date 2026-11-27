@@ -13,6 +13,7 @@ import { ErrorNote } from "../connection/ErrorNote";
 import { editorTheme } from "../editor/SqlEditor";
 import { toAppError, type AppError } from "../lib/ipc/errors";
 import * as ipc from "../lib/ipc/scripts";
+import { useScriptLibrary } from "./store";
 
 export interface TextTabData {
   text: string;
@@ -99,11 +100,13 @@ export function TextTab({ tab }: { tab: Tab }) {
     try {
       if (asPath) {
         const opened = await ipc.scriptSave(withExt(asPath, ext), text);
+        useScriptLibrary.getState().bump();
         updateTab(tab.id, { title: opened.info.name, data: { ...data, scriptId: opened.info.id, filePath: opened.path, fingerprint: opened.file.fingerprint } });
         void ipc.recordRecent({ path: opened.path, library_id: opened.info.id, action: "save" });
         setSaveAs(null);
       } else if (data.scriptId) {
         const info = await ipc.scriptWrite(data.scriptId, text);
+        useScriptLibrary.getState().bump();
         setData({ fingerprint: info.fingerprint });
       } else if (data.filePath) {
         setData({ fingerprint: await ipc.fileWrite(data.filePath, text) });
