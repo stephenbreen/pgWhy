@@ -174,4 +174,140 @@ describe("refresh run view", () => {
     expect(b.calls.filter((c) => c.cmd === "run_get").length).toBe(getRunCountBefore);
     expect(screen.getByText(/dumping table public\.orders/)).toBeInTheDocument();
   });
+
+  it("Staging/Production requires exact typed DB name and never shows Don't ask again", async () => {
+    const user = userEvent.setup();
+    const { calls } = backend({
+      ticket: "t1",
+      checks: [],
+      confirmation: conf({ target_tag: "staging", requires_typed_name: true, can_remember: false }) as PreflightReport["confirmation"],
+      missing_secrets: [],
+    });
+    render(<App />);
+    act(() => openRunTab({ workflowId: "w1", workflowName: "Refresh staging" }));
+    const box = await screen.findByRole("region", { name: "Confirmation" });
+    const startBtn = within(box).getByRole("button", { name: "Replace shop" });
+    expect(startBtn).toBeDisabled();
+    expect(within(box).queryByText(/Don't ask again/i)).not.toBeInTheDocument();
+
+    const input = within(box).getByLabelText("Confirm target database name");
+    await user.type(input, "wrong");
+    expect(startBtn).toBeDisabled();
+    await user.clear(input);
+    await user.type(input, "shop");
+    expect(startBtn).toBeEnabled();
+    await user.click(startBtn);
+    expect(calls.find((c) => c.cmd === "workflow_start")?.args).toEqual({
+      ticket: "t1",
+      fingerprint: "fp",
+      remember: false,
+      typedName: "shop",
+    });
+  });
+
+  it("prompts for runtime parameters and secret parameters and passes them to workflow_start", async () => {
+    const user = userEvent.setup();
+    const { calls } = backend({
+      ticket: "t1",
+      checks: [],
+      confirmation: conf({
+        parameters: [
+          { name: "test_email", label: "Test user email", kind: "text", required: true, default: "qa@example.test" },
+          { name: "test_password", label: "Test password", kind: "secret", required: true, default: null },
+        ],
+      }) as PreflightReport["confirmation"],
+      missing_secrets: [],
+    });
+    render(<App />);
+    act(() => openRunTab({ workflowId: "w1", workflowName: "Seed users" }));
+    const box = await screen.findByRole("region", { name: "Confirmation" });
+    const startBtn = within(box).getByRole("button", { name: "Replace shop" });
+    expect(startBtn).toBeDisabled();
+
+    const secretInput = within(box).getByLabelText("Test password");
+    expect(secretInput).toHaveAttribute("type", "password");
+    await user.type(secretInput, "s3cr3t!");
+    expect(startBtn).toBeEnabled();
+
+    await user.click(startBtn);
+    expect(calls.find((c) => c.cmd === "workflow_start")?.args).toEqual({
+      ticket: "t1",
+      fingerprint: "fp",
+      remember: false,
+      params: { test_email: "qa@example.test" },
+      secretParams: { test_password: "s3cr3t!" },
+    });
+  });
+
+  it("paused_for_inspection shows pipeline step results, Inspect staging (SQL), and swap actions", async () => {
+    const user = userEvent.setup();
+    const b = backend({ ticket: "t1", checks: [], confirmation: conf({ pause_before_swap: true }) as PreflightReport["confirmation"], missing_secrets: [] });
+    render(<App />);
+    act(() => openRunTab({ workflowId: "w1", workflowName: "Restore & seed" }));
+    await user.click(await screen.findByRole("button", { name: "Replace shop" }));
+    await screen.findByRole("list", { name: "Steps" });
+
+    const paused = record({
+      status: "paused_for_inspection",
+      staging_db: "shop_staging_1",
+      pause_before_swap: true,
+      headline: "Paused for inspection — shop_staging_1 is ready to inspect before swapping",
+      pipeline_steps: [
+        { step_id: "s1", step_name: "Delete production users", is_verify: false, status: "succeeded", rows_affected: 42, preview_sql: `DELETE FROM "public"."users";` },
+        { step_id: "s2", step_name: "Seed test users", is_verify: false, status: "succeeded", rows_affected: 2, preview_sql: `INSERT INTO "public"."users" VALUES ('admin@example.test', '••••••••');` },
+        { step_id: "s3", step_name: "Verify test users", is_verify: true, status: "succeeded", summary: "row count 2 >= 1" },
+      ],
+      actions: [
+        { kind: "complete_swap", label: "Complete swap into shop", enabled: true },
+        { kind: "drop_staging", label: "Drop staging shop_staging_1", enabled: true },
+      ],
+    });
+    b.set(paused);
+    await event({ event: "run_finished", run_id: "run1", status: "paused_for_inspection", record: paused });
+
+    expect(screen.getByText("Paused — inspect staging")).toBeInTheDocument();
+    const pipeline = screen.getByRole("region", { name: "Pipeline steps" });
+    expect(pipeline).toHaveTextContent("Delete production users");
+    expect(pipeline).toHaveTextContent("42 rows");
+    expect(pipeline).toHaveTextContent("row count 2 >= 1");
+
+    const actions = screen.getByRole("group", { name: "Actions" });
+    await user.click(within(actions).getByRole("button", { name: "Inspect staging (SQL)" }));
+    const editorTab = useWorkspace.getState().tabs.find((t) => t.kind === "editor");
+    expect(editorTab?.title).toBe("Inspect shop_staging_1");
+    expect((editorTab?.data as { database?: string })?.database).toBe("shop_staging_1");
+  });
+
+  it("in-place workflow supports Dry run (roll back) toggle and renders dry-run banner", async () => {
+    const user = userEvent.setup();
+    const b = backend({
+      ticket: "t1",
+      checks: [],
+      confirmation: conf({
+        source_mode: { mode: "in_place_target", pre_run_backup: true },
+      }) as PreflightReport["confirmation"],
+      missing_secrets: [],
+    });
+    render(<App />);
+    act(() => openRunTab({ workflowId: "w1", workflowName: "Seed in place" }));
+    const box = await screen.findByRole("region", { name: "Confirmation" });
+    await user.click(within(box).getByLabelText(/Dry run/i));
+    await user.click(within(box).getByRole("button", { name: "Dry run on shop" }));
+
+    expect(b.calls.find((c) => c.cmd === "workflow_start")?.args).toEqual({
+      ticket: "t1",
+      fingerprint: "fp",
+      remember: false,
+      dryRun: true,
+    });
+
+    const dryDone = record({
+      status: "succeeded",
+      dry_run: true,
+      source_mode: { mode: "in_place_target", pre_run_backup: false },
+    });
+    b.set(dryDone);
+    await event({ event: "run_finished", run_id: "run1", status: "succeeded", record: dryDone });
+    expect(screen.getByRole("status")).toHaveTextContent(/Dry run succeeded on shop — all changes were rolled back/i);
+  });
 });
