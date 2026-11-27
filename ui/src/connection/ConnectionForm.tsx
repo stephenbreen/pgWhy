@@ -60,9 +60,26 @@ export function ConnectionForm({ tab }: { tab: Tab }) {
     setError(null);
     setTestResult(null);
     try {
-      const info = await ipc.testConnection(effective(), password || undefined);
+      const info = await ipc.testConnection(effective(), password || undefined, sshSecret || undefined);
       const tls = { plaintext: "not encrypted", encrypted_unverified: "encrypted (certificate not verified)", encrypted_verified: "encrypted and verified" }[info.tls];
       setTestResult(`Connected: ${ipc.serverVersionLabel(info.server_version_num)}, ${tls}.`);
+    } catch (e) {
+      setError(toAppError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = useConnections((s) => s.remove);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const onDelete = async () => {
+    if (!existing) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await remove(existing.id);
+      closeTab(tab.id);
     } catch (e) {
       setError(toAppError(e));
     } finally {
@@ -249,6 +266,21 @@ export function ConnectionForm({ tab }: { tab: Tab }) {
         <button type="button" onClick={onTest} disabled={busy}>
           Test
         </button>
+        {existing &&
+          (confirmDelete ? (
+            <>
+              <button type="button" className="danger" onClick={() => void onDelete()} disabled={busy}>
+                Confirm delete
+              </button>
+              <button type="button" onClick={() => setConfirmDelete(false)} disabled={busy}>
+                Keep
+              </button>
+            </>
+          ) : (
+            <button type="button" className="danger" onClick={() => setConfirmDelete(true)} disabled={busy}>
+              Delete
+            </button>
+          ))}
         <span className="spacer" />
         <button type="button" onClick={() => closeTab(tab.id)} disabled={busy}>
           Cancel

@@ -507,6 +507,9 @@ impl Engine {
     pub async fn shutdown(&self, grace: Duration) {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         lock(&self.inner.tickets).clear();
+        for cancel in lock(&self.inner.operation_cancels).values() {
+            cancel.cancel();
+        }
         let runs: Vec<(RunId, watch::Receiver<bool>)> = {
             let active = lock(&self.inner.active);
             active

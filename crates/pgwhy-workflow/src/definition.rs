@@ -16,6 +16,23 @@ impl WorkflowId {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }
+
+    /// Reject IDs that could escape a directory when used as a file or folder name.
+    pub fn validate(&self) -> AppResult<()> {
+        if self.0.is_empty()
+            || self.0.len() > 128
+            || !self
+                .0
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                format!("invalid workflow id \"{}\"", self.0),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for WorkflowId {
@@ -187,6 +204,7 @@ pub fn validate(
     source: &ConnectionEntry,
     target: &ConnectionEntry,
 ) -> AppResult<()> {
+    wf.id.validate()?;
     if wf.name.trim().is_empty() {
         return Err(AppError::new(
             ErrorKind::Config,
@@ -269,15 +287,17 @@ impl WorkflowStore {
                 out.push(read(&p)?);
             }
         }
-        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.sort_by_key(|a| a.name.to_lowercase());
         Ok(out)
     }
 
     pub fn get(&self, id: &WorkflowId) -> AppResult<RefreshWorkflow> {
+        id.validate()?;
         read(&self.path(id))
     }
 
     pub fn save(&self, wf: &RefreshWorkflow) -> AppResult<()> {
+        wf.id.validate()?;
         let text = toml::to_string_pretty(wf).map_err(|e| {
             AppError::internal("could not serialize the workflow").with_detail(e.to_string())
         })?;
@@ -288,6 +308,7 @@ impl WorkflowStore {
     }
 
     pub fn delete(&self, id: &WorkflowId) -> AppResult<()> {
+        id.validate()?;
         match std::fs::remove_file(self.path(id)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

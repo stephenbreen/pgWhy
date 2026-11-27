@@ -28,6 +28,23 @@ impl RunId {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }
+
+    /// Reject IDs that could escape the history directory when used as a filename.
+    pub fn validate(&self) -> AppResult<()> {
+        if self.0.is_empty()
+            || self.0.len() > 128
+            || !self
+                .0
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                format!("invalid run id \"{}\"", self.0),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for RunId {
@@ -1042,6 +1059,7 @@ impl HistoryStore {
     }
 
     fn write<T: Serialize>(&self, id: &RunId, rec: &T) -> AppResult<()> {
+        id.validate()?;
         std::fs::create_dir_all(&self.dir).map_err(|e| io(&self.dir, e))?;
         let bytes = serde_json::to_vec_pretty(rec).map_err(|e| {
             AppError::internal("could not serialize the history record").with_detail(e.to_string())
@@ -1077,6 +1095,7 @@ impl HistoryStore {
     }
 
     fn read<T: serde::de::DeserializeOwned>(&self, id: &RunId) -> AppResult<T> {
+        id.validate()?;
         let path = self.record_path(id);
         let bytes = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

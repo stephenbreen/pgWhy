@@ -143,11 +143,18 @@ pub async fn db_rename(
     to: String,
 ) -> AppResult<OperationRecord> {
     let entry = state.manager.entry(&connection_id)?;
+    let to = to.trim().to_string();
+    if to.len() > 63 {
+        return Err(AppError::new(
+            ErrorKind::Config,
+            "PostgreSQL limits database names to 63 bytes",
+        ));
+    }
     let rec = state
         .engine()
         .rename_database(RenameDatabaseRequest {
             target: target(&entry, &database),
-            to: to.trim().to_string(),
+            to,
         })
         .await?;
     state.introspector.invalidate_server(&connection_id);

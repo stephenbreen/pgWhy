@@ -65,8 +65,10 @@ impl PgPassDir {
         endpoint: &ToolEndpoint,
         password: &ToolPassword,
     ) -> AppResult<PgPassFile> {
-        let line = entry_line(endpoint, password)?;
-        self.create_file(FILE_SUFFIX, line.as_bytes(), "credentials")
+        let mut line = entry_line(endpoint, password)?;
+        let res = self.create_file(FILE_SUFFIX, line.as_bytes(), "credentials");
+        zero_string(&mut line);
+        res
     }
 
     /// Write `pem` (CA certificates) to a private temp file for the child's `PGSSLROOTCERT`.
@@ -214,6 +216,16 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Volatile zeroing of a temporary string buffer holding credential material.
+fn zero_string(s: &mut str) {
+    // SAFETY: we hold an exclusive mutable borrow; zeroed bytes are valid UTF-8.
+    let bytes = unsafe { s.as_bytes_mut() };
+    for b in bytes.iter_mut() {
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The pgpass line for an endpoint: `host:port:dbname:user:password\n`.
 fn entry_line(endpoint: &ToolEndpoint, password: &ToolPassword) -> AppResult<String> {
     let pw = password.expose();
@@ -229,14 +241,17 @@ fn entry_line(endpoint: &ToolEndpoint, password: &ToolPassword) -> AppResult<Str
     } else {
         endpoint.host.as_str()
     };
-    Ok(format!(
+    let mut escaped_pw = escape_field(pw);
+    let line = format!(
         "{}:{}:{}:{}:{}\n",
         escape_field(host),
         endpoint.port,
         escape_field(&endpoint.dbname),
         escape_field(&endpoint.user),
-        escape_field(pw)
-    ))
+        escaped_pw
+    );
+    zero_string(&mut escaped_pw);
+    Ok(line)
 }
 
 /// Escape `\`, `:` and `*` with a backslash. libpq only treats a field as a wildcard when it
@@ -306,8 +321,16 @@ fn is_stale(name: &str, entry: &fs::DirEntry) -> bool {
 
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
+    // Reject 0 and values > pid_t::MAX so a crafted filename can never cast to 0, -1, or a
+    // negative process-group id in libc::kill.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
     // SAFETY: signal 0 only probes for existence. EPERM means it exists (another user's).
-    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
     alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 

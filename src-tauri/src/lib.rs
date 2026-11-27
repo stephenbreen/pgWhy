@@ -105,6 +105,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         commands::runs::run_list,
         commands::runs::history_list,
         commands::runs::operation_get,
+        commands::runs::operation_action,
         commands::runs::run_get,
         commands::runs::run_reinventory,
         commands::runs::run_action,
@@ -157,6 +158,7 @@ static CLOSE_GATE: CloseGate = CloseGate {
 pub(crate) async fn stop_background_work<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(state) = app.try_state::<state::AppState>() {
         // quitting mid-run kills the children and records the run as Interrupted
+        state.backups.cancel_all();
         let _ = state
             .engine()
             .shutdown(std::time::Duration::from_secs(5))

@@ -290,8 +290,11 @@ export function EditorTab({ tab }: { tab: Tab }) {
     <div className="editor-tab" data-tag={entry?.env_tag}>
       <div className="editor-toolbar" role="toolbar" aria-label="Editor">
         <button type="button" className="primary" disabled={state.running} onClick={() => {
+          const view = editorHandle.current?.view;
           const text = currentText();
-          run({ text, from: 0, to: text.length, selection: false });
+          const sel = view?.state.selection.main;
+          const hasSel = !!sel && !sel.empty;
+          run({ text, from: hasSel ? sel.from : 0, to: hasSel ? sel.to : text.length, selection: hasSel });
         }} title="Run (F5 / Ctrl+Enter) — runs the selection when there is one">
           ▶ Run
         </button>
@@ -410,7 +413,7 @@ export function EditorTab({ tab }: { tab: Tab }) {
               if (!state.dirty) patch(tab.id, { dirty: true });
             }}
             onRun={run}
-            onCancel={() => void q.editorCancel(tab.id)}
+            onCancel={state.running ? () => void q.editorCancel(tab.id) : undefined}
           />
         </div>
         <ResultsPane state={state} onSelectResult={(i) => patch(tab.id, { activeResult: i })} />

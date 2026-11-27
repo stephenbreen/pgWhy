@@ -39,8 +39,13 @@ impl fmt::Debug for Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        // best-effort scrub; String's buffer is ours to overwrite
-        unsafe { self.0.as_bytes_mut() }.fill(0);
+        // Volatile zeroing + compiler fence so LLVM cannot elide the scrub before deallocation.
+        // SAFETY: we hold `&mut self`, so the String's byte buffer is exclusively ours.
+        let bytes = unsafe { self.0.as_bytes_mut() };
+        for b in bytes.iter_mut() {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
 

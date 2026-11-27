@@ -3,6 +3,7 @@
 //! forwarded port it hands out.
 
 use crate::config::ConnectionEntry;
+use crate::secret::Secret;
 use crate::{AppError, AppResult, ErrorKind};
 use std::any::Any;
 use std::future::Future;
@@ -38,6 +39,16 @@ impl std::fmt::Debug for TunnelLease {
 pub trait TunnelProvider: Send + Sync {
     /// Open (or share) the tunnel for `entry`. Only called for entries with a tunnel config.
     fn acquire<'a>(&'a self, entry: &'a ConnectionEntry) -> BoxFuture<'a, AppResult<TunnelLease>>;
+
+    /// Open a one-off tunnel for testing an unsaved/edited entry without disturbing any live
+    /// shared tunnel under `entry.id`.
+    fn acquire_ephemeral<'a>(
+        &'a self,
+        entry: &'a ConnectionEntry,
+        _ssh_secret: Option<&'a Secret>,
+    ) -> BoxFuture<'a, AppResult<TunnelLease>> {
+        self.acquire(entry)
+    }
 }
 
 /// Provider for builds/tests without SSH support: tunneled entries fail clearly.

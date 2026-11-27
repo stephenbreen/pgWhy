@@ -206,10 +206,49 @@ export function WorkflowEditor({ tab }: { tab: Tab }) {
       </fieldset>
       {error && <ErrorNote error={error} />}
       <div className="actions">
+        {existing && (
+          <DeleteWorkflowButton
+            busy={busy}
+            onDelete={async () => {
+              setBusy(true);
+              setError(null);
+              try {
+                await w.workflowDelete(existing.id);
+                useWorkflows.getState().remove(existing.id);
+                closeTab(tab.id);
+              } catch (e) {
+                setError(toAppError(e));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          />
+        )}
         <span className="spacer" />
         <button type="button" onClick={() => closeTab(tab.id)}>Cancel</button>
         <button type="submit" className="primary" disabled={busy || (!!check && !check.ok)}>Save</button>
       </div>
     </form>
+  );
+}
+
+function DeleteWorkflowButton({ busy, onDelete }: { busy: boolean; onDelete: () => Promise<void> }) {
+  const [confirm, setConfirm] = useState(false);
+  if (confirm) {
+    return (
+      <>
+        <button type="button" className="danger" disabled={busy} onClick={() => void onDelete()}>
+          Confirm delete
+        </button>
+        <button type="button" disabled={busy} onClick={() => setConfirm(false)}>
+          Keep
+        </button>
+      </>
+    );
+  }
+  return (
+    <button type="button" className="danger" disabled={busy} onClick={() => setConfirm(true)}>
+      Delete
+    </button>
   );
 }

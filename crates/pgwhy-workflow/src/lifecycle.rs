@@ -103,7 +103,10 @@ impl Engine {
         ));
         self.save_operation(&rec)?;
 
-        let maint = self.maintenance(&req.target.connection_id).await?;
+        let maint = match self.maintenance(&req.target.connection_id).await {
+            Ok(m) => m,
+            Err(e) => return Err(self.fail(&mut rec, "create", e)?),
+        };
         let step = rec.step_mut("create").expect("pushed above");
         step.start();
         if let Some(comment) = req.comment.as_deref().filter(|c| !c.trim().is_empty()) {
@@ -149,14 +152,17 @@ impl Engine {
             ));
         }
         if req.to == req.target.database {
-            return Ok(OperationRecord::new(
+            let mut rec = OperationRecord::new(
                 OperationKind::Rename,
                 format!("Rename {} (no change)", req.target.database),
                 OperationDetail::Rename {
                     database: req.target.database.clone(),
                     to: req.to.clone(),
                 },
-            ));
+            );
+            rec.status = RunStatus::Succeeded;
+            rec.finished_at = Some(crate::staging::now_rfc3339());
+            return Ok(rec);
         }
         let _lock = acquire_lock(self.locks(), &ctx)?;
 
@@ -174,7 +180,18 @@ impl Engine {
         ));
         self.save_operation(&rec)?;
 
-        let maint = self.maintenance(&req.target.connection_id).await?;
+        let _quiesce = match self
+            .refresh_ops()
+            .quiesce(&req.target.connection_id, vec![req.target.database.clone()])
+            .await
+        {
+            Ok(q) => q,
+            Err(e) => return Err(self.fail(&mut rec, "rename", e)?),
+        };
+        let maint = match self.maintenance(&req.target.connection_id).await {
+            Ok(m) => m,
+            Err(e) => return Err(self.fail(&mut rec, "rename", e)?),
+        };
         rec.step_mut("rename").expect("pushed above").start();
         self.save_operation(&rec)?;
 
@@ -224,7 +241,18 @@ impl Engine {
         ));
         self.save_operation(&rec)?;
 
-        let maint = self.maintenance(&req.target.connection_id).await?;
+        let _quiesce = match self
+            .refresh_ops()
+            .quiesce(&req.target.connection_id, vec![req.target.database.clone()])
+            .await
+        {
+            Ok(q) => q,
+            Err(e) => return Err(self.fail(&mut rec, "check", e)?),
+        };
+        let maint = match self.maintenance(&req.target.connection_id).await {
+            Ok(m) => m,
+            Err(e) => return Err(self.fail(&mut rec, "check", e)?),
+        };
 
         rec.step_mut("check").expect("pushed above").start();
         let prepared = match maint.prepared_xacts(&req.target.database).await {

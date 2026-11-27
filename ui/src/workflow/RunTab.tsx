@@ -156,11 +156,20 @@ function Preflight({
   );
 }
 
-function Steps({ record, live }: { record: r.RunRecord; live: Record<string, r.StepProgress> }) {
+function Steps({
+  record,
+  live,
+  liveOutput,
+}: {
+  record: r.RunRecord;
+  live: Record<string, r.StepProgress>;
+  liveOutput: Record<string, string[]>;
+}) {
   return (
     <ol className="steps" aria-label="Steps">
       {record.steps.map((s) => {
         const p = live[s.step];
+        const tail = s.output_tail.length > 0 ? s.output_tail : (liveOutput[s.step] ?? []);
         return (
           <li key={s.step} data-status={s.status}>
             <span className="check-icon">{STATUS_ICON[s.status]}</span>
@@ -184,10 +193,10 @@ function Steps({ record, live }: { record: r.RunRecord; live: Record<string, r.S
               )}
               {s.status === "running" && s.step === "swap" && record.swap_phase && <div className="muted">{record.swap_phase.replace(/_/g, " ")}</div>}
               {s.error && <ErrorNote error={s.error} compact />}
-              {(s.status === "failed" || s.status === "running") && s.output_tail.length > 0 && (
+              {(s.status === "failed" || s.status === "running") && tail.length > 0 && (
                 <details open={s.status === "failed"}>
                   <summary>Output</summary>
-                  <pre className="mono output-tail">{s.output_tail.slice(-20).join("\n")}</pre>
+                  <pre className="mono output-tail">{tail.slice(-20).join("\n")}</pre>
                 </details>
               )}
             </div>
@@ -207,6 +216,7 @@ export function RunTab({ tab }: { tab: Tab }) {
   const data = tab.data as RunTabData;
   const [phase, setPhase] = useState<Phase>(() => (data.runId ? { kind: "run", runId: data.runId, record: null } : { kind: "checking" }));
   const [live, setLive] = useState<Record<string, r.StepProgress>>({});
+  const [liveOutput, setLiveOutput] = useState<Record<string, string[]>>({});
   const [error, setError] = useState<AppError | null>(null);
   const [busy, setBusy] = useState(false);
   const ticket = useRef<string | null>(null);
@@ -241,6 +251,7 @@ export function RunTab({ tab }: { tab: Tab }) {
       ticket.current = null;
       runRef.current = runId;
       setLive({});
+      setLiveOutput({});
       setPhase({ kind: "run", runId, record: null });
       updateTab(tab.id, { data: { ...data, runId } });
       setPhase({ kind: "run", runId, record: await r.getRun(runId) });
@@ -256,8 +267,16 @@ export function RunTab({ tab }: { tab: Tab }) {
     else void runPreflight();
     const unlisten = r.onRunEvent((ev) => {
       if (ev.run_id !== runRef.current) return;
-      if (ev.event === "progress") setLive((l) => ({ ...l, [ev.step]: ev.progress }));
-      else if (ev.event === "run_started" || ev.event === "run_finished") {
+      if (ev.event === "progress") {
+        setLive((l) => ({ ...l, [ev.step]: ev.progress }));
+      } else if (ev.event === "output") {
+        // Buffer live output lines in memory rather than triggering a full disk-read getRun() per line.
+        setLiveOutput((o) => {
+          const prev = o[ev.step] ?? [];
+          const next = prev.length >= 60 ? [...prev.slice(-59), ev.line] : [...prev, ev.line];
+          return { ...o, [ev.step]: next };
+        });
+      } else if (ev.event === "run_started" || ev.event === "run_finished") {
         setPhase({ kind: "run", runId: ev.run_id, record: ev.record });
         if (ev.event === "run_finished" && (ev.status === "succeeded" || ev.status === "succeeded_cleanup_required")) {
           // the explorer re-reads the replaced database
@@ -334,7 +353,7 @@ export function RunTab({ tab }: { tab: Tab }) {
               </p>
             </div>
           )}
-          <Steps record={record} live={live} />
+          <Steps record={record} live={live} liveOutput={liveOutput} />
           {record.error && <ErrorNote error={record.error} />}
           {record.failed_items.length > 0 && (
             <section aria-label="Failed objects">

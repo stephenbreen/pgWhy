@@ -291,6 +291,21 @@ impl Engine {
                 }
                 return Err(e);
             }
+            if req.mode == RestoreMode::Replace {
+                let marker = crate::staging::Marker::new(
+                    crate::staging::MarkerRole::Staging,
+                    &rec.id.0,
+                    &rec.id.0,
+                    &req.database,
+                );
+                if let Err(e) = maint
+                    .set_comment(&staging, Some(&marker.to_comment()))
+                    .await
+                {
+                    let _ = maint.drop_database(&staging).await;
+                    return Err(e);
+                }
+            }
             set_step(
                 self,
                 rec,
@@ -655,6 +670,165 @@ impl Engine {
             )),
         }
     }
+
+    /// Perform a swap recovery or cleanup action on a finished/interrupted standalone Replace
+    /// restore record: `CompleteSwap`, `RollbackSwap`, `DropOld`, or `DropStaging`.
+    pub async fn perform_operation(
+        &self,
+        id: &crate::history::RunId,
+        action: crate::history::ActionKind,
+    ) -> AppResult<OperationRecord> {
+        use crate::history::ActionKind;
+        use crate::staging::MarkerRole;
+
+        let mut rec = self.get_operation(id)?;
+        let (conn_id, server_key, target, staging, old, renames) = match &rec.detail {
+            OperationDetail::Restore(r) if r.mode == RestoreMode::Replace => {
+                let swap = r.swap.as_ref().ok_or_else(|| {
+                    AppError::new(
+                        ErrorKind::Refused,
+                        "this restore has no swap state to recover",
+                    )
+                })?;
+                (
+                    r.target.connection_id.clone(),
+                    r.target.server_key.clone(),
+                    r.target.database.clone(),
+                    swap.staging_db.clone().unwrap_or_default(),
+                    swap.old_db
+                        .clone()
+                        .unwrap_or_else(|| crate::staging::old_name(&r.target.database)),
+                    swap.renames_completed,
+                )
+            }
+            _ => {
+                return Err(AppError::new(
+                    ErrorKind::Refused,
+                    "recovery actions only apply to Replace restore operations",
+                ));
+            }
+        };
+        let _lock = self
+            .locks()
+            .try_acquire(&server_key, format!("recovery of restore {}", rec.id))?;
+        let ops = self.refresh_ops();
+        let maint = ops.maintenance(&conn_id).await?;
+        let timeout = self.config().session_drain_timeout;
+        let _quiesce = ops
+            .quiesce(&conn_id, vec![target.clone(), staging.clone(), old.clone()])
+            .await?;
+
+        match action {
+            ActionKind::CompleteSwap => {
+                if renames != 1 || staging.is_empty() {
+                    return Err(AppError::new(
+                        ErrorKind::Refused,
+                        "this restore is not waiting between swap renames",
+                    ));
+                }
+                crate::swap::drain(&*maint, std::slice::from_ref(&staging), timeout, None).await?;
+                crate::swap::rename_with_drain(&*maint, &staging, &target, timeout).await?;
+                if let Err(e) = maint.set_comment(&target, None).await {
+                    rec.warnings.push(format!(
+                        "could not clear pgWhy's marker comment on {target}: {}",
+                        e.message
+                    ));
+                }
+                rec.status = match crate::swap::drop_marked(
+                    &*maint,
+                    &old,
+                    &rec.id,
+                    Some(MarkerRole::Old),
+                    timeout,
+                )
+                .await
+                {
+                    Ok(()) => RunStatus::Succeeded,
+                    Err(e) => {
+                        rec.warnings
+                            .push(format!("{old} could not be dropped: {}", e.message));
+                        RunStatus::SucceededCleanupRequired
+                    }
+                };
+                rec.error = None;
+                rec.failed_step = None;
+                if let OperationDetail::Restore(r) = &mut rec.detail {
+                    if let Some(swap) = &mut r.swap {
+                        swap.renames_completed = 2;
+                        swap.swap_phase = Some(SwapPhase::Done);
+                        swap.work_db_state = WorkDbState::SwappedIn;
+                        swap.staging_db = None;
+                    }
+                }
+                rec.warnings.push(format!(
+                    "swap completed: {target} now holds the restored copy"
+                ));
+            }
+            ActionKind::RollbackSwap => {
+                if renames != 1 {
+                    return Err(AppError::new(
+                        ErrorKind::Refused,
+                        "this restore is not waiting between swap renames",
+                    ));
+                }
+                let warnings =
+                    crate::swap::rollback_rename(&*maint, &target, &old, timeout).await?;
+                rec.warnings.extend(warnings);
+                rec.warnings.push(format!(
+                    "rolled back: {target} is the previous database again"
+                ));
+                if let OperationDetail::Restore(r) = &mut rec.detail {
+                    if let Some(swap) = &mut r.swap {
+                        swap.renames_completed = 0;
+                        swap.swap_phase = None;
+                    }
+                }
+            }
+            ActionKind::DropOld => {
+                if renames == 1 {
+                    return Err(AppError::new(
+                        ErrorKind::Refused,
+                        "complete or roll back the swap before dropping the _old database",
+                    ));
+                }
+                crate::swap::drop_marked(&*maint, &old, &rec.id, Some(MarkerRole::Old), timeout)
+                    .await?;
+                if rec.status == RunStatus::SucceededCleanupRequired {
+                    rec.status = RunStatus::Succeeded;
+                }
+                if let OperationDetail::Restore(r) = &mut rec.detail {
+                    if let Some(swap) = &mut r.swap {
+                        swap.old_db = None;
+                    }
+                }
+                rec.warnings.push(format!("dropped {old}"));
+            }
+            ActionKind::DropStaging => {
+                if renames == 1 || staging.is_empty() {
+                    return Err(AppError::new(
+                        ErrorKind::Refused,
+                        "complete or roll back the swap before dropping the staging database",
+                    ));
+                }
+                crate::swap::drop_marked(&*maint, &staging, &rec.id, None, timeout).await?;
+                if let OperationDetail::Restore(r) = &mut rec.detail {
+                    if let Some(swap) = &mut r.swap {
+                        swap.staging_db = None;
+                        swap.work_db_state = WorkDbState::Dropped;
+                    }
+                }
+                rec.warnings.push(format!("dropped {staging}"));
+            }
+            _ => {
+                return Err(AppError::new(
+                    ErrorKind::Refused,
+                    "that action is not supported on a standalone restore",
+                ));
+            }
+        }
+        self.save_operation(&rec)?;
+        Ok(rec)
+    }
 }
 
 /// Mark a step, persist the record (crash truth) and tell the UI.
@@ -735,7 +909,7 @@ fn restore_options(
         total_items: inspection
             .toc
             .as_ref()
-            .map(|t| t.restorable_count(!settings.no_privileges)),
+            .map(|t| t.restorable_count(settings.no_privileges)),
         log_path: log,
     }
 }

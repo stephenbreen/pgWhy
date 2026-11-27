@@ -61,8 +61,10 @@ export type TreeRow =
 
 interface TreesState {
   trees: Record<string, ConnTree>;
+  openConns: Record<string, boolean>;
   selected: { connectionId: string; id: string } | null;
   ensure: (connectionId: string) => ConnTree;
+  setConnOpen: (connectionId: string, open: boolean) => void;
   loadDatabases: (connectionId: string) => Promise<void>;
   loadSchemas: (connectionId: string, db: string) => Promise<void>;
   loadContents: (connectionId: string, db: string, schema: string, refresh?: boolean) => Promise<void>;
@@ -94,8 +96,11 @@ export const useTrees = create<TreesState>((set, get) => {
 
   return {
     trees: {},
+    openConns: {},
     selected: null,
     ensure: (connectionId) => get().trees[connectionId] ?? empty(),
+    setConnOpen: (connectionId, open) =>
+      set((s) => ({ openConns: { ...s.openConns, [connectionId]: open } })),
 
     loadDatabases: async (connectionId) => {
       update(connectionId, (t) => ({ ...t, databases: { state: "loading" } }));
@@ -216,6 +221,14 @@ export function flatten(connectionId: string, t: ConnTree, depth0: number, filte
             const cs = statusRow(sId, depth0 + 2, contents, () => void st.loadContents(connectionId, db.name, sc.name, true));
             if (cs && !filter) scRows.push(cs);
             if (contents?.state === "loaded") {
+              const partsByParent = new Map<string, ex.RelationNode[]>();
+              for (const r of contents.value.relations) {
+                if (r.partition_of) {
+                  const list = partsByParent.get(r.partition_of);
+                  if (list) list.push(r);
+                  else partsByParent.set(r.partition_of, [r]);
+                }
+              }
               for (const f of FOLDERS) {
                 const rels = contents.value.relations.filter((r) => f.kinds.includes(r.kind) && !r.partition_of);
                 const fns = contents.value.routines.filter((r) => f.kinds.includes(r.kind));
@@ -229,7 +242,7 @@ export function flatten(connectionId: string, t: ConnTree, depth0: number, filte
                     const colRows: TreeRow[] = [];
                     const relOpen = filter ? false : t.expanded.has(rId);
                     const relHit = !filter || matches(rel.name, filter);
-                    const parts = contents.value.relations.filter((p) => p.partition_of === `${rel.schema}.${rel.name}`);
+                    const parts = partsByParent.get(`${rel.schema}.${rel.name}`) ?? [];
                     if (relOpen || (filter && rel.columns.some((c) => matches(c.name, filter)))) {
                       for (const c of rel.columns) {
                         if (filter && !relHit && !matches(c.name, filter)) continue;

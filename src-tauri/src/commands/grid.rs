@@ -136,8 +136,12 @@ async fn execute(
     }
     let query = build_topn(&request)?;
     let result = Arc::new(query.new_result_set(1_000_000));
+    let result_id = result.id().to_string();
     state.results.register(grid_id, result.clone());
-    run_topn(&conn.client, &query, &result).await?;
+    if let Err(e) = run_topn(&conn.client, &query, &result).await {
+        state.release_result(&result_id);
+        return Err(e);
+    }
     Ok((query, result))
 }
 
@@ -189,14 +193,15 @@ pub async fn grid_open(
         result,
     };
     let v = view(&grid);
-    if let Some(old) = state
+    let replaced = state
         .grids
         .grids
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(grid_id.clone(), Arc::new(tokio::sync::Mutex::new(grid)))
-    {
-        drop(old);
+        .insert(grid_id.clone(), Arc::new(tokio::sync::Mutex::new(grid)));
+    if let Some(old) = replaced {
+        let old_id = old.lock().await.result.id().to_string();
+        state.release_result(&old_id);
     }
     Ok(v)
 }

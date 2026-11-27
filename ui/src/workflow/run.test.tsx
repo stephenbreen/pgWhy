@@ -158,4 +158,20 @@ describe("refresh run view", () => {
     await user.click(within(actions).getByRole("button", { name: "Roll back to the old database" }));
     expect(b.calls.find((c) => c.cmd === "run_action")?.args).toEqual({ runId: "run1", action: "rollback_swap" });
   });
+
+  it("buffers live output lines without calling run_get on every line", async () => {
+    const user = userEvent.setup();
+    const b = backend({ ticket: "t1", checks: [], confirmation: conf() as PreflightReport["confirmation"], missing_secrets: [] });
+    render(<App />);
+    act(() => openRunTab({ workflowId: "w1", workflowName: "Refresh shop" }));
+    await user.click(await screen.findByRole("button", { name: "Replace shop" }));
+    await screen.findByRole("list", { name: "Steps" });
+    const getRunCountBefore = b.calls.filter((c) => c.cmd === "run_get").length;
+
+    await event({ event: "output", run_id: "run1", step: "dump", line: "pg_dump: dumping table public.users" });
+    await event({ event: "output", run_id: "run1", step: "dump", line: "pg_dump: dumping table public.orders" });
+
+    expect(b.calls.filter((c) => c.cmd === "run_get").length).toBe(getRunCountBefore);
+    expect(screen.getByText(/dumping table public\.orders/)).toBeInTheDocument();
+  });
 });

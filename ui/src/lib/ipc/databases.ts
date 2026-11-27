@@ -53,6 +53,16 @@ export interface OperationRecord {
   warnings: string[];
   error?: { kind: string; class: string; message: string; hint?: string; detail?: string };
   failed_step?: string;
+  detail?: {
+    kind?: string;
+    mode?: string;
+    target?: { connection_id: string; database: string };
+    swap?: {
+      staging_db?: string | null;
+      old_db?: string | null;
+      renames_completed: number;
+    } | null;
+  };
 }
 
 export const dbCapabilities = (connectionId: string) =>

@@ -101,13 +101,17 @@ pub async fn settings_set(
     let engine_changed = current.backup_dir != settings.backup_dir
         || current.backup_retention != settings.backup_retention
         || current.pg_tools_dirs != settings.pg_tools_dirs;
-    if engine_changed && !state.engine().active_runs().is_empty() {
+    if engine_changed
+        && (!state.engine().active_runs().is_empty()
+            || state.engine().has_active_operations()
+            || state.backups.any_running())
+    {
         return Err(AppError::new(
             ErrorKind::Refused,
-            "a refresh is running; change the backup folder, retention or tool folders once it finishes",
+            "a backup, restore or refresh is running; change the backup folder, retention or tool folders once it finishes",
         ));
     }
-    {
+    let library_changed = {
         // compare, persist and swap under one lock so two saves cannot interleave
         let mut live = state.settings.lock().unwrap_or_else(|p| p.into_inner());
         let library_changed = live.script_library_dir != settings.script_library_dir;
@@ -120,9 +124,11 @@ pub async fn settings_set(
             .manager
             .set_idle_close(std::time::Duration::from_secs(settings.idle_close_secs));
         *live = settings;
-        if library_changed {
-            *state.library.lock().unwrap_or_else(|p| p.into_inner()) = None; // reopened lazily at the new location
-        }
+        library_changed
+    };
+    if library_changed {
+        // Acquired after releasing `state.settings` to prevent lock-order inversion with `with_library`.
+        *state.library.lock().unwrap_or_else(|p| p.into_inner()) = None; // reopened lazily at the new location
     }
     if engine_changed {
         state.rebuild_engine()?;

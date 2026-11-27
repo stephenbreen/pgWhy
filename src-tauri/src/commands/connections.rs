@@ -82,6 +82,7 @@ fn apply_secret(
 }
 
 fn validate(entry: &ConnectionEntry) -> AppResult<()> {
+    entry.id.validate()?;
     let missing = |what: &str| AppError::new(ErrorKind::Config, format!("{what} is required"));
     if entry.name.trim().is_empty() {
         return Err(missing("A name"));
@@ -219,9 +220,17 @@ pub async fn test_connection(
     state: State<'_, AppState>,
     entry: ConnectionEntry,
     password: Option<String>,
+    ssh_secret: Option<String>,
 ) -> AppResult<ConnInfo> {
     validate(&entry)?;
-    state.manager.test(&entry, password.map(Secret::new)).await
+    state
+        .manager
+        .test_with_ssh_secret(
+            &entry,
+            password.map(Secret::new),
+            ssh_secret.map(Secret::new),
+        )
+        .await
 }
 
 /// Connect an entry's default database for the explorer and record it as recently used.

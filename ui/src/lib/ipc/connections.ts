@@ -87,8 +87,8 @@ export const saveConnection = (entry: ConnectionEntry, password: SecretInput, ss
 
 export const deleteConnection = (id: string) => invoke<void>("delete_connection", { id });
 
-export const testConnection = (entry: ConnectionEntry, password?: string) =>
-  invoke<ConnInfo>("test_connection", { entry, password: password ?? null });
+export const testConnection = (entry: ConnectionEntry, password?: string, sshSecret?: string) =>
+  invoke<ConnInfo>("test_connection", { entry, password: password ?? null, sshSecret: sshSecret ?? null });
 
 export const connect = (id: string, password?: SecretInput, sshSecret?: SecretInput) =>
   invoke<ConnInfo>("connect", { id, password: password ?? null, sshSecret: sshSecret ?? null });

@@ -180,6 +180,8 @@ export const cancelRun = (runId: string) => invoke<void>("workflow_cancel", { ru
 export const historyList = () => invoke<HistoryEntry[]>("history_list");
 
 export const operationGet = (id: string) => invoke<import("./databases").OperationRecord>("operation_get", { id });
+export const operationAction = (id: string, action: ActionKind) =>
+  invoke<import("./databases").OperationRecord>("operation_action", { id, action });
 
 export const listRuns = (workflowId?: string) => invoke<RunRecord[]>("run_list", { workflowId: workflowId ?? null });
 export const getRun = (runId: string) => invoke<RunRecord>("run_get", { runId });

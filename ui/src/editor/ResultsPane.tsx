@@ -1,7 +1,7 @@
 // SSMS-style results pane: one grid at a time with a result-set switcher, plus Messages.
 // A 50-statement script yields one pane, not 50 tabs.
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { ResultGrid } from "../grid/ResultGrid";
 import { useResultStore } from "../grid/useResultStore";
 import { resultCopy } from "../lib/ipc/query";
@@ -10,10 +10,14 @@ import type { EditorTabState, ResultSet } from "./store";
 
 function ResultView({ rs, label }: { rs: ResultSet; label: string }) {
   const store = useResultStore(rs.resultId);
+  const columns = useMemo(
+    () => rs.columns.map((c) => ({ name: c.name, type: c.type_name ?? undefined })),
+    [rs.columns],
+  );
   return (
     <>
       <ResultGrid
-        columns={rs.columns.map((c) => ({ name: c.name, type: c.type_name ?? undefined }))}
+        columns={columns}
         store={store}
         rowCount={rs.rowCount}
         label={label}

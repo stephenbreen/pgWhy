@@ -22,6 +22,23 @@ impl ConnectionId {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }
+
+    /// Reject IDs that could escape directories or corrupt filenames.
+    pub fn validate(&self) -> crate::AppResult<()> {
+        if self.0.is_empty()
+            || self.0.len() > 128
+            || !self
+                .0
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(crate::AppError::new(
+                crate::ErrorKind::Config,
+                format!("invalid connection id \"{}\"", self.0),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for ConnectionId {

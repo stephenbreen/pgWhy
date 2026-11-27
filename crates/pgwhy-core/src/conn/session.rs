@@ -232,20 +232,29 @@ impl PgConn {
 
         let handle = ConnHandle::next();
         let shared = Arc::new(ConnShared::new());
-        let (ntx, nrx) = mpsc::unbounded_channel();
+        // Only Editor and Workflow script sessions drain notices; other purposes drop them so
+        // long-lived introspection/grid/maintenance connections cannot leak unboundedly.
+        let (ntx, nrx) = if matches!(purpose, Purpose::EditorTab | Purpose::Workflow) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let driver_shared = shared.clone();
         let task = tokio::spawn(async move {
             let mut messages = futures_util::stream::poll_fn(move |cx| connection.poll_message(cx));
             while let Some(msg) = messages.next().await {
                 match msg {
                     Ok(AsyncMessage::Notice(n)) => {
-                        let _ = ntx.send(Notice {
-                            severity: n.severity().to_string(),
-                            code: n.code().code().to_string(),
-                            message: n.message().to_string(),
-                            detail: n.detail().map(str::to_string),
-                            hint: n.hint().map(str::to_string),
-                        });
+                        if let Some(ntx) = &ntx {
+                            let _ = ntx.send(Notice {
+                                severity: n.severity().to_string(),
+                                code: n.code().code().to_string(),
+                                message: n.message().to_string(),
+                                detail: n.detail().map(str::to_string),
+                                hint: n.hint().map(str::to_string),
+                            });
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -263,14 +272,20 @@ impl PgConn {
         });
         *shared.abort.lock().unwrap() = Some(task.abort_handle());
 
-        let row = client
+        let row = match client
             .query_one(
                 "select current_setting('server_version_num')::int4, pg_backend_pid(), \
                  coalesce((select ssl from pg_stat_ssl where pid = pg_backend_pid()), false)",
                 &[],
             )
             .await
-            .map_err(|e| classify(&e, &context))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                shared.close();
+                return Err(classify(&e, &context));
+            }
+        };
         let encrypted: bool = row.get(2);
         let info = ConnInfo {
             handle,
@@ -287,7 +302,7 @@ impl PgConn {
             info,
             cancel,
             cancel_tls: setup.connector,
-            notices: Mutex::new(Some(nrx)),
+            notices: Mutex::new(nrx),
             shared,
             _lease: lease,
         })

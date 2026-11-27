@@ -130,3 +130,17 @@ test("replace mode is disabled for a role that cannot create databases", async (
   // on-top stays available: it needs no CREATE DATABASE
   expect(screen.getByRole("radio", { name: /restore on top/i })).toBeEnabled();
 });
+
+test("restoring a History backup from Production defaults to an available Local target", async () => {
+  backend();
+  const prod: ConnectionEntry = { ...entry, id: "c-prod", name: "Prod", env_tag: "production" };
+  const local: ConnectionEntry = { ...entry, id: "c-local", name: "Local", env_tag: "local" };
+  useConnections.setState({ entries: [prod, local], recents: [], status: {} } as never);
+  useTrees.setState({ trees: {} } as never);
+  useRestore.setState({ connectionId: "c-prod", database: "app", envTag: "production", archive: "/tmp/src.dump" });
+
+  render(<RestoreDialog />);
+  const picker = (await screen.findByLabelText(/target connection/i)) as HTMLSelectElement;
+  expect(picker.value).toBe("c-local");
+  expect(await screen.findByRole("button", { name: /^restore$/i })).toBeEnabled();
+});
