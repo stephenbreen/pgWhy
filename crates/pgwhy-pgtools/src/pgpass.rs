@@ -216,9 +216,9 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Volatile zeroing of a temporary String holding credential material.
-fn zero_string(s: &mut String) {
-    // SAFETY: we own the String exclusively; zeroed bytes are valid UTF-8.
+/// Volatile zeroing of a temporary string buffer holding credential material.
+fn zero_string(s: &mut str) {
+    // SAFETY: we hold an exclusive mutable borrow; zeroed bytes are valid UTF-8.
     let bytes = unsafe { s.as_bytes_mut() };
     for b in bytes.iter_mut() {
         unsafe { std::ptr::write_volatile(b, 0) };
