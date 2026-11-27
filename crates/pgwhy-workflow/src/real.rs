@@ -221,9 +221,8 @@ impl RefreshOps for RealOps {
         ctx: &'a OpCtx,
     ) -> BoxFuture<'a, AppResult<DumpDone>> {
         Box::pin(async move {
-            let tools = plan
-                .tools
-                .as_ref()
+            let pg_dump = plan
+                .resolved_pg_dump()
                 .ok_or_else(|| AppError::internal("no pg_dump selected"))?;
             let lease = self.lease(&plan.source).await?;
             let ep = tool_endpoint(&plan.source, lease.as_ref(), plan.source_db());
@@ -247,7 +246,7 @@ impl RefreshOps for RealOps {
             };
             let rc = self.run_context(ctx);
             let outcome = pgwhy_pgtools::backup(
-                &tools.pg_dump,
+                pg_dump,
                 &ep,
                 plan.source_password.as_ref(),
                 out,
@@ -278,13 +277,12 @@ impl RefreshOps for RealOps {
         ctx: &'a OpCtx,
     ) -> BoxFuture<'a, AppResult<BackupVerdict>> {
         Box::pin(async move {
-            let tools = plan
-                .tools
-                .as_ref()
+            let pg_restore = plan
+                .resolved_pg_restore()
                 .ok_or_else(|| AppError::internal("no pg_restore selected"))?;
             let rc = self.run_context(ctx);
             let insp = pgwhy_pgtools::inspect_archive(
-                &tools.pg_restore,
+                pg_restore,
                 path,
                 pgwhy_pgtools::ArchiveCheck::TocOnly,
                 &rc,
@@ -317,9 +315,8 @@ impl RefreshOps for RealOps {
         ctx: &'a OpCtx,
     ) -> BoxFuture<'a, AppResult<ToolStepDone>> {
         Box::pin(async move {
-            let tools = plan
-                .tools
-                .as_ref()
+            let pg_restore = plan
+                .resolved_pg_restore()
                 .ok_or_else(|| AppError::internal("no pg_restore selected"))?;
             let o = &plan.workflow.options;
             let opts = RestoreOptions {
@@ -335,7 +332,7 @@ impl RefreshOps for RealOps {
             };
             self.restore_archive(
                 &plan.target,
-                &tools.pg_restore,
+                pg_restore,
                 plan.target_password.as_ref(),
                 archive,
                 into_db,
@@ -532,6 +529,511 @@ impl RefreshOps for RealOps {
             Ok(Box::new(guard) as QuiesceToken)
         })
     }
+
+    fn restore_plain_sql<'a>(
+        &'a self,
+        plan: &'a RunPlan,
+        sql_path: &'a Path,
+        into_db: &'a str,
+        log: &'a Path,
+        ctx: &'a OpCtx,
+    ) -> BoxFuture<'a, AppResult<ToolStepDone>> {
+        Box::pin(async move {
+            let psql = plan
+                .psql_tool
+                .as_ref()
+                .ok_or_else(|| AppError::new(ErrorKind::ToolMissing, "no psql tool selected"))?;
+            let lease = self.lease(&plan.target).await?;
+            let ep = tool_endpoint(&plan.target, lease.as_ref(), into_db);
+            let opts = RestoreOptions {
+                error_policy: match plan.workflow.options.error_policy {
+                    ErrorPolicy::StopOnFirst => pgwhy_pgtools::ErrorPolicy::ExitOnError,
+                    ErrorPolicy::ContinueThenFail => pgwhy_pgtools::ErrorPolicy::ContinueOnError,
+                },
+                log_path: Some(log.to_path_buf()),
+                ..Default::default()
+            };
+            let rc = self.run_context(ctx);
+            let outcome = pgwhy_pgtools::restore_plain_sql(
+                psql,
+                &ep,
+                plan.target_password.as_ref(),
+                sql_path,
+                &opts,
+                &rc,
+                forward(ctx),
+            )
+            .await?;
+            drop(lease);
+            Ok(ToolStepDone {
+                exit_code: outcome.run.exit_code,
+                output_tail: tail(&outcome.run.stderr_tail, TAIL),
+                log_path: outcome.run.log_path.clone(),
+                objects_done: outcome.run.objects_done,
+            })
+        })
+    }
+
+    fn dump_target<'a>(
+        &'a self,
+        plan: &'a RunPlan,
+        out: &'a Path,
+        log: &'a Path,
+        ctx: &'a OpCtx,
+    ) -> BoxFuture<'a, AppResult<DumpDone>> {
+        Box::pin(async move {
+            let pg_dump = plan
+                .resolved_pg_dump()
+                .ok_or_else(|| AppError::internal("no pg_dump selected for pre-run backup"))?;
+            let lease = self.lease(&plan.target).await?;
+            let ep = tool_endpoint(&plan.target, lease.as_ref(), plan.target_db());
+            let opts = BackupOptions {
+                format: DumpFormat::Custom,
+                log_path: Some(log.to_path_buf()),
+                ..Default::default()
+            };
+            let rc = self.run_context(ctx);
+            let outcome = pgwhy_pgtools::backup(
+                pg_dump,
+                &ep,
+                plan.target_password.as_ref(),
+                out,
+                &opts,
+                &rc,
+                forward(ctx),
+            )
+            .await?;
+            drop(lease);
+            Ok(DumpDone {
+                path: outcome.path,
+                size_bytes: outcome.size_bytes,
+                dumped_by: outcome.dumped_by.raw.clone(),
+                tool: ToolStepDone {
+                    exit_code: outcome.run.exit_code,
+                    output_tail: tail(&outcome.run.stderr_tail, TAIL),
+                    log_path: outcome.run.log_path.clone(),
+                    objects_done: outcome.run.objects_done,
+                },
+            })
+        })
+    }
+
+    fn run_pipeline<'a>(
+        &'a self,
+        plan: &'a RunPlan,
+        db: &'a str,
+        steps: &'a [CompiledPipelineStep],
+        dry_run: bool,
+        ctx: &'a OpCtx,
+    ) -> BoxFuture<'a, AppResult<PipelineRunDone>> {
+        Box::pin(async move {
+            if steps.is_empty() {
+                return Ok(PipelineRunDone::default());
+            }
+            if dry_run && steps.iter().any(|s| s.no_transaction) {
+                return Err(AppError::new(
+                    ErrorKind::Refused,
+                    "dry run cannot execute steps with \"run without transaction\" enabled",
+                )
+                .with_hint(
+                    "disable \"run without transaction\" on those steps, or disable dry run",
+                ));
+            }
+
+            let conn = self
+                .deps
+                .manager
+                .open(&plan.target.id, db, Purpose::Workflow)
+                .await?;
+            let mut lines: VecDeque<String> = VecDeque::new();
+            let push_line = |lines: &mut VecDeque<String>, line: String| {
+                ctx.output(line.clone());
+                lines.push_back(line);
+                while lines.len() > TAIL {
+                    lines.pop_front();
+                }
+            };
+
+            let mut results = Vec::with_capacity(steps.len());
+            let mut in_txn = false;
+            let mut any_mutated_outside_txn = false;
+
+            if dry_run {
+                conn.client
+                    .batch_execute("BEGIN")
+                    .await
+                    .map_err(|e| classify(&e, "start dry-run transaction"))?;
+                in_txn = true;
+                push_line(
+                    &mut lines,
+                    "dry run: started transaction (all changes will be rolled back)".into(),
+                );
+            }
+
+            let mut run_err: Option<AppError> = None;
+
+            for step in steps {
+                if ctx.cancel.is_cancelled() {
+                    run_err = Some(AppError::new(ErrorKind::Cancelled, "the run was cancelled"));
+                    break;
+                }
+
+                if !dry_run {
+                    if step.no_transaction {
+                        if in_txn {
+                            if let Err(e) = conn.client.batch_execute("COMMIT").await {
+                                run_err = Some(classify(&e, "commit preceding transform steps"));
+                                break;
+                            }
+                            in_txn = false;
+                        }
+                        any_mutated_outside_txn = true;
+                    } else if !in_txn {
+                        if let Err(e) = conn.client.batch_execute("BEGIN").await {
+                            run_err = Some(classify(&e, "start transform transaction"));
+                            break;
+                        }
+                        in_txn = true;
+                    }
+                }
+
+                match &step.exec {
+                    CompiledExec::Sql { sql, preview_sql } => {
+                        push_line(&mut lines, format!("running step \"{}\"", step.step_name));
+                        let fut = conn.client.simple_query(sql);
+                        let res = tokio::select! {
+                            r = fut => r,
+                            _ = ctx.cancel.cancelled() => {
+                                let _ = conn.cancel_token().cancel_query(tokio_postgres::NoTls).await;
+                                run_err = Some(AppError::new(
+                                    ErrorKind::Cancelled,
+                                    format!("step \"{}\" was cancelled", step.step_name),
+                                ));
+                                break;
+                            }
+                        };
+                        match res {
+                            Ok(msgs) => {
+                                let mut rows: u64 = 0;
+                                let mut stmts: u64 = 0;
+                                for msg in msgs {
+                                    if let tokio_postgres::SimpleQueryMessage::CommandComplete(n) =
+                                        msg
+                                    {
+                                        rows = rows.saturating_add(n);
+                                        stmts += 1;
+                                    }
+                                }
+                                let summary =
+                                    format!("{stmts} statement(s), {rows} row(s) affected");
+                                push_line(
+                                    &mut lines,
+                                    format!("step \"{}\": {summary}", step.step_name),
+                                );
+                                results.push(crate::history::PipelineStepResult {
+                                    step_id: step.step_id.clone(),
+                                    step_name: step.step_name.clone(),
+                                    is_verify: false,
+                                    status: crate::history::StepStatus::Succeeded,
+                                    rows_affected: Some(rows),
+                                    summary: Some(summary),
+                                    preview_sql: Some(preview_sql.clone()),
+                                });
+                            }
+                            Err(e) => {
+                                let err = classify(&e, &format!("run step \"{}\"", step.step_name));
+                                push_line(
+                                    &mut lines,
+                                    format!("step \"{}\" failed: {}", step.step_name, err.message),
+                                );
+                                results.push(crate::history::PipelineStepResult {
+                                    step_id: step.step_id.clone(),
+                                    step_name: step.step_name.clone(),
+                                    is_verify: false,
+                                    status: crate::history::StepStatus::Failed,
+                                    rows_affected: None,
+                                    summary: Some(err.message.clone()),
+                                    preview_sql: Some(preview_sql.clone()),
+                                });
+                                run_err = Some(err);
+                                break;
+                            }
+                        }
+                    }
+                    CompiledExec::Verify {
+                        assertion,
+                        sql,
+                        preview_sql,
+                    } => {
+                        match eval_verify_step(&conn, step, assertion, sql, preview_sql, ctx).await
+                        {
+                            Ok(r) => {
+                                if let Some(s) = &r.summary {
+                                    push_line(
+                                        &mut lines,
+                                        format!("verify \"{}\": {s}", step.step_name),
+                                    );
+                                }
+                                results.push(r);
+                            }
+                            Err(e) => {
+                                push_line(
+                                    &mut lines,
+                                    format!("verify \"{}\" failed: {}", step.step_name, e.message),
+                                );
+                                results.push(crate::history::PipelineStepResult {
+                                    step_id: step.step_id.clone(),
+                                    step_name: step.step_name.clone(),
+                                    is_verify: true,
+                                    status: crate::history::StepStatus::Failed,
+                                    rows_affected: None,
+                                    summary: Some(e.message.clone()),
+                                    preview_sql: Some(preview_sql.clone()),
+                                });
+                                run_err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if in_txn {
+                if dry_run || run_err.is_some() {
+                    let _ = conn.client.batch_execute("ROLLBACK").await;
+                    if dry_run && run_err.is_none() {
+                        push_line(
+                            &mut lines,
+                            "dry run complete: all changes rolled back cleanly".into(),
+                        );
+                    }
+                } else if let Err(e) = conn.client.batch_execute("COMMIT").await {
+                    run_err = Some(classify(&e, "commit workflow transform transaction"));
+                }
+            }
+
+            drop(conn);
+            let output_tail: Vec<String> = lines.into_iter().collect();
+            if let Some(mut err) = run_err {
+                let mut data = err.data.take().unwrap_or_else(|| serde_json::json!({}));
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("output_tail".into(), serde_json::json!(output_tail));
+                    obj.insert("pipeline_steps".into(), serde_json::json!(results));
+                    obj.insert(
+                        "any_mutated_outside_txn".into(),
+                        serde_json::json!(any_mutated_outside_txn),
+                    );
+                }
+                return Err(err.with_data(data));
+            }
+            Ok(PipelineRunDone {
+                results,
+                output_tail,
+                any_mutated_outside_txn,
+            })
+        })
+    }
+
+    fn run_verify_steps<'a>(
+        &'a self,
+        plan: &'a RunPlan,
+        db: &'a str,
+        steps: &'a [CompiledPipelineStep],
+        ctx: &'a OpCtx,
+    ) -> BoxFuture<'a, AppResult<PipelineRunDone>> {
+        Box::pin(async move {
+            let conn = self
+                .deps
+                .manager
+                .open(&plan.target.id, db, Purpose::Workflow)
+                .await?;
+            let mut lines: VecDeque<String> = VecDeque::new();
+            let mut results = Vec::with_capacity(steps.len());
+            let mut run_err: Option<AppError> = None;
+
+            for step in steps {
+                if ctx.cancel.is_cancelled() {
+                    run_err = Some(AppError::new(ErrorKind::Cancelled, "the run was cancelled"));
+                    break;
+                }
+                let CompiledExec::Verify {
+                    assertion,
+                    sql,
+                    preview_sql,
+                } = &step.exec
+                else {
+                    continue;
+                };
+                match eval_verify_step(&conn, step, assertion, sql, preview_sql, ctx).await {
+                    Ok(r) => {
+                        let line = format!(
+                            "verify \"{}\": {}",
+                            step.step_name,
+                            r.summary.as_deref().unwrap_or("ok")
+                        );
+                        ctx.output(line.clone());
+                        lines.push_back(line);
+                        results.push(r);
+                    }
+                    Err(e) => {
+                        let line = format!("verify \"{}\" failed: {}", step.step_name, e.message);
+                        ctx.output(line.clone());
+                        lines.push_back(line);
+                        results.push(crate::history::PipelineStepResult {
+                            step_id: step.step_id.clone(),
+                            step_name: step.step_name.clone(),
+                            is_verify: true,
+                            status: crate::history::StepStatus::Failed,
+                            rows_affected: None,
+                            summary: Some(e.message.clone()),
+                            preview_sql: Some(preview_sql.clone()),
+                        });
+                        run_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            drop(conn);
+            let output_tail: Vec<String> = lines.into_iter().collect();
+            if let Some(mut err) = run_err {
+                let mut data = err.data.take().unwrap_or_else(|| serde_json::json!({}));
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("output_tail".into(), serde_json::json!(output_tail));
+                    obj.insert("pipeline_steps".into(), serde_json::json!(results));
+                }
+                return Err(err.with_data(data));
+            }
+            Ok(PipelineRunDone {
+                results,
+                output_tail,
+                any_mutated_outside_txn: false,
+            })
+        })
+    }
+}
+
+async fn eval_verify_step(
+    conn: &PgConn,
+    step: &CompiledPipelineStep,
+    assertion: &crate::pipeline::VerifyAssertion,
+    sql: &str,
+    preview_sql: &str,
+    ctx: &OpCtx,
+) -> AppResult<crate::history::PipelineStepResult> {
+    use crate::pipeline::{CustomVerifyExpect, VerifyAssertion};
+
+    let fut = conn.client.simple_query(sql);
+    let msgs = tokio::select! {
+        r = fut => r.map_err(|e| {
+            let mut err = classify(&e, &format!("run verify \"{}\"", step.step_name));
+            err.message = format!("verification \"{}\" failed: {}", step.step_name, err.message);
+            err
+        })?,
+        _ = ctx.cancel.cancelled() => {
+            let _ = conn.cancel_token().cancel_query(tokio_postgres::NoTls).await;
+            return Err(AppError::new(
+                ErrorKind::Cancelled,
+                format!("verify \"{}\" was cancelled", step.step_name),
+            ));
+        }
+    };
+
+    let rows: Vec<tokio_postgres::SimpleQueryRow> = msgs
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+
+    let summary = match assertion {
+        VerifyAssertion::RowCount { op, expected, .. } => {
+            let actual: i64 = rows
+                .first()
+                .and_then(|r| r.get(0))
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or_else(|| {
+                    AppError::new(
+                        ErrorKind::Sql,
+                        format!(
+                            "verification \"{}\" did not return a row count",
+                            step.step_name
+                        ),
+                    )
+                })?;
+            if !op.eval(actual, *expected) {
+                return Err(AppError::new(
+                    ErrorKind::Sql,
+                    format!(
+                        "verification \"{}\" failed: expected row count {} {}, got {actual}",
+                        step.step_name,
+                        op.symbol(),
+                        expected
+                    ),
+                ));
+            }
+            format!("row count {actual} {} {expected} (passed)", op.symbol())
+        }
+        VerifyAssertion::ZeroRows { .. } => {
+            let actual: i64 = rows
+                .first()
+                .and_then(|r| r.get(0))
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            if actual != 0 {
+                return Err(AppError::new(
+                    ErrorKind::Sql,
+                    format!(
+                        "verification \"{}\" failed: expected 0 matching rows, found {actual}",
+                        step.step_name
+                    ),
+                ));
+            }
+            "0 matching rows (passed)".to_string()
+        }
+        VerifyAssertion::CustomSql { expect, .. } => match expect {
+            CustomVerifyExpect::Succeeds => "query succeeded (passed)".to_string(),
+            CustomVerifyExpect::ZeroRows => {
+                if !rows.is_empty() {
+                    return Err(AppError::new(
+                        ErrorKind::Sql,
+                        format!(
+                            "verification \"{}\" failed: expected 0 rows, got {}",
+                            step.step_name,
+                            rows.len()
+                        ),
+                    ));
+                }
+                "0 rows returned (passed)".to_string()
+            }
+            CustomVerifyExpect::TruthyScalar => {
+                let val = rows.first().and_then(|r| r.get(0)).unwrap_or("");
+                let truthy =
+                    val.eq_ignore_ascii_case("t") || val.eq_ignore_ascii_case("true") || val == "1";
+                if rows.len() != 1 || !truthy {
+                    return Err(AppError::new(
+                        ErrorKind::Sql,
+                        format!(
+                            "verification \"{}\" failed: expected truthy scalar, got \"{val}\" ({} row(s))",
+                            step.step_name,
+                            rows.len()
+                        ),
+                    ));
+                }
+                "assertion returned true (passed)".to_string()
+            }
+        },
+    };
+
+    Ok(crate::history::PipelineStepResult {
+        step_id: step.step_id.clone(),
+        step_name: step.step_name.clone(),
+        is_verify: true,
+        status: crate::history::StepStatus::Succeeded,
+        rows_affected: None,
+        summary: Some(summary),
+        preview_sql: Some(preview_sql.to_string()),
+    })
 }
 
 /// Maintenance statements over one dedicated connection.

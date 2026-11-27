@@ -27,18 +27,20 @@ pub mod toc;
 
 pub use discover::{discover, DiscoveredTool, DiscoveryOptions, PgVersion, ToolKind, ToolRegistry};
 pub use endpoint::{table_pattern, ToolEndpoint, ToolPassword};
-pub use gates::{require_pg_dump, require_pg_restore, target_version_warning, GateWarning};
+pub use gates::{
+    require_pg_dump, require_pg_restore, require_psql, target_version_warning, GateWarning,
+};
 pub use ops::{
-    backup, dump_schema_ddl, restore, BackupOptions, BackupOutcome, DdlOptions, DumpFormat,
-    ErrorPolicy, RestoreOptions, RestoreOutcome,
+    backup, dump_schema_ddl, restore, restore_plain_sql, BackupOptions, BackupOutcome, DdlOptions,
+    DumpFormat, ErrorPolicy, RestoreOptions, RestoreOutcome,
 };
 pub use pgpass::{sweep_stale_pgpass, PgPassDir, PgPassFile};
 pub use progress::{ProgressEvent, ProgressPhase};
 pub use retention::{apply_retention, plan_retention, RetentionPlan, RetentionPolicy};
 pub use runner::{CancelHandle, FailureCause, RunContext, ToolRun};
 pub use toc::{
-    inspect_archive, parse_archive_header, parse_toc, read_archive_header, ArchiveCheck,
-    ArchiveHeader, ArchiveInspection, Toc, TocEntry,
+    detect_archive_kind, inspect_archive, parse_archive_header, parse_toc, read_archive_header,
+    ArchiveCheck, ArchiveHeader, ArchiveInspection, ArchiveKind, Toc, TocEntry,
 };
 
 pub use pgwhy_errors::{AppError, AppResult, ErrorClass, ErrorKind};

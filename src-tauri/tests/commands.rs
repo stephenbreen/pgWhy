@@ -922,3 +922,81 @@ fn path_traversal_and_read_only_grants_and_bad_ids_are_refused() {
         "config"
     );
 }
+
+#[test]
+fn workflows_v2_commands_templates_preview_convert_export_import_and_save() {
+    let app = app();
+    save_offline(&app, "staging_conn", "staging");
+
+    // 1. Starter templates are returned and include the primary restore+seed use case.
+    let templates = invoke(&app, "workflow_templates", json!({})).unwrap();
+    let arr = templates.as_array().unwrap();
+    assert!(arr.len() >= 3);
+    assert_eq!(arr[0]["id"], "restore_replace_users");
+
+    // 2. Preview SQL compiles all visual steps and masks secret params.
+    let mut wf = arr[0]["workflow"].clone();
+    wf["target"] = json!({ "connection": "staging_conn", "database": "app" });
+    let preview = invoke(&app, "workflow_preview_sql", json!({ "workflow": wf })).unwrap();
+    let steps = preview.as_array().unwrap();
+    assert_eq!(steps.len(), 3);
+    assert!(steps[0]["sql"]
+        .as_str()
+        .unwrap()
+        .contains("DELETE FROM \"public\".\"users\""));
+    assert!(steps[1]["sql"].as_str().unwrap().contains("'••••••••'"));
+
+    // 3. Convert to SQL turns visual InsertRows into inline SQL while preserving {{test_password}}.
+    let converted = invoke(
+        &app,
+        "workflow_convert_step_to_sql",
+        json!({ "workflow": wf, "stepId": "step_seed_users" }),
+    )
+    .unwrap();
+    assert_eq!(converted["kind"], "sql");
+    assert_eq!(converted["source"], "inline");
+    assert!(converted["sql"]
+        .as_str()
+        .unwrap()
+        .contains("{{test_password}}"));
+
+    // 4. Save an in_place_target workflow targeting Staging (no source connection required!).
+    let mut in_place = arr[2]["workflow"].clone();
+    in_place["id"] = json!("wf_v2_in_place");
+    in_place["target"] = json!({ "connection": "staging_conn", "database": "app" });
+    let saved = invoke(&app, "workflow_save", json!({ "workflow": in_place })).unwrap();
+    assert_eq!(saved["schema_version"], 2);
+    assert_eq!(saved["id"], "wf_v2_in_place");
+
+    // 5. Export TOML and import TOML round-trip cleanly (assigning a fresh ID on collision).
+    let toml_text = invoke(
+        &app,
+        "workflow_export_toml",
+        json!({ "id": "wf_v2_in_place" }),
+    )
+    .unwrap();
+    let imported = invoke(
+        &app,
+        "workflow_import_toml",
+        json!({ "tomlText": toml_text.as_str().unwrap() }),
+    )
+    .unwrap();
+    assert_ne!(
+        imported["id"], "wf_v2_in_place",
+        "colliding import ID must get a fresh id"
+    );
+    assert_eq!(imported["schema_version"], 2);
+
+    // 6. Archive tables endpoint enforces PathGrants security boundary.
+    let outside = app._dirs.path().join("ungranted.dump");
+    std::fs::write(&outside, b"PGDMP").unwrap();
+    assert_eq!(
+        invoke(
+            &app,
+            "workflow_archive_tables",
+            json!({ "path": outside.display().to_string() }),
+        )
+        .unwrap_err()["kind"],
+        "refused"
+    );
+}

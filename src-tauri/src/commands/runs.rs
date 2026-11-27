@@ -34,10 +34,24 @@ fn caller_warnings(state: &AppState, target: &ConnectionId, database: &str) -> V
 pub async fn workflow_preflight(
     state: State<'_, AppState>,
     workflow_id: WorkflowId,
+    options: Option<pgwhy_workflow::PreflightOptions>,
 ) -> AppResult<PreflightReport> {
     let wf = state.workflow_store().get(&workflow_id)?;
+    let mut opts = options.unwrap_or_default();
+    if let Some(p) = &opts.archive_path {
+        opts.archive_path = Some(state.check_path(p, false)?);
+    }
+    if let pgwhy_workflow::WorkflowSource::FromBackupFile {
+        archive: pgwhy_workflow::BackupSource::FixedPath { path },
+    } = wf.effective_source()
+    {
+        state.check_path(&path, false)?;
+    }
     let warnings = caller_warnings(&state, &wf.target.connection, &wf.target.database);
-    Ok(state.engine().preflight(&wf, warnings).await)
+    Ok(state
+        .engine()
+        .preflight_with_options(&wf, &opts, warnings)
+        .await)
 }
 
 #[tauri::command]
@@ -45,10 +59,18 @@ pub async fn workflow_retry_preflight(
     state: State<'_, AppState>,
     run_id: RunId,
     from: StepId,
+    options: Option<pgwhy_workflow::PreflightOptions>,
 ) -> AppResult<PreflightReport> {
     let run = state.engine().get_run(&run_id)?;
+    let mut opts = options.unwrap_or_default();
+    if let Some(p) = &opts.archive_path {
+        opts.archive_path = Some(state.check_path(p, false)?);
+    }
     let warnings = caller_warnings(&state, &run.target.connection_id, &run.target.database);
-    Ok(state.engine().retry(&run_id, from, warnings).await)
+    Ok(state
+        .engine()
+        .retry_with_options(&run_id, from, &opts, warnings)
+        .await)
 }
 
 #[tauri::command]
@@ -90,6 +112,7 @@ pub fn workflow_provide_secret(
 
 /// Start a confirmed run. Events go to every window as `workflow-event`; a successful swap
 /// also invalidates the target's catalog so the tree and completion re-read it.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn workflow_start<R: Runtime>(
     app: AppHandle<R>,
@@ -97,6 +120,11 @@ pub async fn workflow_start<R: Runtime>(
     ticket: String,
     fingerprint: String,
     remember: bool,
+    typed_name: Option<String>,
+    params: Option<std::collections::HashMap<String, String>>,
+    secret_params: Option<std::collections::HashMap<String, String>>,
+    pause_before_swap: Option<bool>,
+    dry_run: Option<bool>,
 ) -> AppResult<RunId> {
     let emit_app = app.clone();
     let introspector = state.introspector.clone();
@@ -105,7 +133,8 @@ pub async fn workflow_start<R: Runtime>(
             if matches!(
                 status,
                 RunStatus::Succeeded | RunStatus::SucceededCleanupRequired
-            ) {
+            ) && !record.dry_run
+            {
                 introspector.invalidate_db(&record.target.connection_id, &record.target.database);
             }
         }
@@ -118,6 +147,11 @@ pub async fn workflow_start<R: Runtime>(
             StartRequest {
                 fingerprint,
                 remember,
+                typed_name,
+                params: params.unwrap_or_default(),
+                secret_params: secret_params.unwrap_or_default(),
+                pause_before_swap,
+                dry_run: dry_run.unwrap_or(false),
             },
             sink,
         )

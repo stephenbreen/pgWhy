@@ -108,14 +108,46 @@ pub enum RunEvent {
 /// Where a run's events go (e.g. a Tauri `Channel`).
 pub type EventSink = Arc<dyn Fn(RunEvent) + Send + Sync>;
 
-/// The user's answer to the confirmation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The user's answer to the confirmation, plus optional Workflows v2 runtime inputs.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartRequest {
     /// `PreflightReport.confirmation.fingerprint` — proves the user confirmed this plan.
     pub fingerprint: String,
     /// Remember this confirmation (honoured only for Local targets after a first success).
     #[serde(default)]
     pub remember: bool,
+    /// Exact target database name — required by the backend on Staging and Production targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_name: Option<String>,
+    /// Non-secret runtime parameter values (`{{param_name}}`).
+    #[serde(default)]
+    pub params: HashMap<String, String>,
+    /// Secret runtime parameter values — bound in memory only, never persisted or logged.
+    #[serde(default)]
+    pub secret_params: HashMap<String, String>,
+    /// Override `pause_before_swap` for this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_before_swap: Option<bool>,
+    /// Run an `in_place_target` workflow as a rolled-back Dry Run.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl std::fmt::Debug for StartRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartRequest")
+            .field("fingerprint", &self.fingerprint)
+            .field("remember", &self.remember)
+            .field("typed_name", &self.typed_name)
+            .field("params", &self.params)
+            .field(
+                "secret_params",
+                &format!("<{} secret(s) redacted>", self.secret_params.len()),
+            )
+            .field("pause_before_swap", &self.pause_before_swap)
+            .field("dry_run", &self.dry_run)
+            .finish()
+    }
 }
 
 struct ActiveRun {
@@ -273,6 +305,22 @@ impl Engine {
         workflow: &RefreshWorkflow,
         caller_warnings: Vec<String>,
     ) -> PreflightReport {
+        self.preflight_with_options(
+            workflow,
+            &preflight::PreflightOptions::default(),
+            caller_warnings,
+        )
+        .await
+    }
+
+    /// Workflows v2 preflight accepting runtime parameter values, archive path, pause-before-swap,
+    /// and dry-run options.
+    pub async fn preflight_with_options(
+        &self,
+        workflow: &RefreshWorkflow,
+        opts: &preflight::PreflightOptions,
+        caller_warnings: Vec<String>,
+    ) -> PreflightReport {
         self.prune_tickets();
         // A new preflight of the same workflow replaces its pending ticket (and lock).
         lock(&self.inner.tickets).retain(|_, t| t.plan.workflow.id != workflow.id);
@@ -281,19 +329,33 @@ impl Engine {
             Err(e) => return PreflightReport::refused_early(workflow, e),
         };
         let (mut report, parked) =
-            preflight::run(&deps, &self.inner, workflow, caller_warnings, None).await;
+            preflight::run(&deps, &self.inner, workflow, caller_warnings, None, opts).await;
         self.park(&mut report, parked);
         report
     }
 
-    /// Prepare a retry of a failed/cancelled/interrupted run from `from` (retry matrix): the
-    /// prerequisites (backup + verdict, staging state, live reachability) are validated and the
-    /// full gate sequence re-runs (fresh credentials, environment-tag re-check, current script content).
-    /// Confirm with [`start`](Self::start) like any run.
+    /// Prepare a retry of a failed/cancelled/paused/interrupted run from `from` (retry matrix).
     pub async fn retry(
         &self,
         run_id: &RunId,
         from: StepId,
+        caller_warnings: Vec<String>,
+    ) -> PreflightReport {
+        self.retry_with_options(
+            run_id,
+            from,
+            &preflight::PreflightOptions::default(),
+            caller_warnings,
+        )
+        .await
+    }
+
+    /// Workflows v2 retry preflight with optional runtime options.
+    pub async fn retry_with_options(
+        &self,
+        run_id: &RunId,
+        from: StepId,
+        opts: &preflight::PreflightOptions,
         caller_warnings: Vec<String>,
     ) -> PreflightReport {
         self.prune_tickets();
@@ -310,7 +372,11 @@ impl Engine {
             Err(e) => return PreflightReport::refused_bare(e),
         };
         lock(&self.inner.tickets).retain(|_, t| t.plan.workflow.id != workflow.id);
-        let inv = scan_inventory(&*self.inner.ops, &rec, None, true).await;
+        let probe_src = matches!(
+            rec.source_mode,
+            None | Some(crate::pipeline::WorkflowSource::FromRemoteDb { .. })
+        );
+        let inv = scan_inventory(&*self.inner.ops, &rec, None, probe_src).await;
         let offer = match retry::plan_retry(&rec, from, Some(&inv)) {
             Ok(o) => o,
             Err(e) => {
@@ -335,8 +401,15 @@ impl Engine {
             offer,
             inventory: inv,
         };
-        let (mut report, parked) =
-            preflight::run(&deps, &self.inner, &workflow, caller_warnings, Some(ctx)).await;
+        let (mut report, parked) = preflight::run(
+            &deps,
+            &self.inner,
+            &workflow,
+            caller_warnings,
+            Some(ctx),
+            opts,
+        )
+        .await;
         self.park(&mut report, parked);
         report
     }
@@ -357,12 +430,17 @@ impl Engine {
             return Err(AppError::internal("retry needs the workflow store"));
         };
         let wf = store.get(&rec.workflow_id)?;
-        if wf.source.connection != rec.source.connection_id
-            || wf.source.database != rec.source.database
-            || wf.target.connection != rec.target.connection_id
-            || wf.target.database != rec.target.database
-            || wf.options.strategy != rec.strategy
-        {
+        let same_target = wf.target.connection == rec.target.connection_id
+            && wf.target.database == rec.target.database
+            && wf.options.strategy == rec.strategy;
+        let same_source = match wf.effective_source() {
+            crate::pipeline::WorkflowSource::FromRemoteDb { source } => {
+                source.connection == rec.source.connection_id
+                    && source.database == rec.source.database
+            }
+            _ => true,
+        };
+        if !same_target || !same_source {
             return Err(AppError::new(
                 ErrorKind::Refused,
                 "the workflow's source, target or strategy changed since this run; start a new run instead",
@@ -376,15 +454,16 @@ impl Engine {
         lock(&self.inner.tickets).remove(ticket);
     }
 
-    /// Start a confirmed run. Errors when the ticket expired or the fingerprint doesn't match
-    /// the preflighted plan.
+    /// Start a confirmed run. Errors when the ticket expired, the fingerprint doesn't match
+    /// the preflighted plan, a Staging/Production target lacks exact typed-name confirmation,
+    /// or required runtime parameters/secrets are missing.
     pub async fn start(
         &self,
         ticket: &str,
         request: StartRequest,
         sink: EventSink,
     ) -> AppResult<RunId> {
-        let t = lock(&self.inner.tickets).remove(ticket).ok_or_else(|| {
+        let mut t = lock(&self.inner.tickets).remove(ticket).ok_or_else(|| {
             AppError::new(ErrorKind::Refused, "this confirmation has expired")
                 .with_hint("run the workflow again")
         })?;
@@ -399,6 +478,107 @@ impl Engine {
                 ErrorKind::Refused,
                 "the confirmation does not match the checked plan; run the workflow again",
             ));
+        }
+        // Backend-enforced exact typed database-name confirmation on Staging and Production.
+        if matches!(
+            t.plan.target.env_tag,
+            pgwhy_core::config::EnvTag::Staging | pgwhy_core::config::EnvTag::Production
+        ) {
+            let ctx = crate::destructive::DestructiveContext::new(
+                t.plan.target.server_key(),
+                t.plan.target.name.clone(),
+                t.plan.target_db(),
+                t.plan.target.env_tag,
+                format!("workflow \"{}\"", t.plan.workflow.name),
+            );
+            crate::destructive::require_typed_name(
+                &ctx,
+                request.typed_name.as_deref().unwrap_or(""),
+            )?;
+        }
+        if let Some(pause) = request.pause_before_swap {
+            if !t.plan.workflow.is_in_place()
+                && t.plan.workflow.options.strategy == ReplaceStrategy::StagingSwap
+            {
+                t.plan.pause_before_swap = pause;
+            }
+        }
+        if request.dry_run {
+            if !t.plan.workflow.is_in_place() {
+                return Err(AppError::new(
+                    ErrorKind::Refused,
+                    "dry run is only supported for in-place workflows",
+                ));
+            }
+            t.plan.dry_run = true;
+            t.plan.pre_run_backup = false;
+        }
+        // Compile v2 pipeline steps with runtime parameters + in-memory-only secrets.
+        if !t.plan.workflow.steps.is_empty() {
+            let scripts_src = self
+                .inner
+                .real
+                .as_ref()
+                .map(|r| &*r.scripts as &dyn crate::real::ScriptSource);
+            let secrets_map: HashMap<String, pgwhy_core::secret::Secret> = request
+                .secret_params
+                .into_iter()
+                .map(|(k, v)| (k, pgwhy_core::secret::Secret::new(v)))
+                .collect();
+            let exec_mode = crate::compiler::CompileMode::Execute {
+                values: &request.params,
+                secrets: &secrets_map,
+            };
+            let preview_mode = crate::compiler::CompileMode::Preview {
+                values: &request.params,
+            };
+            let mut compiled_pipeline = Vec::new();
+            for step in &t.plan.workflow.steps {
+                if !step.enabled {
+                    continue;
+                }
+                let exec_step = crate::compiler::compile_step(
+                    step,
+                    &t.plan.workflow.parameters,
+                    &exec_mode,
+                    scripts_src,
+                )?;
+                if !exec_step.problems.is_empty() {
+                    return Err(AppError::new(
+                        ErrorKind::Refused,
+                        format!(
+                            "step \"{}\" cannot run: {}",
+                            step.name,
+                            exec_step.problems.join("; ")
+                        ),
+                    ));
+                }
+                let preview_step = crate::compiler::compile_step(
+                    step,
+                    &t.plan.workflow.parameters,
+                    &preview_mode,
+                    scripts_src,
+                )?;
+                let exec = match &step.kind {
+                    crate::pipeline::StepKind::Verify { assertion } => CompiledExec::Verify {
+                        assertion: assertion.clone(),
+                        sql: exec_step.sql,
+                        preview_sql: preview_step.sql,
+                    },
+                    _ => CompiledExec::Sql {
+                        sql: exec_step.sql,
+                        preview_sql: preview_step.sql,
+                    },
+                };
+                compiled_pipeline.push(CompiledPipelineStep {
+                    step_id: step.id.clone(),
+                    step_name: step.name.clone(),
+                    no_transaction: step.no_transaction,
+                    exec,
+                });
+            }
+            // `secrets_map` drops here, zeroing its temporary copies via `Secret::drop`.
+            t.plan.pipeline = compiled_pipeline;
         }
         if request.remember && t.can_remember {
             if let Some(store) = &self.inner.config.workflows {
@@ -719,6 +899,11 @@ impl Engine {
                     .await
                     .map(|_| {
                         rec.work_db_state = WorkDbState::Dropped;
+                        if rec.status == RunStatus::PausedForInspection {
+                            rec.status = RunStatus::Cancelled;
+                            rec.warnings
+                                .push(format!("staging database {db} dropped after inspection"));
+                        }
                     })
             }
             ActionKind::DropOld => {
@@ -735,7 +920,18 @@ impl Engine {
                 crate::swap::rollback(&*ops, &*maint, &mut rec, timeout).await
             }
             ActionKind::CompleteSwap => {
-                let r = crate::swap::complete(&*ops, &*maint, &mut rec, timeout).await;
+                let r = if rec.status == RunStatus::PausedForInspection {
+                    crate::swap::complete_from_paused(
+                        &*ops,
+                        &*maint,
+                        &self.inner.history,
+                        &mut rec,
+                        timeout,
+                    )
+                    .await
+                } else {
+                    crate::swap::complete(&*ops, &*maint, &mut rec, timeout).await
+                };
                 if r.is_ok() {
                     self.mark_workflow_succeeded(&rec);
                 }
@@ -899,7 +1095,11 @@ pub(crate) async fn scan_inventory(
             }
         },
     }
-    if probe_source {
+    let is_remote = matches!(
+        rec.source_mode,
+        None | Some(crate::pipeline::WorkflowSource::FromRemoteDb { .. })
+    );
+    if probe_source && is_remote {
         match ops
             .probe(&rec.source.connection_id, &rec.source.database)
             .await
@@ -916,6 +1116,7 @@ pub(crate) async fn scan_inventory(
 
 fn new_record(plan: &RunPlan) -> RunRecord {
     let strategy = plan.workflow.options.strategy;
+    let is_in_place = plan.workflow.is_in_place();
     let mut source = EndpointRecord::of(&plan.source, plan.source_db());
     source.server_version = plan.source_version.clone();
     let mut target = EndpointRecord::of(&plan.target, plan.target_db());
@@ -934,8 +1135,9 @@ fn new_record(plan: &RunPlan) -> RunRecord {
         create_mode: plan.create_mode,
         source,
         target,
-        staging_db: (strategy == ReplaceStrategy::StagingSwap).then(|| plan.staging_db.clone()),
-        old_db: (strategy == ReplaceStrategy::StagingSwap && !plan.create_mode)
+        staging_db: (!is_in_place && strategy == ReplaceStrategy::StagingSwap)
+            .then(|| plan.staging_db.clone()),
+        old_db: (!is_in_place && strategy == ReplaceStrategy::StagingSwap && !plan.create_mode)
             .then(|| plan.old_db.clone()),
         work_db_state: match resume {
             Some(r) if r.adopt_work_db => r.work_db_state,
@@ -943,13 +1145,13 @@ fn new_record(plan: &RunPlan) -> RunRecord {
         },
         staging_kept: false,
         tools: ToolsRecord {
-            pg_dump: plan.tools.as_ref().map(|t| ToolRecord {
-                path: t.pg_dump.path.clone(),
-                version: t.pg_dump.version.raw.clone(),
+            pg_dump: plan.resolved_pg_dump().map(|t| ToolRecord {
+                path: t.path.clone(),
+                version: t.version.raw.clone(),
             }),
-            pg_restore: plan.tools.as_ref().map(|t| ToolRecord {
-                path: t.pg_restore.path.clone(),
-                version: t.pg_restore.version.raw.clone(),
+            pg_restore: plan.resolved_pg_restore().map(|t| ToolRecord {
+                path: t.path.clone(),
+                version: t.version.raw.clone(),
             }),
         },
         options: plan.workflow.options.clone(),
@@ -958,7 +1160,7 @@ fn new_record(plan: &RunPlan) -> RunRecord {
             .into_iter()
             .map(|s| StepRecord::pending(s, strategy))
             .collect(),
-        backup: None,
+        backup: plan.external_archive.as_ref().map(|(b, _)| b.clone()),
         script: plan.script.clone(),
         locale: plan.locale.clone(),
         renames_completed: 0,
@@ -973,6 +1175,10 @@ fn new_record(plan: &RunPlan) -> RunRecord {
         warnings: plan.warnings.clone(),
         confirmation_fingerprint: plan.fingerprint.clone(),
         confirmation_remembered: plan.remembered,
+        source_mode: plan.workflow.source_mode.clone(),
+        pause_before_swap: plan.pause_before_swap,
+        dry_run: plan.dry_run,
+        pipeline_steps: Vec::new(),
     }
 }
 
@@ -1138,7 +1344,7 @@ impl Runner {
             .resume
             .as_ref()
             .map(|r| r.begins_at)
-            .unwrap_or(StepId::Dump);
+            .unwrap_or_else(|| steps.first().copied().unwrap_or(StepId::Dump));
         let begin_idx = steps.iter().position(|s| *s == begins_at).unwrap_or(0);
         self.emit(RunEvent::RunStarted {
             run_id: self.run_id(),
@@ -1154,6 +1360,18 @@ impl Runner {
                 self.mark_step(step, StepStatus::Skipped, None);
                 self.save_quiet();
                 continue;
+            }
+            if step == StepId::Swap
+                && self.plan.pause_before_swap
+                && self.rec.strategy == ReplaceStrategy::StagingSwap
+            {
+                self.mark_step(
+                    StepId::Swap,
+                    StepStatus::Pending,
+                    Some("paused before swap — inspect staging database".into()),
+                );
+                self.finish(RunStatus::PausedForInspection).await;
+                return;
             }
             if let Err(e) = self.check_cancel() {
                 self.begin_step(step);
@@ -1179,7 +1397,7 @@ impl Runner {
 
     fn skip(&self, step: StepId) -> bool {
         match step {
-            StepId::PostRestore => self.plan.script.is_none(),
+            StepId::PostRestore => self.plan.script.is_none() && self.plan.pipeline.is_empty(),
             StepId::DropTarget => self.plan.create_mode,
             _ => false,
         }
@@ -1222,8 +1440,14 @@ impl Runner {
     // ------------------------------------------------------------------ steps
 
     async fn dump(&mut self) -> AppResult<()> {
+        let is_in_place = self.plan.workflow.is_in_place();
         let ts = staging::compact_timestamp(SystemTime::now());
-        let stem = format!("{}_{}", sanitize(self.plan.source_db()), ts);
+        let db_name = if is_in_place {
+            self.plan.target_db()
+        } else {
+            self.plan.source_db()
+        };
+        let stem = format!("{}_{}", sanitize(db_name), ts);
         let out = unique_dump_path(&self.plan.backup_dir, &stem);
         let log_dir = self.inner.history.log_dir(&self.rec.run_id);
         std::fs::create_dir_all(&log_dir).map_err(|e| {
@@ -1233,7 +1457,11 @@ impl Runner {
         let log = log_dir.join("dump.log");
         let ctx = self.step_ctx(StepId::Dump);
         let ops = self.inner.ops.clone();
-        let res = ops.dump(&self.plan, &out, &log, &ctx).await;
+        let res = if is_in_place {
+            ops.dump_target(&self.plan, &out, &log, &ctx).await
+        } else {
+            ops.dump(&self.plan, &out, &log, &ctx).await
+        };
         let done = match res {
             Ok(d) => d,
             Err(e) => {
@@ -1246,6 +1474,19 @@ impl Runner {
             s.output_tail = done.tool.output_tail.clone();
             s.log_path = done.tool.log_path.clone();
             s.objects_done = Some(done.tool.objects_done);
+        }
+        if is_in_place && self.plan.resolved_pg_restore().is_none() {
+            self.rec.backup = Some(BackupRecord {
+                path: done.path.clone(),
+                size_bytes: done.size_bytes,
+                dumped_by: Some(done.dumped_by.clone()),
+                reusable: true,
+                reason: None,
+                cause: None,
+                toc_items: None,
+                from_run: None,
+            });
+            return Ok(());
         }
         let verdict = ops.inspect_backup(&self.plan, &done.path, &ctx).await?;
         self.rec.backup = Some(BackupRecord {
@@ -1298,6 +1539,11 @@ impl Runner {
                 self.rec.failed_items = items;
             }
         }
+        if let Some(steps) = data.get("pipeline_steps") {
+            if let Ok(parsed) = serde_json::from_value::<Vec<PipelineStepResult>>(steps.clone()) {
+                self.rec.pipeline_steps.extend(parsed);
+            }
+        }
     }
 
     async fn create_database(&mut self) -> AppResult<()> {
@@ -1345,6 +1591,11 @@ impl Runner {
     }
 
     async fn restore(&mut self) -> AppResult<()> {
+        if self.rec.backup.is_none() {
+            if let Some((b, _)) = &self.plan.external_archive {
+                self.rec.backup = Some(b.clone());
+            }
+        }
         let backup = self
             .rec
             .backup
@@ -1363,10 +1614,18 @@ impl Runner {
         self.save_quiet();
         let ctx = self.step_ctx(StepId::Restore);
         let ops = self.inner.ops.clone();
-        match ops
-            .restore(&self.plan, &backup.path, &db, backup.toc_items, &log, &ctx)
-            .await
-        {
+        let is_plain_sql = matches!(
+            self.plan.external_archive,
+            Some((_, pgwhy_pgtools::ArchiveKind::PlainSql))
+        );
+        let res = if is_plain_sql {
+            ops.restore_plain_sql(&self.plan, &backup.path, &db, &log, &ctx)
+                .await
+        } else {
+            ops.restore(&self.plan, &backup.path, &db, backup.toc_items, &log, &ctx)
+                .await
+        };
+        match res {
             Ok(done) => {
                 if let Some(s) = self.rec.step_mut(StepId::Restore) {
                     s.exit_code = done.exit_code;
@@ -1391,55 +1650,163 @@ impl Runner {
         }
     }
 
+    /// Split `self.plan.pipeline` into `(transform_slice, trailing_verify_slice)`.
+    fn split_pipeline(&self) -> (&[CompiledPipelineStep], &[CompiledPipelineStep]) {
+        let p = self.plan.pipeline.as_slice();
+        let trailing_start = p
+            .iter()
+            .rposition(|s| !matches!(s.exec, CompiledExec::Verify { .. }))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        p.split_at(trailing_start)
+    }
+
     async fn post_restore(&mut self) -> AppResult<()> {
-        let Some(script) = self.plan.script.clone() else {
-            return Ok(());
-        };
-        self.rec.script = Some(script.clone());
-        let db = self.plan.work_db().to_string();
-        let ctx = self.step_ctx(StepId::PostRestore);
-        let ops = self.inner.ops.clone();
-        match ops.run_script(&self.plan, &db, &script, &ctx).await {
-            Ok(done) => {
-                if let Some(s) = self.rec.step_mut(StepId::PostRestore) {
-                    s.objects_done = Some(done.statements as u64);
-                    s.output_tail = done.output_tail;
-                }
-                self.rec.work_db_state = WorkDbState::ScriptApplied;
-                Ok(())
+        if !self.plan.pipeline.is_empty() {
+            let is_in_place = self.plan.workflow.is_in_place();
+            // For in-place workflows (including Dry Run), run transforms AND trailing verify steps
+            // inside the same transaction so a failing assertion rolls back in-place changes cleanly
+            // and Dry Run evaluates assertions against the uncommitted state before ROLLBACK.
+            let steps: Vec<CompiledPipelineStep> = if is_in_place {
+                self.plan.pipeline.clone()
+            } else {
+                self.split_pipeline().0.to_vec()
+            };
+            if steps.is_empty() {
+                return Ok(());
             }
-            Err(e) => {
-                self.record_tool_error(StepId::PostRestore, &e);
-                self.rec.work_db_state = match script.mode {
-                    // Rolled back: the restore underneath is still clean.
-                    ScriptMode::Transaction => WorkDbState::Restored,
-                    ScriptMode::NoTransaction => WorkDbState::Mutated,
-                };
-                Err(e)
+            let db = self.plan.work_db().to_string();
+            let ctx = self.step_ctx(StepId::PostRestore);
+            let ops = self.inner.ops.clone();
+            match ops
+                .run_pipeline(&self.plan, &db, &steps, self.plan.dry_run, &ctx)
+                .await
+            {
+                Ok(done) => {
+                    if let Some(s) = self.rec.step_mut(StepId::PostRestore) {
+                        s.objects_done = Some(done.results.len() as u64);
+                        s.output_tail = done.output_tail;
+                        if self.plan.dry_run {
+                            s.note = Some("dry run: rolled back cleanly".into());
+                        }
+                    }
+                    self.rec.pipeline_steps = done.results;
+                    if !is_in_place {
+                        self.rec.work_db_state = WorkDbState::ScriptApplied;
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    let mutated = e
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("any_mutated_outside_txn"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    self.record_tool_error(StepId::PostRestore, &e);
+                    if !is_in_place {
+                        self.rec.work_db_state = if mutated {
+                            WorkDbState::Mutated
+                        } else {
+                            WorkDbState::Restored
+                        };
+                    }
+                    Err(e)
+                }
+            }
+        } else {
+            let Some(script) = self.plan.script.clone() else {
+                return Ok(());
+            };
+            self.rec.script = Some(script.clone());
+            let db = self.plan.work_db().to_string();
+            let ctx = self.step_ctx(StepId::PostRestore);
+            let ops = self.inner.ops.clone();
+            match ops.run_script(&self.plan, &db, &script, &ctx).await {
+                Ok(done) => {
+                    if let Some(s) = self.rec.step_mut(StepId::PostRestore) {
+                        s.objects_done = Some(done.statements as u64);
+                        s.output_tail = done.output_tail;
+                    }
+                    self.rec.work_db_state = WorkDbState::ScriptApplied;
+                    Ok(())
+                }
+                Err(e) => {
+                    self.record_tool_error(StepId::PostRestore, &e);
+                    self.rec.work_db_state = match script.mode {
+                        // Rolled back: the restore underneath is still clean.
+                        ScriptMode::Transaction => WorkDbState::Restored,
+                        ScriptMode::NoTransaction => WorkDbState::Mutated,
+                    };
+                    Err(e)
+                }
             }
         }
     }
 
     async fn verify(&mut self) -> AppResult<()> {
+        let is_in_place = self.plan.workflow.is_in_place();
+        if is_in_place && !self.plan.pipeline.is_empty() {
+            let verify_count = self
+                .rec
+                .pipeline_steps
+                .iter()
+                .filter(|r| r.is_verify)
+                .count();
+            let note = if self.plan.dry_run {
+                format!("dry run: {verify_count} verification assertion(s) passed before rollback")
+            } else if verify_count > 0 {
+                format!("{verify_count} verification assertion(s) passed in transaction")
+            } else {
+                "in-place transforms committed".into()
+            };
+            if let Some(s) = self.rec.step_mut(StepId::Verify) {
+                s.note = Some(note);
+            }
+            return Ok(());
+        }
+
         let db = self.plan.work_db().to_string();
         let ctx = self.step_ctx(StepId::Verify);
         let ops = self.inner.ops.clone();
-        let note = ops.verify(&self.plan, &db, &ctx).await?;
-        ctx.output(note.clone());
-        if let Some(s) = self.rec.step_mut(StepId::Verify) {
-            s.note = Some(note);
-        }
-        self.rec.work_db_state = WorkDbState::Verified;
-        if self.rec.strategy == ReplaceStrategy::DropFirst {
-            // The restored target is now the user's database: drop pgWhy's marker.
-            let maint = self.maint().await?;
-            if let Err(e) = maint.set_comment(&db, None).await {
-                self.rec.warnings.push(format!(
-                    "could not clear pgWhy's marker comment on {db}: {}",
-                    e.message
-                ));
+        let (_, trailing_verifies) = self.split_pipeline();
+        if !trailing_verifies.is_empty() {
+            let verifies = trailing_verifies.to_vec();
+            match ops.run_verify_steps(&self.plan, &db, &verifies, &ctx).await {
+                Ok(done) => {
+                    let count = done.results.len();
+                    self.rec.pipeline_steps.extend(done.results);
+                    let note = format!("{count} verification assertion(s) passed");
+                    if let Some(s) = self.rec.step_mut(StepId::Verify) {
+                        s.note = Some(note);
+                        s.output_tail = done.output_tail;
+                    }
+                }
+                Err(e) => {
+                    self.record_tool_error(StepId::Verify, &e);
+                    return Err(e);
+                }
             }
-            self.rec.work_db_state = WorkDbState::SwappedIn;
+        } else {
+            let note = ops.verify(&self.plan, &db, &ctx).await?;
+            ctx.output(note.clone());
+            if let Some(s) = self.rec.step_mut(StepId::Verify) {
+                s.note = Some(note);
+            }
+        }
+        if !is_in_place {
+            self.rec.work_db_state = WorkDbState::Verified;
+            if self.rec.strategy == ReplaceStrategy::DropFirst {
+                // The restored target is now the user's database: drop pgWhy's marker.
+                let maint = self.maint().await?;
+                if let Err(e) = maint.set_comment(&db, None).await {
+                    self.rec.warnings.push(format!(
+                        "could not clear pgWhy's marker comment on {db}: {}",
+                        e.message
+                    ));
+                }
+                self.rec.work_db_state = WorkDbState::SwappedIn;
+            }
         }
         Ok(())
     }
@@ -1478,7 +1845,7 @@ impl Runner {
             ));
         }
         self.finish(status).await;
-        if status.is_success() {
+        if status.is_success() && !self.plan.dry_run {
             mark_workflow_succeeded(&self.inner, &self.rec);
         }
     }
@@ -1508,6 +1875,13 @@ impl Runner {
     }
 
     fn apply_retention(&mut self) {
+        // Never touch user-owned external backup files.
+        if matches!(
+            self.plan.workflow.effective_source(),
+            crate::pipeline::WorkflowSource::FromBackupFile { .. }
+        ) {
+            return;
+        }
         let records = self
             .inner
             .history
@@ -1515,7 +1889,7 @@ impl Runner {
             .unwrap_or_default();
         let mut protected = retry::protected_backups(&records);
         if let Some(b) = &self.rec.backup {
-            if self.rec.status.is_failure() {
+            if self.rec.status.is_failure() || self.rec.status == RunStatus::PausedForInspection {
                 protected.insert(b.path.clone());
             }
         }

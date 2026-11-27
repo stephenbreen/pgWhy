@@ -20,15 +20,17 @@ use std::time::{Duration, Instant};
 pub enum ToolKind {
     PgDump,
     PgRestore,
+    Psql,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 2] = [ToolKind::PgDump, ToolKind::PgRestore];
+    pub const ALL: [ToolKind; 3] = [ToolKind::PgDump, ToolKind::PgRestore, ToolKind::Psql];
 
     pub fn name(self) -> &'static str {
         match self {
             ToolKind::PgDump => "pg_dump",
             ToolKind::PgRestore => "pg_restore",
+            ToolKind::Psql => "psql",
         }
     }
 

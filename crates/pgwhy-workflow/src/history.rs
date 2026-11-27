@@ -159,6 +159,8 @@ pub enum RunStatus {
     Succeeded,
     /// Both renames done, but dropping `<target>_old` failed: success plus a cleanup action.
     SucceededCleanupRequired,
+    /// Paused after Verify so the user can inspect the staging database before swapping or dropping.
+    PausedForInspection,
     FailedAtStep,
     FailedAtSwap,
     Cancelled,
@@ -188,6 +190,22 @@ impl RunStatus {
                 | RunStatus::Interrupted
         )
     }
+}
+
+/// Execution summary of one v2 workflow step (never contains raw secret values).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineStepResult {
+    pub step_id: String,
+    pub step_name: String,
+    pub is_verify: bool,
+    pub status: StepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_affected: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Masked/redacted preview SQL (secrets replaced with `'••••••••'`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_sql: Option<String>,
 }
 
 /// A server endpoint as discrete fields (never a conninfo string).
@@ -495,6 +513,18 @@ pub struct RunRecord {
     pub confirmation_fingerprint: String,
     #[serde(default)]
     pub confirmation_remembered: bool,
+    /// Workflows v2 entry mode snapshot (None for legacy v1 records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mode: Option<crate::pipeline::WorkflowSource>,
+    /// True when this run paused after Verify for staging inspection.
+    #[serde(default)]
+    pub pause_before_swap: bool,
+    /// True when this was an in-place dry run (rolled back after verify).
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Per-step execution summaries for Workflows v2 pipelines (secrets always redacted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipeline_steps: Vec<PipelineStepResult>,
 }
 
 impl RunRecord {

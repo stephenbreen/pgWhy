@@ -128,6 +128,26 @@ pub struct MissingSecret {
     pub reason: String,
 }
 
+/// Runtime options supplied when preflighting a Workflows v2 run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreflightOptions {
+    /// Non-secret runtime parameter values supplied before preflight.
+    #[serde(default)]
+    pub params: std::collections::HashMap<String, String>,
+    /// Archive path chosen for `from_backup_file` (`PromptAtRun`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_path: Option<std::path::PathBuf>,
+    /// Override `workflow.options.pause_before_swap` for this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_before_swap: Option<bool>,
+    /// In-place dry run (execute transforms + verify inside a transaction, then ROLLBACK).
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Override `pre_run_backup` for `in_place_target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_run_backup: Option<bool>,
+}
+
 /// What the single confirmation shows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirmation {
@@ -147,6 +167,19 @@ pub struct Confirmation {
     pub remembered: bool,
     /// "Remember" may be offered (Local target, after a first successful run).
     pub can_remember: bool,
+    /// True on Staging/Production: caller must supply exact `target_db` in `StartRequest.typed_name`.
+    #[serde(default)]
+    pub requires_typed_name: bool,
+    /// True if the run will pause after Verify for staging inspection.
+    #[serde(default)]
+    pub pause_before_swap: bool,
+    /// True if this is an in-place dry run (rolled back).
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mode: Option<crate::pipeline::WorkflowSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<crate::pipeline::WorkflowParam>,
     /// Echo this back in [`crate::StartRequest`].
     pub fingerprint: String,
 }
@@ -471,7 +504,10 @@ pub(crate) async fn run(
     wf: &RefreshWorkflow,
     caller_warnings: Vec<String>,
     retry: Option<RetryContext>,
+    opts: &PreflightOptions,
 ) -> (PreflightReport, Parked) {
+    use crate::pipeline::{BackupSource, WorkflowSource};
+
     let mut report = PreflightReport {
         workflow_id: Some(wf.id.clone()),
         ticket: None,
@@ -485,16 +521,19 @@ pub(crate) async fn run(
         report.refused.get_or_insert(e);
         (report, None)
     };
-    let (source, target) = match (
-        deps.manager.entry(&wf.source.connection),
-        deps.manager.entry(&wf.target.connection),
-    ) {
-        (Ok(s), Ok(t)) => (s, t),
-        (Err(e), _) | (_, Err(e)) => {
+
+    let effective_source = wf.effective_source();
+    let is_remote = matches!(effective_source, WorkflowSource::FromRemoteDb { .. });
+    let is_backup_file = matches!(effective_source, WorkflowSource::FromBackupFile { .. });
+    let is_in_place = matches!(effective_source, WorkflowSource::InPlaceTarget { .. });
+
+    let target = match deps.manager.entry(&wf.target.connection) {
+        Ok(t) => t,
+        Err(e) => {
             let e = AppError::new(
                 ErrorKind::Config,
                 format!(
-                    "the workflow refers to a connection that no longer exists ({})",
+                    "the workflow refers to a target connection that no longer exists ({})",
                     e.message
                 ),
             );
@@ -504,13 +543,66 @@ pub(crate) async fn run(
             return refuse(report, e);
         }
     };
+    let source_opt = match &effective_source {
+        WorkflowSource::FromRemoteDb { source: src_ref } => match deps
+            .manager
+            .entry(&src_ref.connection)
+        {
+            Ok(s) => Some(s),
+            Err(e) => {
+                let e = AppError::new(
+                    ErrorKind::Config,
+                    format!(
+                        "the workflow refers to a connection that no longer exists ({})",
+                        e.message
+                    ),
+                );
+                report
+                    .checks
+                    .push(PreflightCheck::from_error("connections", "Connections", &e));
+                return refuse(report, e);
+            }
+        },
+        _ => None,
+    };
+    let source = source_opt.clone().unwrap_or_else(|| target.clone());
+
     let target_db = wf.target.database.clone();
     let strategy = wf.options.strategy;
+    let requires_typed_name = matches!(target.env_tag, EnvTag::Staging | EnvTag::Production);
+    let pause_before_swap = if is_in_place || strategy != ReplaceStrategy::StagingSwap {
+        false
+    } else {
+        opts.pause_before_swap
+            .unwrap_or(wf.options.pause_before_swap)
+    };
+    let dry_run = is_in_place && opts.dry_run;
+    let pre_run_backup = match &effective_source {
+        WorkflowSource::InPlaceTarget { pre_run_backup } => {
+            opts.pre_run_backup
+                .unwrap_or(*pre_run_backup || requires_typed_name)
+                && !dry_run
+        }
+        _ => false,
+    };
+
     let begins_at = retry
         .as_ref()
         .map(|r| r.offer.begins_at)
-        .unwrap_or(StepId::Dump);
-    let redump = begins_at == StepId::Dump;
+        .unwrap_or(if is_remote {
+            StepId::Dump
+        } else if is_backup_file {
+            if strategy == ReplaceStrategy::DropFirst {
+                StepId::DropTarget
+            } else {
+                StepId::CreateDatabase
+            }
+        } else if pre_run_backup {
+            StepId::Dump
+        } else {
+            StepId::PostRestore
+        });
+    let redump = is_remote && begins_at == StepId::Dump;
     let mut warnings = caller_warnings;
 
     // 1. run lock
@@ -534,14 +626,31 @@ pub(crate) async fn run(
         }
     };
 
-    // 2. environment-tag re-check against the current entries (workflow files and tags are editable
-    // outside the app).
-    match definition::validate(wf, &source, &target) {
-        Ok(()) => report.checks.push(PreflightCheck::ok(
-            "environment_tag",
-            "Target environment tag",
-            format!("\"{}\" is tagged {}", target.name, target.env_tag.label()),
-        )),
+    // 2. definition & environment-tag check
+    match definition::validate_workflow(wf, source_opt.as_ref(), &target) {
+        Ok(()) => {
+            if requires_typed_name {
+                let msg = format!(
+                    "\"{}\" is tagged {}; you must type \"{}\" to confirm this run",
+                    target.name,
+                    target.env_tag.label(),
+                    target_db
+                );
+                warnings.push(msg.clone());
+                report.checks.push(PreflightCheck::warn(
+                    "environment_tag",
+                    "Target environment tag",
+                    msg,
+                    Some("confirmation cannot be remembered on Staging or Production".into()),
+                ));
+            } else {
+                report.checks.push(PreflightCheck::ok(
+                    "environment_tag",
+                    "Target environment tag",
+                    format!("\"{}\" is tagged {}", target.name, target.env_tag.label()),
+                ));
+            }
+        }
         Err(e) => {
             report.checks.push(PreflightCheck::from_error(
                 "environment_tag",
@@ -552,55 +661,327 @@ pub(crate) async fn run(
         }
     }
 
-    // 3. tools
+    // 3. tools + archive resolution (for from_backup_file)
     let registry = pgwhy_pgtools::discover(&deps.discovery);
-    let tools_found = registry.highest(ToolKind::PgDump).is_some()
-        && registry.highest(ToolKind::PgRestore).is_some();
-    if tools_found {
-        let d = registry
-            .highest(ToolKind::PgDump)
-            .map(|t| t.version.raw.clone())
-            .unwrap_or_default();
-        let r = registry
-            .highest(ToolKind::PgRestore)
-            .map(|t| t.version.raw.clone())
-            .unwrap_or_default();
-        report.checks.push(PreflightCheck::ok(
-            "tools",
-            "PostgreSQL client tools",
-            format!("found pg_dump {d} and pg_restore {r}"),
-        ));
-    } else {
-        let kind = if registry.highest(ToolKind::PgDump).is_none() {
-            ToolKind::PgDump
-        } else {
-            ToolKind::PgRestore
-        };
-        let e = match kind {
-            ToolKind::PgDump => pgwhy_pgtools::require_pg_dump(&registry, 0).err(),
-            ToolKind::PgRestore => pgwhy_pgtools::require_pg_restore(
-                &registry,
-                &PgVersion {
-                    major: 0,
-                    minor: 0,
-                    raw: "0".into(),
-                },
-            )
-            .err(),
+    let mut external_archive: Option<(crate::history::BackupRecord, pgwhy_pgtools::ArchiveKind)> =
+        None;
+    let mut pg_dump_tool: Option<pgwhy_pgtools::DiscoveredTool> = None;
+    let mut pg_restore_tool: Option<pgwhy_pgtools::DiscoveredTool> = None;
+    let mut psql_tool: Option<pgwhy_pgtools::DiscoveredTool> = None;
+    let mut tools_found = true;
+
+    match &effective_source {
+        WorkflowSource::FromRemoteDb { .. } => {
+            tools_found = registry.highest(ToolKind::PgDump).is_some()
+                && registry.highest(ToolKind::PgRestore).is_some();
+            if tools_found {
+                let d = registry
+                    .highest(ToolKind::PgDump)
+                    .map(|t| t.version.raw.clone())
+                    .unwrap_or_default();
+                let r = registry
+                    .highest(ToolKind::PgRestore)
+                    .map(|t| t.version.raw.clone())
+                    .unwrap_or_default();
+                report.checks.push(PreflightCheck::ok(
+                    "tools",
+                    "PostgreSQL client tools",
+                    format!("found pg_dump {d} and pg_restore {r}"),
+                ));
+            } else {
+                let kind = if registry.highest(ToolKind::PgDump).is_none() {
+                    ToolKind::PgDump
+                } else {
+                    ToolKind::PgRestore
+                };
+                let e = match kind {
+                    ToolKind::PgDump => pgwhy_pgtools::require_pg_dump(&registry, 0).err(),
+                    ToolKind::PgRestore => pgwhy_pgtools::require_pg_restore(
+                        &registry,
+                        &PgVersion {
+                            major: 0,
+                            minor: 0,
+                            raw: "0".into(),
+                        },
+                    )
+                    .err(),
+                    ToolKind::Psql => pgwhy_pgtools::require_psql(&registry).err(),
+                }
+                .unwrap_or_else(|| {
+                    AppError::new(ErrorKind::ToolMissing, "pg client tools were not found")
+                });
+                report.checks.push(PreflightCheck::from_error(
+                    "tools",
+                    "PostgreSQL client tools",
+                    &e,
+                ));
+            }
         }
-        .unwrap_or_else(|| AppError::new(ErrorKind::ToolMissing, "pg client tools were not found"));
-        report.checks.push(PreflightCheck::from_error(
-            "tools",
-            "PostgreSQL client tools",
-            &e,
-        ));
+        WorkflowSource::FromBackupFile { archive } => {
+            let resolved_path: AppResult<std::path::PathBuf> = match archive {
+                BackupSource::FixedPath { path } => Ok(path.clone()),
+                BackupSource::PromptAtRun { param } => opts
+                    .archive_path
+                    .clone()
+                    .or_else(|| {
+                        param
+                            .as_deref()
+                            .and_then(|p| opts.params.get(p))
+                            .filter(|s| !s.trim().is_empty())
+                            .map(std::path::PathBuf::from)
+                    })
+                    .ok_or_else(|| {
+                        AppError::new(
+                            ErrorKind::Config,
+                            "choose a backup archive file to restore before starting",
+                        )
+                    }),
+                BackupSource::LatestFromHistory {
+                    connection,
+                    database,
+                } => inner
+                    .history
+                    .list_entries()
+                    .ok()
+                    .and_then(|entries| {
+                        entries.into_iter().find_map(|e| {
+                            let b = e.backup?;
+                            if b.connection.id == *connection
+                                && b.database == *database
+                                && b.path.exists()
+                            {
+                                Some(b.path)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .ok_or_else(|| {
+                        AppError::new(
+                            ErrorKind::Config,
+                            format!("no reusable backup of \"{database}\" was found in History"),
+                        )
+                        .with_hint(
+                            "take a backup of that database first, or pick a backup file manually",
+                        )
+                    }),
+            };
+
+            match resolved_path {
+                Err(e) => {
+                    tools_found = false;
+                    report
+                        .checks
+                        .push(PreflightCheck::from_error("archive", "Backup archive", &e));
+                }
+                Ok(path) => {
+                    match pgwhy_pgtools::detect_archive_kind(&path) {
+                        None => {
+                            tools_found = false;
+                            report.checks.push(PreflightCheck::fail(
+                            "archive",
+                            "Backup archive",
+                            format!(
+                                "{} is not a readable PostgreSQL custom, directory, or .sql backup",
+                                path.display()
+                            ),
+                            Some("choose a valid pg_dump custom (.dump), directory, or .sql file".into()),
+                        ));
+                        }
+                        Some(
+                            kind @ (pgwhy_pgtools::ArchiveKind::Custom
+                            | pgwhy_pgtools::ArchiveKind::Directory),
+                        ) => {
+                            let header = pgwhy_pgtools::read_archive_header(&path);
+                            let gate = match header.as_ref().and_then(|h| h.dumped_by.as_ref()) {
+                                Some(ver) => pgwhy_pgtools::require_pg_restore(&registry, ver),
+                                None => registry.highest(ToolKind::PgRestore).cloned().ok_or_else(
+                                    || {
+                                        pgwhy_pgtools::require_pg_restore(
+                                            &registry,
+                                            &PgVersion {
+                                                major: 16,
+                                                minor: 0,
+                                                raw: "16".into(),
+                                            },
+                                        )
+                                        .unwrap_err()
+                                    },
+                                ),
+                            };
+                            match gate {
+                                Err(e) => {
+                                    tools_found = false;
+                                    report.checks.push(PreflightCheck::from_error(
+                                        "tools",
+                                        "PostgreSQL client tools",
+                                        &e,
+                                    ));
+                                }
+                                Ok(tool) => {
+                                    let rc =
+                                        pgwhy_pgtools::RunContext::new(deps.pgpass_dir.clone());
+                                    match pgwhy_pgtools::inspect_archive(
+                                        &tool,
+                                        &path,
+                                        pgwhy_pgtools::ArchiveCheck::TocOnly,
+                                        &rc,
+                                    )
+                                    .await
+                                    {
+                                        Ok(insp) if insp.reusable => {
+                                            let toc_items = insp.toc.as_ref().map(|t| {
+                                                t.restorable_count(wf.options.no_privileges)
+                                            });
+                                            let dumped_by = insp
+                                                .toc
+                                                .as_ref()
+                                                .and_then(|t| t.header.dumped_by.as_ref())
+                                                .map(|v| v.raw.clone());
+                                            report.checks.push(PreflightCheck::ok(
+                                                "tools",
+                                                "PostgreSQL client tools",
+                                                format!("pg_restore {} selected", tool.version.raw),
+                                            ));
+                                            report.checks.push(PreflightCheck::ok(
+                                                "archive",
+                                                "Backup archive",
+                                                format!(
+                                                    "{} ({:?}, {})",
+                                                    path.display(),
+                                                    kind,
+                                                    human(insp.size_bytes.unwrap_or(0))
+                                                ),
+                                            ));
+                                            external_archive = Some((
+                                                crate::history::BackupRecord {
+                                                    path,
+                                                    size_bytes: insp.size_bytes.unwrap_or(0),
+                                                    dumped_by,
+                                                    reusable: true,
+                                                    reason: None,
+                                                    cause: None,
+                                                    toc_items,
+                                                    from_run: None,
+                                                },
+                                                kind,
+                                            ));
+                                            pg_restore_tool = Some(tool);
+                                        }
+                                        Ok(insp) => {
+                                            tools_found = false;
+                                            report.checks.push(PreflightCheck::fail(
+                                                "archive",
+                                                "Backup archive",
+                                                insp.reason.unwrap_or_else(|| {
+                                                    "the archive could not be read".into()
+                                                }),
+                                                None,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            tools_found = false;
+                                            report.checks.push(PreflightCheck::from_error(
+                                                "archive",
+                                                "Backup archive",
+                                                &e,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(pgwhy_pgtools::ArchiveKind::PlainSql) => {
+                            match pgwhy_pgtools::require_psql(&registry) {
+                                Ok(tool) => {
+                                    let size_bytes =
+                                        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                    report.checks.push(PreflightCheck::ok(
+                                        "tools",
+                                        "PostgreSQL client tools",
+                                        format!(
+                                            "psql {} selected for plain .sql restore",
+                                            tool.version.raw
+                                        ),
+                                    ));
+                                    report.checks.push(PreflightCheck::ok(
+                                        "archive",
+                                        "Backup archive",
+                                        format!(
+                                            "{} (plain SQL, {})",
+                                            path.display(),
+                                            human(size_bytes)
+                                        ),
+                                    ));
+                                    external_archive = Some((
+                                        crate::history::BackupRecord {
+                                            path,
+                                            size_bytes,
+                                            dumped_by: None,
+                                            reusable: true,
+                                            reason: None,
+                                            cause: None,
+                                            toc_items: None,
+                                            from_run: None,
+                                        },
+                                        pgwhy_pgtools::ArchiveKind::PlainSql,
+                                    ));
+                                    psql_tool = Some(tool);
+                                }
+                                Err(e) => {
+                                    tools_found = false;
+                                    report.checks.push(PreflightCheck::from_error(
+                                        "tools",
+                                        "PostgreSQL client tools",
+                                        &e,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        WorkflowSource::InPlaceTarget { .. } => {
+            if pre_run_backup {
+                if let Some(d) = registry.highest(ToolKind::PgDump) {
+                    report.checks.push(PreflightCheck::ok(
+                        "tools",
+                        "PostgreSQL client tools",
+                        format!("pg_dump {} found for pre-run backup", d.version.raw),
+                    ));
+                } else {
+                    tools_found = false;
+                    let e = pgwhy_pgtools::require_pg_dump(&registry, 16).unwrap_err();
+                    report.checks.push(PreflightCheck::from_error(
+                        "tools",
+                        "PostgreSQL client tools",
+                        &e,
+                    ));
+                }
+            } else {
+                report.checks.push(PreflightCheck::skipped(
+                    "tools",
+                    "PostgreSQL client tools",
+                    if dry_run {
+                        "not needed for in-place dry run"
+                    } else {
+                        "not needed for in-place workflow"
+                    },
+                ));
+            }
+        }
     }
 
     // credentials (resolved now, reported last)
     let mut missing = Vec::new();
-    let (source_pw, source_cred) = match resolve_db_password(deps, &source) {
-        Ok(v) => v,
-        Err(e) => return refuse(report, e),
+    let (source_pw, source_cred) = if is_remote {
+        match resolve_db_password(deps, &source) {
+            Ok(v) => v,
+            Err(e) => return refuse(report, e),
+        }
+    } else {
+        (None, CredentialSource::None)
     };
     let (target_pw, target_cred) = match resolve_db_password(deps, &target) {
         Ok(v) => v,
@@ -628,9 +1009,13 @@ pub(crate) async fn run(
     // 4. source reachable + live catalog facts
     let mut src: Option<SourceFacts> = None;
     if redump {
+        let src_db = match &effective_source {
+            WorkflowSource::FromRemoteDb { source: s } => s.database.as_str(),
+            _ => wf.source.database.as_str(),
+        };
         match deps
             .manager
-            .open(&source.id, &wf.source.database, Purpose::Workflow)
+            .open(&source.id, src_db, Purpose::Workflow)
             .await
         {
             Ok(conn) => match source_facts(&conn).await {
@@ -640,7 +1025,7 @@ pub(crate) async fn run(
                         "Source database",
                         format!(
                             "{} on {} answers (PostgreSQL {}, {})",
-                            wf.source.database,
+                            src_db,
                             source.name,
                             f.version,
                             human(f.size.max(0) as u64)
@@ -663,7 +1048,7 @@ pub(crate) async fn run(
                     .push(PreflightCheck::from_error("source", "Source database", &e));
             }
         }
-    } else {
+    } else if is_remote {
         let from = retry
             .as_ref()
             .map(|r| r.record.run_id.to_string())
@@ -675,10 +1060,15 @@ pub(crate) async fn run(
         ));
     }
 
-    // maintenance connection (facts used by several gates)
+    // maintenance / target connection
+    let connect_db = if is_in_place {
+        target_db.as_str()
+    } else {
+        target.maintenance_db.as_str()
+    };
     let maint_conn = deps
         .manager
-        .open(&target.id, &target.maintenance_db, Purpose::Maintenance)
+        .open(&target.id, connect_db, Purpose::Maintenance)
         .await;
     let tgt: Option<TargetFacts>;
     let maint: Option<RealMaintenance>;
@@ -714,139 +1104,194 @@ pub(crate) async fn run(
     };
     let target_exists = dbs.iter().any(|d| d.name == target_db);
     let prev = retry.as_ref().map(|r| &r.record);
-    let create_mode = match (strategy, prev) {
-        (ReplaceStrategy::DropFirst, Some(p)) if begins_at > StepId::DropTarget => p.create_mode,
-        _ => !target_exists,
+    let create_mode = if is_in_place {
+        false
+    } else {
+        match (strategy, prev) {
+            (ReplaceStrategy::DropFirst, Some(p)) if begins_at > StepId::DropTarget => {
+                p.create_mode
+            }
+            _ => !target_exists,
+        }
     };
 
     // 5. version gates
     let mut tools: Option<PlannedTools> = None;
-    if tools_found {
-        let gate = if redump {
-            match &src {
-                Some(f) => {
-                    let major = PgVersion::major_from_version_num(f.version_num as u32);
-                    pgwhy_pgtools::require_pg_dump(&registry, major).and_then(|d| {
-                        let r = pgwhy_pgtools::require_pg_restore(&registry, &d.version)?;
-                        Ok(PlannedTools {
-                            pg_dump: d,
+    if is_remote {
+        if tools_found {
+            let gate = if redump {
+                match &src {
+                    Some(f) => {
+                        let major = PgVersion::major_from_version_num(f.version_num as u32);
+                        pgwhy_pgtools::require_pg_dump(&registry, major).and_then(|d| {
+                            let r = pgwhy_pgtools::require_pg_restore(&registry, &d.version)?;
+                            Ok(PlannedTools {
+                                pg_dump: d,
+                                pg_restore: r,
+                            })
+                        })
+                    }
+                    None => Err(AppError::new(
+                        ErrorKind::Refused,
+                        "can't check versions without reaching the source",
+                    )),
+                }
+            } else {
+                let dumped = prev
+                    .and_then(|p| p.backup.as_ref())
+                    .and_then(|b| b.dumped_by.as_deref())
+                    .and_then(PgVersion::parse);
+                match (dumped, registry.highest(ToolKind::PgDump)) {
+                    (Some(v), Some(d)) => {
+                        pgwhy_pgtools::require_pg_restore(&registry, &v).map(|r| PlannedTools {
+                            pg_dump: d.clone(),
                             pg_restore: r,
                         })
-                    })
+                    }
+                    _ => Err(AppError::new(
+                        ErrorKind::Refused,
+                        "the reused backup's pg_dump version is unknown",
+                    )),
                 }
-                None => Err(AppError::new(
-                    ErrorKind::Refused,
-                    "can't check versions without reaching the source",
+            };
+            match gate {
+                Ok(t) => {
+                    report.checks.push(PreflightCheck::ok(
+                        "tool_versions",
+                        "Tool versions",
+                        format!(
+                            "pg_dump {} and pg_restore {} selected",
+                            t.pg_dump.version.raw, t.pg_restore.version.raw
+                        ),
+                    ));
+                    tools = Some(t);
+                }
+                Err(e) if src.is_none() && redump => {
+                    report.checks.push(PreflightCheck::skipped(
+                        "tool_versions",
+                        "Tool versions",
+                        e.message,
+                    ));
+                }
+                Err(e) => report.checks.push(PreflightCheck::from_error(
+                    "tool_versions",
+                    "Tool versions",
+                    &e,
                 )),
+            }
+            if let (Some(f), Some(tm)) = (&src, target_major) {
+                if let Some(w) = pgwhy_pgtools::target_version_warning(
+                    PgVersion::major_from_version_num(f.version_num as u32),
+                    tm,
+                ) {
+                    warnings.push(w.message.clone());
+                    report.checks.push(PreflightCheck::warn(
+                        "target_version",
+                        "Target server version",
+                        w.message,
+                        w.hint,
+                    ));
+                }
             }
         } else {
-            let dumped = prev
-                .and_then(|p| p.backup.as_ref())
-                .and_then(|b| b.dumped_by.as_deref())
-                .and_then(PgVersion::parse);
-            match (dumped, registry.highest(ToolKind::PgDump)) {
-                (Some(v), Some(d)) => {
-                    pgwhy_pgtools::require_pg_restore(&registry, &v).map(|r| PlannedTools {
-                        pg_dump: d.clone(),
-                        pg_restore: r,
-                    })
-                }
-                _ => Err(AppError::new(
-                    ErrorKind::Refused,
-                    "the reused backup's pg_dump version is unknown",
-                )),
-            }
-        };
-        match gate {
-            Ok(t) => {
-                report.checks.push(PreflightCheck::ok(
-                    "tool_versions",
-                    "Tool versions",
-                    format!(
-                        "pg_dump {} and pg_restore {} selected",
-                        t.pg_dump.version.raw, t.pg_restore.version.raw
-                    ),
-                ));
-                tools = Some(t);
-            }
-            Err(e) if src.is_none() && redump => {
-                report.checks.push(PreflightCheck::skipped(
-                    "tool_versions",
-                    "Tool versions",
-                    e.message,
-                ));
-            }
-            Err(e) => report.checks.push(PreflightCheck::from_error(
+            report.checks.push(PreflightCheck::skipped(
                 "tool_versions",
                 "Tool versions",
-                &e,
-            )),
+                "no client tools found",
+            ));
         }
-        if let (Some(f), Some(tm)) = (&src, target_major) {
-            if let Some(w) = pgwhy_pgtools::target_version_warning(
-                PgVersion::major_from_version_num(f.version_num as u32),
-                tm,
-            ) {
-                warnings.push(w.message.clone());
-                report.checks.push(PreflightCheck::warn(
-                    "target_version",
-                    "Target server version",
-                    w.message,
-                    w.hint,
-                ));
+    } else if is_in_place && pre_run_backup {
+        if let Some(tm) = target_major {
+            match pgwhy_pgtools::require_pg_dump(&registry, tm) {
+                Ok(d) => {
+                    report.checks.push(PreflightCheck::ok(
+                        "tool_versions",
+                        "Tool versions",
+                        format!("pg_dump {} selected for pre-run backup", d.version.raw),
+                    ));
+                    pg_dump_tool = Some(d);
+                }
+                Err(e) => report.checks.push(PreflightCheck::from_error(
+                    "tool_versions",
+                    "Tool versions",
+                    &e,
+                )),
             }
         }
-    } else {
-        report.checks.push(PreflightCheck::skipped(
-            "tool_versions",
-            "Tool versions",
-            "no client tools found",
-        ));
     }
 
     // 6. maintenance DB + privileges
     match (&tgt, &maint_err) {
         (Some(f), _) => {
-            let mut problems = Vec::new();
-            if !f.superuser && !f.createdb {
-                problems.push(format!(
-                    "{} lacks CREATEDB (needed to create the staging database)",
-                    target.user
-                ));
-            }
-            if f.owns_target == Some(false) && !f.superuser {
-                problems.push(format!(
-                    "{} does not own {target_db} (needed to rename and drop it)",
-                    target.user
-                ));
-            }
-            if problems.is_empty() {
-                report.checks.push(PreflightCheck::ok(
-                    "maintenance",
-                    "Target server access",
-                    format!(
-                        "connected to {} as {} (PostgreSQL {})",
-                        target.maintenance_db, target.user, f.version
-                    ),
-                ));
-                if !f.superuser && !f.can_signal {
-                    report.checks.push(PreflightCheck::warn(
-                        "terminate_privilege",
-                        "Ending sessions",
+            if is_in_place {
+                if !target_exists {
+                    report.checks.push(PreflightCheck::fail(
+                        "maintenance",
+                        "Target database",
                         format!(
-                            "{} can only end sessions of roles it belongs to",
-                            target.user
+                            "target database \"{target_db}\" does not exist on {}",
+                            target.name
                         ),
-                        Some("grant pg_signal_backend if other roles connect to the target".into()),
+                        Some("in-place workflows run against an existing database".into()),
+                    ));
+                } else {
+                    report.checks.push(PreflightCheck::ok(
+                        "maintenance",
+                        "Target server access",
+                        format!(
+                            "connected to {target_db} as {} (PostgreSQL {})",
+                            target.user, f.version
+                        ),
                     ));
                 }
             } else {
-                report.checks.push(PreflightCheck::fail(
-                    "maintenance",
-                    "Target server access",
-                    problems.join("; "),
-                    Some("connect the target as the database owner or a role with CREATEDB".into()),
-                ));
+                let mut problems = Vec::new();
+                if !f.superuser && !f.createdb {
+                    problems.push(format!(
+                        "{} lacks CREATEDB (needed to create the staging database)",
+                        target.user
+                    ));
+                }
+                if f.owns_target == Some(false) && !f.superuser {
+                    problems.push(format!(
+                        "{} does not own {target_db} (needed to rename and drop it)",
+                        target.user
+                    ));
+                }
+                if problems.is_empty() {
+                    report.checks.push(PreflightCheck::ok(
+                        "maintenance",
+                        "Target server access",
+                        format!(
+                            "connected to {} as {} (PostgreSQL {})",
+                            target.maintenance_db, target.user, f.version
+                        ),
+                    ));
+                    if !f.superuser && !f.can_signal {
+                        report.checks.push(PreflightCheck::warn(
+                            "terminate_privilege",
+                            "Ending sessions",
+                            format!(
+                                "{} can only end sessions of roles it belongs to",
+                                target.user
+                            ),
+                            Some(
+                                "grant pg_signal_backend if other roles connect to the target"
+                                    .into(),
+                            ),
+                        ));
+                    }
+                } else {
+                    report.checks.push(PreflightCheck::fail(
+                        "maintenance",
+                        "Target server access",
+                        problems.join("; "),
+                        Some(
+                            "connect the target as the database owner or a role with CREATEDB"
+                                .into(),
+                        ),
+                    ));
+                }
             }
         }
         (None, Some(e)) => report.checks.push(PreflightCheck::from_error(
@@ -857,69 +1302,73 @@ pub(crate) async fn run(
         (None, None) => {}
     }
 
-    // 7. maintenance ≠ target (validate() refused it already; recorded for the report)
-    report.checks.push(PreflightCheck::ok(
-        "maintenance_not_target",
-        "Maintenance database",
-        format!(
-            "renames run from {}, not from {target_db}",
-            target.maintenance_db
-        ),
-    ));
+    // 7. maintenance ≠ target (for swap/drop-first)
+    if !is_in_place {
+        report.checks.push(PreflightCheck::ok(
+            "maintenance_not_target",
+            "Maintenance database",
+            format!(
+                "renames run from {}, not from {target_db}",
+                target.maintenance_db
+            ),
+        ));
+    }
 
-    // 8. prepared transactions on the target
-    if let Some(m) = &maint {
-        if target_exists {
-            match crate::ops::MaintenanceOps::prepared_xacts(m, &target_db).await {
-                Ok(px) if px.is_empty() => report.checks.push(PreflightCheck::ok(
-                    "prepared_xacts",
-                    "Prepared transactions",
-                    format!("none on {target_db}"),
-                )),
-                Ok(px) => {
-                    let gids = px
-                        .iter()
-                        .map(|p| format!("'{}'", p.gid))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let mut c = PreflightCheck::fail(
+    // 8. prepared transactions on the target (for swap/drop-first)
+    if !is_in_place {
+        if let Some(m) = &maint {
+            if target_exists {
+                match crate::ops::MaintenanceOps::prepared_xacts(m, &target_db).await {
+                    Ok(px) if px.is_empty() => report.checks.push(PreflightCheck::ok(
                         "prepared_xacts",
                         "Prepared transactions",
-                        format!(
-                            "{target_db} has {} prepared transaction(s): {gids}",
-                            px.len()
-                        ),
-                        Some(
-                            "commit or roll them back first; pgWhy never discards them blindly"
-                                .into(),
-                        ),
-                    );
-                    c.fixes = px
-                        .iter()
-                        .map(|p| PreflightFix {
-                            kind: PreflightFixKind::RollbackPrepared,
-                            database: target_db.clone(),
-                            gid: Some(p.gid.clone()),
-                        })
-                        .collect();
-                    report.checks.push(c);
+                        format!("none on {target_db}"),
+                    )),
+                    Ok(px) => {
+                        let gids = px
+                            .iter()
+                            .map(|p| format!("'{}'", p.gid))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let mut c = PreflightCheck::fail(
+                            "prepared_xacts",
+                            "Prepared transactions",
+                            format!(
+                                "{target_db} has {} prepared transaction(s): {gids}",
+                                px.len()
+                            ),
+                            Some(
+                                "commit or roll them back first; pgWhy never discards them blindly"
+                                    .into(),
+                            ),
+                        );
+                        c.fixes = px
+                            .iter()
+                            .map(|p| PreflightFix {
+                                kind: PreflightFixKind::RollbackPrepared,
+                                database: target_db.clone(),
+                                gid: Some(p.gid.clone()),
+                            })
+                            .collect();
+                        report.checks.push(c);
+                    }
+                    Err(e) => report.checks.push(PreflightCheck::from_error(
+                        "prepared_xacts",
+                        "Prepared transactions",
+                        &e,
+                    )),
                 }
-                Err(e) => report.checks.push(PreflightCheck::from_error(
+            } else {
+                report.checks.push(PreflightCheck::skipped(
                     "prepared_xacts",
                     "Prepared transactions",
-                    &e,
-                )),
+                    format!("{target_db} does not exist yet"),
+                ));
             }
-        } else {
-            report.checks.push(PreflightCheck::skipped(
-                "prepared_xacts",
-                "Prepared transactions",
-                format!("{target_db} does not exist yet"),
-            ));
         }
     }
 
-    // plan skeleton (names) — needed by the name and backup checks
+    // plan skeleton (names)
     let backup_dir = inner.config.backup_root.join(wf.id.0.as_str());
     let mut plan = RunPlan::new(
         wf.clone(),
@@ -928,6 +1377,9 @@ pub(crate) async fn run(
         backup_dir.clone(),
         SystemTime::now(),
     );
+    plan.pause_before_swap = pause_before_swap;
+    plan.dry_run = dry_run;
+    plan.pre_run_backup = pre_run_backup;
     let adopt = retry.as_ref().is_some_and(|r| r.offer.reuses_work_db);
     if adopt && strategy == ReplaceStrategy::StagingSwap {
         if let Some(s) = prev.and_then(|p| p.staging_db.clone()) {
@@ -936,8 +1388,11 @@ pub(crate) async fn run(
     }
 
     // 9. disk space
-    if begins_at <= StepId::CreateDatabase {
-        let size = src.as_ref().map(|f| f.size.max(0) as u64);
+    if !is_in_place && begins_at <= StepId::CreateDatabase {
+        let size = src
+            .as_ref()
+            .map(|f| f.size.max(0) as u64)
+            .or_else(|| external_archive.as_ref().map(|(b, _)| b.size_bytes));
         let mut notes: Vec<(CheckStatus, String, Option<String>)> = Vec::new();
         if let (true, Some(sz)) = (redump, size) {
             match free_space(&backup_dir) {
@@ -1039,7 +1494,7 @@ pub(crate) async fn run(
             message,
             hint,
         ));
-    } else {
+    } else if !is_in_place {
         report.checks.push(PreflightCheck::skipped(
             "disk_space",
             "Disk space",
@@ -1048,7 +1503,7 @@ pub(crate) async fn run(
     }
 
     // 10. staging / _old names (marker-verified)
-    if strategy == ReplaceStrategy::StagingSwap && maint.is_some() {
+    if !is_in_place && strategy == ReplaceStrategy::StagingSwap && maint.is_some() {
         let mut problems: Vec<String> = Vec::new();
         let mut fixes = Vec::new();
         let mut check_free = |name: &str, role: MarkerRole, problems: &mut Vec<String>| {
@@ -1083,8 +1538,6 @@ pub(crate) async fn run(
                 None => problems.push(format!("{} no longer exists", plan.staging_db)),
             }
         } else {
-            // A retry drops the retried run's own staging before creating the new one, so a
-            // fresh name that lands on it (a retry within the same second) is not a conflict.
             let dropped_by_retry = prev.is_some_and(|p| {
                 p.staging_db.as_deref() == Some(plan.staging_db.as_str())
                     && dbs
@@ -1129,20 +1582,25 @@ pub(crate) async fn run(
     // 11. encoding / locale representability
     let locale = if redump {
         src.as_ref().map(|f| f.locale.clone())
-    } else {
+    } else if is_remote {
         prev.and_then(|p| p.locale.clone())
+    } else {
+        None
     };
-    if begins_at <= StepId::CreateDatabase {
+    if is_remote && begins_at <= StepId::CreateDatabase {
         match (&locale, &maint, target_major) {
             (Some(l), Some(m), Some(tm)) => {
                 let conn_check = locale_gap(m.conn(), tm, l).await;
                 match conn_check {
                     Ok(None) => {
-                        let mut msg = format!("{} / {} ({})", l.encoding, l.collate, l.provider.label());
+                        let mut msg =
+                            format!("{} / {} ({})", l.encoding, l.collate, l.provider.label());
                         if let Some(loc) = &l.locale {
                             msg.push_str(&format!(" {loc}"));
                         }
-                        report.checks.push(PreflightCheck::ok("locale", "Encoding and locale", msg));
+                        report
+                            .checks
+                            .push(PreflightCheck::ok("locale", "Encoding and locale", msg));
                         if l.icu_rules.is_some() && tm < 16 {
                             warnings.push("the source's ICU tailoring rules can't be applied on this target (needs 16+)".into());
                         }
@@ -1151,9 +1609,16 @@ pub(crate) async fn run(
                         "locale",
                         "Encoding and locale",
                         gap,
-                        Some("install the locale on the target machine, or upgrade the target server".into()),
+                        Some(
+                            "install the locale on the target machine, or upgrade the target server"
+                                .into(),
+                        ),
                     )),
-                    Err(e) => report.checks.push(PreflightCheck::from_error("locale", "Encoding and locale", &e)),
+                    Err(e) => report.checks.push(PreflightCheck::from_error(
+                        "locale",
+                        "Encoding and locale",
+                        &e,
+                    )),
                 }
             }
             _ => report.checks.push(PreflightCheck::skipped(
@@ -1162,7 +1627,7 @@ pub(crate) async fn run(
                 "needs the source and target servers",
             )),
         }
-    } else {
+    } else if is_remote {
         report.checks.push(PreflightCheck::skipped(
             "locale",
             "Encoding and locale",
@@ -1170,24 +1635,84 @@ pub(crate) async fn run(
         ));
     }
 
-    // 12. post-restore script (re-checked against current content)
+    // 12. post-restore script (v1) OR v2 compiled steps check
     let mut script: Option<ScriptRecord> = None;
-    match &wf.post_restore_script {
-        None => report.checks.push(PreflightCheck::skipped(
-            "script",
-            "Post-restore script",
-            "no post-restore script",
-        )),
-        Some(_) if begins_at > StepId::PostRestore => {
-            script = prev.and_then(|p| p.script.clone());
-            report.checks.push(PreflightCheck::skipped(
+    let mut v2_script_hash: Option<String> = None;
+    if !wf.steps.is_empty() {
+        if dry_run && wf.steps.iter().any(|s| s.enabled && s.no_transaction) {
+            report.checks.push(PreflightCheck::fail(
+                "script",
+                "Pipeline steps",
+                "dry run cannot execute steps with \"run without transaction\" enabled",
+                Some("disable \"run without transaction\" or disable dry run".into()),
+            ));
+        } else {
+            let preview_mode = crate::compiler::CompileMode::Preview {
+                values: &opts.params,
+            };
+            match crate::compiler::compile_steps(
+                &wf.steps,
+                &wf.parameters,
+                &preview_mode,
+                Some(&*deps.scripts),
+            ) {
+                Err(e) => {
+                    report
+                        .checks
+                        .push(PreflightCheck::from_error("script", "Pipeline steps", &e))
+                }
+                Ok(compiled) => {
+                    let mut problems = Vec::new();
+                    for c in &compiled {
+                        for p in &c.problems {
+                            problems.push(format!("{}: {p}", c.step_name));
+                        }
+                        for w in &c.warnings {
+                            warnings.push(format!("{}: {w}", c.step_name));
+                        }
+                    }
+                    if !problems.is_empty() {
+                        report.checks.push(PreflightCheck::fail(
+                            "script",
+                            "Pipeline steps",
+                            problems.join("; "),
+                            None,
+                        ));
+                    } else {
+                        use sha2::{Digest, Sha256};
+                        let mut h = Sha256::new();
+                        for c in &compiled {
+                            h.update(c.step_id.as_bytes());
+                            h.update([0]);
+                            h.update(c.sql.as_bytes());
+                            h.update([0]);
+                        }
+                        v2_script_hash = Some(crate::definition::hex(h.finalize().as_slice()));
+                        report.checks.push(PreflightCheck::ok(
+                            "script",
+                            "Pipeline steps",
+                            format!("{} enabled step(s) validated", compiled.len()),
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        match &wf.post_restore_script {
+            None => report.checks.push(PreflightCheck::skipped(
                 "script",
                 "Post-restore script",
-                "already applied by the retried run",
-            ));
-        }
-        Some(id) => {
-            match deps.scripts.load(id) {
+                "no post-restore script",
+            )),
+            Some(_) if begins_at > StepId::PostRestore => {
+                script = prev.and_then(|p| p.script.clone());
+                report.checks.push(PreflightCheck::skipped(
+                    "script",
+                    "Post-restore script",
+                    "already applied by the retried run",
+                ));
+            }
+            Some(id) => match deps.scripts.load(id) {
                 Err(e) => report.checks.push(PreflightCheck::from_error(
                     "script",
                     "Post-restore script",
@@ -1200,14 +1725,22 @@ pub(crate) async fn run(
                     };
                     let problem = if pgwhy_core::scripts::has_meta_commands(&s.content) {
                         Some((
-                        format!("\"{}\" contains psql meta-commands (\\c, \\i, \\set, …), which pgWhy doesn't run", s.name),
-                        "remove the backslash commands".to_string(),
-                    ))
+                            format!(
+                                "\"{}\" contains psql meta-commands (\\c, \\i, \\set, …), which pgWhy doesn't run",
+                                s.name
+                            ),
+                            "remove the backslash commands".to_string(),
+                        ))
                     } else if let Some(&i) = analysis.txn_control.first() {
                         Some((
-                        format!("\"{}\" controls its own transaction ({} at statement {})", s.name, stmt(i), i + 1),
-                        "remove BEGIN/COMMIT/ROLLBACK/SAVEPOINT; the script already runs in one transaction (or none)".to_string(),
-                    ))
+                            format!(
+                                "\"{}\" controls its own transaction ({} at statement {})",
+                                s.name,
+                                stmt(i),
+                                i + 1
+                            ),
+                            "remove BEGIN/COMMIT/ROLLBACK/SAVEPOINT; the script already runs in one transaction (or none)".to_string(),
+                        ))
                     } else if let Some(&i) = analysis.copy_client.first() {
                         Some((
                             format!(
@@ -1218,7 +1751,14 @@ pub(crate) async fn run(
                             "use server-side COPY or INSERTs".to_string(),
                         ))
                     } else if let Some(&i) = analysis.unterminated.first() {
-                        Some((format!("\"{}\" ends inside an unterminated string or comment (statement {})", s.name, i + 1), "fix the script".to_string()))
+                        Some((
+                            format!(
+                                "\"{}\" ends inside an unterminated string or comment (statement {})",
+                                s.name,
+                                i + 1
+                            ),
+                            "fix the script".to_string(),
+                        ))
                     } else if wf.options.script_mode == ScriptMode::Transaction
                         && analysis.needs_no_transaction_mode()
                     {
@@ -1266,7 +1806,7 @@ pub(crate) async fn run(
                         }
                     }
                 }
-            }
+            },
         }
     }
 
@@ -1306,7 +1846,7 @@ pub(crate) async fn run(
     let mut resume: Option<Resume> = None;
     if let Some(r) = &retry {
         let mut backup = None;
-        if r.offer.reuses_backup {
+        if r.offer.reuses_backup && is_remote {
             match (&r.record.backup, &tools) {
                 (Some(b), Some(t)) => {
                     let mut probe_plan = plan.clone();
@@ -1347,9 +1887,11 @@ pub(crate) async fn run(
                     None,
                 )),
             }
+        } else if r.offer.reuses_backup {
+            backup = r.record.backup.clone();
         }
         let mut drop_before_create = Vec::new();
-        if !r.offer.reuses_work_db {
+        if !r.offer.reuses_work_db && !is_in_place {
             match strategy {
                 ReplaceStrategy::StagingSwap => {
                     if let (Some(s), Some(name)) = (&r.inventory.staging, &r.record.staging_db) {
@@ -1386,45 +1928,69 @@ pub(crate) async fn run(
         return refuse(report, e);
     }
 
-    // confirmation
-    let own: Vec<_> = deps
-        .manager
-        .live_connections()
-        .into_iter()
-        .filter(|c| {
-            c.connection_id == target.id
-                && (c.database == target_db || c.database == plan.staging_db)
-        })
-        .collect();
-    if !own.is_empty() {
+    // confirmation warnings
+    if !is_in_place {
+        let own: Vec<_> = deps
+            .manager
+            .live_connections()
+            .into_iter()
+            .filter(|c| {
+                c.connection_id == target.id
+                    && (c.database == target_db || c.database == plan.staging_db)
+            })
+            .collect();
+        if !own.is_empty() {
+            warnings.push(format!(
+                "pgWhy has {} open connection(s) to {target_db} (explorer, editor tabs, grids); they are closed when the {} — open transactions roll back",
+                own.len(),
+                if strategy == ReplaceStrategy::DropFirst { "target is dropped" } else { "swap starts" }
+            ));
+        }
+        match (strategy, create_mode) {
+            (_, true) => warnings.push(format!(
+                "{target_db} does not exist on {} yet; it will be created",
+                target.name
+            )),
+            (ReplaceStrategy::StagingSwap, false) => warnings.push(format!(
+                "anything opened on {target_db} during the run is closed when the swap starts: open transactions roll back and pending grid edits are discarded"
+            )),
+            (ReplaceStrategy::DropFirst, false) => warnings.push(format!(
+                "drop-first: {target_db} is dropped before the restore — a failed run will leave no local database"
+            )),
+        }
+        if wf.options.no_owner || wf.options.no_privileges {
+            warnings.push(format!(
+                "restored without ownership/privileges: objects will be owned by {} and other roles lose access unless the post-restore script re-grants",
+                target.user
+            ));
+        }
+    } else if dry_run {
         warnings.push(format!(
-            "pgWhy has {} open connection(s) to {target_db} (explorer, editor tabs, grids); they are closed when the {} — open transactions roll back",
-            own.len(),
-            if strategy == ReplaceStrategy::DropFirst { "target is dropped" } else { "swap starts" }
+            "dry run: steps will execute inside a transaction on {target_db} and roll back automatically"
+        ));
+    } else if pre_run_backup {
+        warnings.push(format!(
+            "a safety backup of {target_db} will be taken before in-place transforms run"
         ));
     }
-    match (strategy, create_mode) {
-        (_, true) => warnings.push(format!("{target_db} does not exist on {} yet; it will be created", target.name)),
-        (ReplaceStrategy::StagingSwap, false) => warnings.push(format!(
-            "anything opened on {target_db} during the run is closed when the swap starts: open transactions roll back and pending grid edits are discarded"
-        )),
-        (ReplaceStrategy::DropFirst, false) => warnings.push(format!(
-            "drop-first: {target_db} is dropped before the restore — a failed run will leave no local database"
-        )),
-    }
-    if wf.options.no_owner || wf.options.no_privileges {
+    if pause_before_swap {
         warnings.push(format!(
-            "restored without ownership/privileges: objects will be owned by {} and other roles lose access unless the post-restore script re-grants",
-            target.user
+            "pause before swap is enabled: the run will stop after Verify so you can inspect {} before swapping",
+            plan.staging_db
         ));
     }
 
-    let script_hash = script.as_ref().map(|s| s.sha256.clone());
-    plan.fingerprint = wf.confirmation_fingerprint(script_hash.as_deref());
-    plan.remembered = wf.confirmation_remembered(&target, script_hash.as_deref());
+    let combined_hash = v2_script_hash.or_else(|| script.as_ref().map(|s| s.sha256.clone()));
+    plan.fingerprint = wf.confirmation_fingerprint(combined_hash.as_deref());
+    plan.remembered =
+        !requires_typed_name && wf.confirmation_remembered(&target, combined_hash.as_deref());
     let can_remember = target.env_tag == EnvTag::Local && wf.has_succeeded;
     plan.create_mode = create_mode;
     plan.tools = tools;
+    plan.pg_dump_tool = pg_dump_tool;
+    plan.pg_restore_tool = pg_restore_tool;
+    plan.psql_tool = psql_tool;
+    plan.external_archive = external_archive.clone();
     plan.locale = locale;
     plan.script = script;
     plan.source_password = source_pw;
@@ -1444,18 +2010,42 @@ pub(crate) async fn run(
     plan.resume = resume;
     plan.warnings = warnings.clone();
 
+    let (source_label, source_db) = match &effective_source {
+        WorkflowSource::FromRemoteDb { source: s } => (
+            format!("{} ({}:{})", source.name, source.host, source.port),
+            s.database.clone(),
+        ),
+        WorkflowSource::FromBackupFile { .. } => {
+            let p = external_archive
+                .as_ref()
+                .map(|(b, _)| b.path.display().to_string())
+                .unwrap_or_else(|| "backup file".into());
+            ("Backup file".into(), p)
+        }
+        WorkflowSource::InPlaceTarget { .. } => (
+            format!("{} ({}:{})", target.name, target.host, target.port),
+            target_db.clone(),
+        ),
+    };
+
     report.confirmation = Some(Confirmation {
         target_db: target_db.clone(),
         target_server_label: format!("{} ({}:{})", target.name, target.host, target.port),
         target_tag: target.env_tag,
         strategy,
         create_mode,
-        source_label: format!("{} ({}:{})", source.name, source.host, source.port),
-        source_db: wf.source.database.clone(),
-        staging_db: (strategy == ReplaceStrategy::StagingSwap).then(|| plan.staging_db.clone()),
+        source_label,
+        source_db,
+        staging_db: (!is_in_place && strategy == ReplaceStrategy::StagingSwap)
+            .then(|| plan.staging_db.clone()),
         warnings,
         remembered: plan.remembered,
         can_remember,
+        requires_typed_name,
+        pause_before_swap,
+        dry_run,
+        source_mode: Some(effective_source),
+        parameters: wf.parameters.clone(),
         fingerprint: plan.fingerprint.clone(),
     });
     (report, Some((plan, lock, can_remember)))
