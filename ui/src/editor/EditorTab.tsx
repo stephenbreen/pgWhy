@@ -11,6 +11,7 @@ import { ErrorNote } from "../connection/ErrorNote";
 import * as q from "../lib/ipc/query";
 import { toAppError, type AppError } from "../lib/ipc/errors";
 import * as scriptsIpc from "../lib/ipc/scripts";
+import { useScriptLibrary } from "../scripts/store";
 import { byteToCharOffset, charToByteOffset, SqlEditor, type RunRequest, type SqlEditorHandle } from "./SqlEditor";
 import { ResultsPane } from "./ResultsPane";
 import { useEditors } from "./store";
@@ -78,8 +79,24 @@ export function EditorTab({ tab }: { tab: Tab }) {
   const [disk, setDisk] = useState<DiskState>(null);
   const [saveAs, setSaveAs] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<AppError | null>(null);
+  const [metaCmds, setMetaCmds] = useState<scriptsIpc.MetaCommand[]>([]);
+  const metaTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editorHandle = useRef<SqlEditorHandle | null>(null);
   const currentText = () => editorHandle.current?.view.state.doc.toString() ?? textRef.current;
+
+  const scheduleMetaScan = useCallback((text: string) => {
+    if (metaTimer.current) clearTimeout(metaTimer.current);
+    if (!text.includes("\\")) {
+      setMetaCmds([]);
+      return;
+    }
+    metaTimer.current = setTimeout(() => {
+      void scriptsIpc
+        .metaScan(text)
+        .then((res) => setMetaCmds(Array.isArray(res) ? res : []))
+        .catch(() => setMetaCmds([]));
+    }, 200);
+  }, []);
   /** a run request is on its way to the core (blocks a double submit before `running` is set) */
   const starting = useRef(false);
   const entries = useConnections((s) => s.entries);
@@ -100,6 +117,10 @@ export function EditorTab({ tab }: { tab: Tab }) {
   useEffect(() => {
     init(tab.id, data.connectionId, data.database, data.filePath);
     void open();
+    scheduleMetaScan(textRef.current);
+    return () => {
+      if (metaTimer.current) clearTimeout(metaTimer.current);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -204,11 +225,13 @@ export function EditorTab({ tab }: { tab: Tab }) {
     try {
       if (asPath) {
         const opened = await scriptsIpc.scriptSave(asPath, text);
+        useScriptLibrary.getState().bump();
         updateTab(tab.id, { title: opened.info.name, data: { ...data, scriptId: opened.info.id, filePath: opened.path, fingerprint: opened.file.fingerprint } });
         void scriptsIpc.recordRecent({ path: opened.path, library_id: opened.info.id, action: "save" });
         setSaveAs(null);
       } else if (data.scriptId) {
         const info = await scriptsIpc.scriptWrite(data.scriptId, text);
+        useScriptLibrary.getState().bump();
         setData({ fingerprint: info.fingerprint });
         if (data.filePath) void scriptsIpc.recordRecent({ path: data.filePath, library_id: data.scriptId, action: "save" });
       } else if (data.filePath) {
@@ -401,6 +424,13 @@ export function EditorTab({ tab }: { tab: Tab }) {
           <button type="button" onClick={() => void open()}>Reconnect</button>
         </div>
       )}
+      {metaCmds.length > 0 && (
+        <div className="editor-banner meta-warn-banner" role="status" aria-label="psql meta-command warning">
+          <span>
+            <b>psql meta-command detected:</b> {metaCmds.map((m) => `${m.command} (line ${m.line})`).join(", ")} — pgWhy runs standard SQL, not psql meta-commands.
+          </span>
+        </div>
+      )}
       <div className="editor-split">
         <div className="editor-host">
           <SqlEditor
@@ -411,6 +441,7 @@ export function EditorTab({ tab }: { tab: Tab }) {
             error={errorDecoration}
             onChange={() => {
               if (!state.dirty) patch(tab.id, { dirty: true });
+              scheduleMetaScan(currentText());
             }}
             onRun={run}
             onCancel={state.running ? () => void q.editorCancel(tab.id) : undefined}

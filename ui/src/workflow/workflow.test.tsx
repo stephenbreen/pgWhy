@@ -265,4 +265,77 @@ describe("workflow editor", () => {
     await user.click(within(importDialog).getByRole("button", { name: "Load workflow" }));
     expect(await screen.findByDisplayValue("Imported QA reset")).toBeInTheDocument();
   });
+
+  it("creates and edits a linked library script inline from a SQL step", async () => {
+    const user = userEvent.setup();
+    const fp = { sha256: "h", size: 10, modified_ms: 1 };
+    let scriptContent = "DELETE FROM public.sessions;";
+    const extraScripts: { id: string; path: string; name: string; folder: string; tags: string[]; fingerprint: typeof fp; missing: boolean }[] = [];
+    const calls = backend({
+      library_list: () => ({
+        root: "/lib",
+        tags: [],
+        scripts: [
+          { id: "ok", path: "post/anonymize.sql", name: "anonymize", folder: "post", tags: [], fingerprint: fp, missing: false },
+          ...extraScripts,
+        ],
+      }),
+      script_save: (a) => {
+        const info = { id: "new-script", path: String(a.path), name: "seed", folder: "post", tags: [], fingerprint: fp, missing: false };
+        scriptContent = String(a.content);
+        extraScripts.push(info);
+        return { info, path: `/lib/${a.path}`, file: { content: scriptContent, fingerprint: fp } };
+      },
+      script_read: () => ({
+        info: { id: "new-script", path: "post/seed.sql", name: "seed", folder: "post", tags: [], fingerprint: fp, missing: false },
+        path: "/lib/post/seed.sql",
+        file: { content: scriptContent, fingerprint: fp },
+      }),
+      script_write: (a) => {
+        scriptContent = String(a.content);
+        return { id: String(a.id), path: "post/seed.sql", name: "seed", folder: "post", tags: [], fingerprint: fp, missing: false };
+      },
+      meta_scan: (a) =>
+        String(a.text ?? "").includes("\\c")
+          ? [{ command: "\\c", line: 1, column: 1, offset: 0, text: "\\c prod", position: "line_start" }]
+          : [],
+    });
+
+    render(<App />);
+    openWorkflowEditor();
+    await user.click(await screen.findByRole("button", { name: "+ SQL" }));
+    const step = screen.getByRole("article", { name: /Step 1: SQL step/i });
+    await user.click(within(step).getByLabelText("Linked script from Library"));
+
+    await user.click(within(step).getByRole("button", { name: "+ New script" }));
+    const newDialog = await screen.findByRole("dialog", { name: "New script" });
+    const pathInput = within(newDialog).getByLabelText("New script path");
+    await user.clear(pathInput);
+    await user.type(pathInput, "post/seed.sql");
+    const bodyInput = within(newDialog).getByLabelText("New script content");
+    await user.clear(bodyInput);
+    await user.type(bodyInput, "INSERT INTO public.users (email) VALUES ('qa@example.test');");
+    await user.click(within(newDialog).getByRole("button", { name: "Create script" }));
+
+    expect(calls.find((c) => c.cmd === "script_save")?.args).toEqual({
+      path: "post/seed.sql",
+      content: "INSERT INTO public.users (email) VALUES ('qa@example.test');",
+    });
+    expect(within(step).getByLabelText("Library script")).toHaveValue("new-script");
+
+    await user.click(within(step).getByRole("button", { name: "Edit script" }));
+    const editDialog = await screen.findByRole("dialog", { name: "Edit linked script" });
+    const editArea = await within(editDialog).findByLabelText("Linked script SQL");
+    expect(editArea).toHaveValue("INSERT INTO public.users (email) VALUES ('qa@example.test');");
+    await user.clear(editArea);
+    await user.type(editArea, "\\c prod");
+    expect(await within(editDialog).findByRole("alert")).toHaveTextContent(/\\c \(line 1\)/);
+    await user.clear(editArea);
+    await user.type(editArea, "DELETE FROM public.users;");
+    await user.click(within(editDialog).getByRole("button", { name: "Save script" }));
+    expect(calls.find((c) => c.cmd === "script_write")?.args).toEqual({
+      id: "new-script",
+      content: "DELETE FROM public.users;",
+    });
+  });
 });

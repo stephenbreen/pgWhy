@@ -940,12 +940,18 @@ function SqlBody({
   params,
   idPrefix,
   onChange,
+  onOpenScript,
+  onEditScript,
+  onCreateScript,
 }: {
   step: w.SqlStep;
   scripts: ScriptInfo[];
   params: w.WorkflowParam[];
   idPrefix: string;
   onChange: (next: w.SqlStep) => void;
+  onOpenScript?: (scriptId: string) => void;
+  onEditScript?: (scriptId: string) => void;
+  onCreateScript?: (bind: (scriptId: string) => void) => void;
 }) {
   const switchSource = (source: "inline" | "library") => {
     if (source === step.source) return;
@@ -1023,23 +1029,61 @@ function SqlBody({
           )}
         </>
       ) : (
-        <label>
-          Library script
-          <select
-            aria-label="Library script"
-            value={step.script_id}
-            onChange={(e) => onChange({ ...step, script_id: e.target.value })}
-          >
-            <option value="">choose script…</option>
-            {scripts
-              .filter((s) => /\.sql$/i.test(s.path))
-              .map((s) => (
-                <option key={s.id} value={s.id} disabled={s.missing}>
-                  {s.path}
-                </option>
-              ))}
-          </select>
-        </label>
+        <div className="wf-linked-script-bar">
+          <label className="grow">
+            Library script
+            <select
+              aria-label="Library script"
+              value={step.script_id}
+              onChange={(e) => onChange({ ...step, script_id: e.target.value })}
+            >
+              <option value="">choose script…</option>
+              {scripts
+                .filter((s) => /\.sql$/i.test(s.path))
+                .map((s) => (
+                  <option key={s.id} value={s.id} disabled={s.missing}>
+                    {s.path}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <div className="wf-linked-script-actions">
+            {onEditScript && (
+              <button
+                type="button"
+                disabled={!step.script_id}
+                onClick={() => onEditScript(step.script_id)}
+              >
+                Edit script
+              </button>
+            )}
+            {onOpenScript && (
+              <button
+                type="button"
+                disabled={!step.script_id}
+                onClick={() => onOpenScript(step.script_id)}
+              >
+                Open tab
+              </button>
+            )}
+            {onCreateScript && (
+              <button
+                type="button"
+                onClick={() =>
+                  onCreateScript((scriptId) =>
+                    onChange({
+                      ...step,
+                      source: "library",
+                      script_id: scriptId,
+                    }),
+                  )
+                }
+              >
+                + New script
+              </button>
+            )}
+          </div>
+        </div>
       )}
       <label className="check">
         <input
@@ -1203,6 +1247,9 @@ export function StepCard({
   onRemove,
   onConvertToSql,
   onRequestPreview,
+  onOpenScript,
+  onEditScript,
+  onCreateScript,
 }: {
   step: w.WorkflowStep;
   index: number;
@@ -1218,6 +1265,9 @@ export function StepCard({
   onRemove: () => void;
   onConvertToSql?: () => Promise<void>;
   onRequestPreview: () => void;
+  onOpenScript?: (scriptId: string) => void;
+  onEditScript?: (scriptId: string) => void;
+  onCreateScript?: (bind: (scriptId: string) => void) => void;
 }) {
   const idPrefix = useId();
   const [showPreview, setShowPreview] = useState(false);
@@ -1325,7 +1375,16 @@ export function StepCard({
           <UpdateMaskBody step={step} catalog={catalog} params={params} idPrefix={idPrefix} onChange={onChange} />
         )}
         {step.kind === "sql" && (
-          <SqlBody step={step} scripts={scripts} params={params} idPrefix={idPrefix} onChange={onChange} />
+          <SqlBody
+            step={step}
+            scripts={scripts}
+            params={params}
+            idPrefix={idPrefix}
+            onChange={onChange}
+            onOpenScript={onOpenScript}
+            onEditScript={onEditScript}
+            onCreateScript={onCreateScript}
+          />
         )}
         {step.kind === "verify" && (
           <VerifyBody step={step} catalog={catalog} params={params} idPrefix={idPrefix} onChange={onChange} />
