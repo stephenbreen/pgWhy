@@ -46,6 +46,20 @@ pub fn require_pg_restore(
     ))
 }
 
+/// Select `psql` for restoring plain-text `.sql` backups, or refuse with install instructions.
+pub fn require_psql(registry: &ToolRegistry) -> AppResult<DiscoveredTool> {
+    if let Some(tool) = registry.highest(ToolKind::Psql) {
+        return Ok(tool.clone());
+    }
+    Err(refusal(
+        registry,
+        ToolKind::Psql,
+        16,
+        |found| format!("psql {found} cannot be used"),
+        "psql is required to restore plain .sql backup files".to_string(),
+    ))
+}
+
 fn refusal(
     registry: &ToolRegistry,
     kind: ToolKind,
@@ -204,5 +218,14 @@ mod tests {
         assert!(w
             .message
             .contains("PostgreSQL 15, older than the source (PostgreSQL 17)"));
+    }
+
+    #[test]
+    fn require_psql_selects_highest_or_refuses() {
+        let err = require_psql(&reg(&[(ToolKind::PgRestore, 16)])).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ToolMissing);
+        assert!(err.message.contains("psql"));
+        let r = reg(&[(ToolKind::Psql, 15), (ToolKind::Psql, 17)]);
+        assert_eq!(require_psql(&r).unwrap().version.major, 17);
     }
 }

@@ -662,3 +662,102 @@ pub(crate) async fn complete(
     };
     Ok(())
 }
+
+/// Complete a swap for a run that paused after Verify (`RunStatus::PausedForInspection`,
+/// `renames_completed == 0`): runs the full `swap_into_place` state machine and persists every
+/// crash-recovery boundary.
+pub(crate) async fn complete_from_paused(
+    ops: &dyn RefreshOps,
+    maint: &dyn MaintenanceOps,
+    history: &crate::history::HistoryStore,
+    rec: &mut RunRecord,
+    timeout: Duration,
+) -> AppResult<()> {
+    let target = rec.target.database.clone();
+    let old = rec
+        .old_db
+        .clone()
+        .unwrap_or_else(|| crate::staging::old_name(&target));
+    let staging = rec
+        .staging_db
+        .clone()
+        .ok_or_else(|| AppError::internal("no staging name recorded"))?;
+    let run_id = rec.run_id.clone();
+    let owner = rec.workflow_id.0.clone();
+    let conn_id = rec.target.connection_id.clone();
+    let create_mode = rec.create_mode;
+    let in_window = AtomicBool::new(false);
+    let progress = SwapProgress {
+        phase: rec.swap_phase,
+        renames_completed: rec.renames_completed,
+        work_db_state: rec.work_db_state,
+        warnings: Vec::new(),
+    };
+    if let Some(step) = rec.step_mut(crate::history::StepId::Swap) {
+        step.status = crate::history::StepStatus::Running;
+        step.started_at = Some(crate::staging::now_rfc3339());
+        step.note = None;
+    }
+    let _ = history.save(rec);
+
+    let mut persist = |p: &SwapProgress| -> AppResult<()> {
+        rec.swap_phase = p.phase;
+        rec.renames_completed = p.renames_completed;
+        rec.work_db_state = p.work_db_state;
+        for w in &p.warnings {
+            if !rec.warnings.contains(w) {
+                rec.warnings.push(w.clone());
+            }
+        }
+        history.save(rec)
+    };
+    let job = SwapJob {
+        ops,
+        maint,
+        connection: &conn_id,
+        target: &target,
+        staging: &staging,
+        old: &old,
+        create_mode,
+        run_id: &run_id,
+        owner: &owner,
+        timeout,
+        cancel: None,
+        in_window: &in_window,
+        progress,
+        persist: &mut persist,
+    };
+    match swap_into_place(job).await {
+        Ok(out) => {
+            rec.swap_phase = out.progress.phase;
+            rec.renames_completed = out.progress.renames_completed;
+            rec.work_db_state = out.progress.work_db_state;
+            if let Some(step) = rec.step_mut(crate::history::StepId::Swap) {
+                step.status = crate::history::StepStatus::Succeeded;
+                step.finished_at = Some(crate::staging::now_rfc3339());
+            }
+            if let Some(e) = out.cleanup_error {
+                rec.warnings.push(format!(
+                    "the swap finished but {old} could not be dropped: {}",
+                    e.message
+                ));
+                rec.status = RunStatus::SucceededCleanupRequired;
+            } else {
+                rec.status = RunStatus::Succeeded;
+            }
+            rec.finished_at = Some(crate::staging::now_rfc3339());
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(step) = rec.step_mut(crate::history::StepId::Swap) {
+                step.status = crate::history::StepStatus::Failed;
+                step.finished_at = Some(crate::staging::now_rfc3339());
+                step.error = Some(e.clone());
+            }
+            rec.failed_step = Some(crate::history::StepId::Swap);
+            rec.error = Some(e.clone());
+            rec.status = RunStatus::FailedAtSwap;
+            Err(e)
+        }
+    }
+}

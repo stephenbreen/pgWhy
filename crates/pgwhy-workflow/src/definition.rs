@@ -54,6 +54,15 @@ pub struct DbRef {
     pub database: String,
 }
 
+impl Default for DbRef {
+    fn default() -> Self {
+        Self {
+            connection: ConnectionId(String::new()),
+            database: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplaceStrategy {
@@ -100,6 +109,9 @@ pub struct RefreshOptions {
     /// Replaces the default verify check (connect + at least one user table). Passes when the
     /// query succeeds.
     pub sanity_query: Option<String>,
+    /// Default toggle for pausing after Verify so the user can inspect staging before swapping.
+    #[serde(default)]
+    pub pause_before_swap: bool,
 }
 
 impl Default for RefreshOptions {
@@ -113,6 +125,7 @@ impl Default for RefreshOptions {
             error_policy: ErrorPolicy::StopOnFirst,
             script_mode: ScriptMode::Transaction,
             sanity_query: None,
+            pause_before_swap: false,
         }
     }
 }
@@ -136,16 +149,35 @@ pub struct RememberedConfirmation {
     pub remembered_at: String,
 }
 
+fn default_v1_schema_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefreshWorkflow {
+    /// Schema version (`1` for legacy v1 TOML files; `2` for unified Workflows v2 pipelines).
+    #[serde(default = "default_v1_schema_version")]
+    pub schema_version: u32,
     #[serde(default)]
     pub id: WorkflowId,
     pub name: String,
+    /// Legacy v1 source reference (also synced with `FromRemoteDb` for backward compatibility).
+    #[serde(default)]
     pub source: DbRef,
+    /// Workflows v2 entry mode (`from_remote_db`, `from_backup_file`, or `in_place_target`).
+    /// When `None`, defaults to `FromRemoteDb { source }` for v1 compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mode: Option<crate::pipeline::WorkflowSource>,
     pub target: DbRef,
-    /// Stable library script id.
+    /// Legacy v1 stable library script id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_restore_script: Option<String>,
+    /// Workflows v2 typed runtime parameters (`{{param_name}}`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<crate::pipeline::WorkflowParam>,
+    /// Workflows v2 ordered visual / SQL / verify steps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<crate::pipeline::WorkflowStep>,
     #[serde(default)]
     pub options: RefreshOptions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,8 +188,53 @@ pub struct RefreshWorkflow {
 }
 
 impl RefreshWorkflow {
-    /// Fingerprint of everything a confirmation vouches for: source, target, strategy and the
-    /// post-restore script (id + content hash). Any change invalidates a remembered one.
+    /// Resolve the effective entry mode, auto-mapping legacy v1 definitions to `FromRemoteDb`.
+    pub fn effective_source(&self) -> crate::pipeline::WorkflowSource {
+        self.source_mode
+            .clone()
+            .unwrap_or_else(|| crate::pipeline::WorkflowSource::FromRemoteDb {
+                source: self.source.clone(),
+            })
+    }
+
+    /// Resolve the effective ordered steps, auto-mapping legacy v1 `post_restore_script` into a
+    /// single linked-library `Sql` step when `steps` is empty.
+    pub fn effective_steps(&self) -> Vec<crate::pipeline::WorkflowStep> {
+        if !self.steps.is_empty() {
+            return self.steps.clone();
+        }
+        if let Some(sid) = &self.post_restore_script {
+            return vec![crate::pipeline::WorkflowStep {
+                id: "legacy_post_restore".into(),
+                name: "Post-restore script".into(),
+                enabled: true,
+                no_transaction: self.options.script_mode == ScriptMode::NoTransaction,
+                kind: crate::pipeline::StepKind::Sql {
+                    body: crate::pipeline::SqlStepBody::Library {
+                        script_id: sid.clone(),
+                    },
+                },
+            }];
+        }
+        Vec::new()
+    }
+
+    /// True if this workflow uses Workflows v2 features (non-remote entry mode, visual/multi steps,
+    /// or runtime parameters).
+    pub fn is_v2_pipeline(&self) -> bool {
+        self.source_mode.is_some() || !self.steps.is_empty() || !self.parameters.is_empty()
+    }
+
+    /// True when this workflow targets an existing database in place (no restore/swap).
+    pub fn is_in_place(&self) -> bool {
+        matches!(
+            self.effective_source(),
+            crate::pipeline::WorkflowSource::InPlaceTarget { .. }
+        )
+    }
+
+    /// Fingerprint of everything a confirmation vouches for: source/mode, target, strategy,
+    /// steps, parameters, and linked script hashes. Any change invalidates a remembered one.
     pub fn confirmation_fingerprint(&self, script_hash: Option<&str>) -> String {
         let mut h = Sha256::new();
         for part in [
@@ -175,10 +252,23 @@ impl RefreshWorkflow {
             h.update(part.as_bytes());
             h.update([0]);
         }
+        if self.is_v2_pipeline() {
+            if let Ok(json) = serde_json::to_string(&(
+                &self.source_mode,
+                &self.parameters,
+                &self.steps,
+                self.options.pause_before_swap,
+            )) {
+                h.update(json.as_bytes());
+                h.update([0]);
+            }
+        }
         hex(h.finalize().as_slice())
     }
 
     /// Whether the single confirmation may be skipped for this run.
+    /// Strictly limited to `Local` targets after at least one successful run — never allowed on
+    /// `Dev`, `Staging`, or `Production`.
     pub fn confirmation_remembered(
         &self,
         target: &ConnectionEntry,
@@ -191,19 +281,85 @@ impl RefreshWorkflow {
                 .as_ref()
                 .is_some_and(|r| r.fingerprint == self.confirmation_fingerprint(script_hash))
     }
+
+    /// Export this workflow as a shareable v2 TOML string, stripping local confirmation state and
+    /// ensuring no `Secret` parameter defaults are ever exported.
+    pub fn export_toml(&self) -> AppResult<String> {
+        let mut clean = self.clone();
+        clean.schema_version = crate::pipeline::WORKFLOW_SCHEMA_VERSION;
+        clean.remembered_confirmation = None;
+        clean.has_succeeded = false;
+        if clean.source_mode.is_none() {
+            clean.source_mode = Some(clean.effective_source());
+        }
+        if clean.steps.is_empty() && clean.post_restore_script.is_some() {
+            clean.steps = clean.effective_steps();
+            clean.post_restore_script = None;
+        }
+        for p in &mut clean.parameters {
+            if p.kind == crate::pipeline::ParamType::Secret {
+                p.default = None;
+            }
+        }
+        toml::to_string_pretty(&clean).map_err(|e| {
+            AppError::internal("could not export the workflow as TOML").with_detail(e.to_string())
+        })
+    }
+
+    /// Parse and sanitize a shareable v1 or v2 workflow TOML string for import.
+    pub fn import_toml(text: &str) -> AppResult<Self> {
+        let mut wf: Self = toml::from_str(text).map_err(|e| {
+            AppError::new(ErrorKind::Config, "not a valid workflow TOML file")
+                .with_detail(e.to_string())
+        })?;
+        wf.id.validate()?;
+        wf.schema_version = crate::pipeline::WORKFLOW_SCHEMA_VERSION;
+        wf.remembered_confirmation = None;
+        wf.has_succeeded = false;
+        if wf.source_mode.is_none() {
+            wf.source_mode = Some(crate::pipeline::WorkflowSource::FromRemoteDb {
+                source: wf.source.clone(),
+            });
+        }
+        if wf.steps.is_empty() && wf.post_restore_script.is_some() {
+            wf.steps = wf.effective_steps();
+            wf.post_restore_script = None;
+        }
+        for p in &mut wf.parameters {
+            if p.kind == crate::pipeline::ParamType::Secret {
+                p.default = None;
+            }
+            p.validate()?;
+        }
+        Ok(wf)
+    }
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Save-time and run-time validation that doesn't need a server: the environment-tag gate and
-/// source ≠ target.
+/// Save-time and run-time validation that doesn't need a server (legacy v1 signature).
 pub fn validate(
     wf: &RefreshWorkflow,
     source: &ConnectionEntry,
     target: &ConnectionEntry,
 ) -> AppResult<()> {
+    validate_workflow(wf, Some(source), target)
+}
+
+/// Save-time and run-time validation for Workflows v1 & v2.
+///
+/// Workflows are allowed on every environment (`Local`, `Dev`, `Staging`, `Production`); Staging
+/// and Production runs are protected by backend-enforced typed database-name confirmation in
+/// preflight and start.
+pub fn validate_workflow(
+    wf: &RefreshWorkflow,
+    source: Option<&ConnectionEntry>,
+    target: &ConnectionEntry,
+) -> AppResult<()> {
+    use crate::pipeline::{BackupSource, WorkflowSource};
+
     wf.id.validate()?;
     if wf.name.trim().is_empty() {
         return Err(AppError::new(
@@ -211,36 +367,65 @@ pub fn validate(
             "the workflow needs a name",
         ));
     }
-    if wf.source.database.trim().is_empty() || wf.target.database.trim().is_empty() {
-        return Err(AppError::new(
-            ErrorKind::Config,
-            "choose both a source and a target database",
-        ));
+    if wf.target.database.trim().is_empty() {
+        return Err(AppError::new(ErrorKind::Config, "choose a target database"));
     }
-    if !target.env_tag.allows_destructive_target() {
+    let effective_source = wf.effective_source();
+    match &effective_source {
+        WorkflowSource::FromRemoteDb { source: src_ref } => {
+            if src_ref.database.trim().is_empty() {
+                return Err(AppError::new(
+                    ErrorKind::Config,
+                    "choose both a source and a target database",
+                ));
+            }
+            let src = source.ok_or_else(|| {
+                AppError::new(
+                    ErrorKind::Config,
+                    "choose a source connection for a remote database workflow",
+                )
+            })?;
+            if src.server_key() == target.server_key() && src_ref.database == wf.target.database {
+                return Err(AppError::new(
+                    ErrorKind::Refused,
+                    "the source and target are the same database",
+                ));
+            }
+        }
+        WorkflowSource::FromBackupFile { archive } => match archive {
+            BackupSource::FixedPath { path } if path.as_os_str().is_empty() => {
+                return Err(AppError::new(
+                    ErrorKind::Config,
+                    "choose a backup archive path",
+                ));
+            }
+            BackupSource::LatestFromHistory { database, .. } if database.trim().is_empty() => {
+                return Err(AppError::new(
+                    ErrorKind::Config,
+                    "choose the source database whose latest backup should be restored",
+                ));
+            }
+            _ => {}
+        },
+        WorkflowSource::InPlaceTarget { .. } => {}
+    }
+
+    // Renames / drops cannot run while connected to the target database as maintenance_db.
+    if !matches!(effective_source, WorkflowSource::InPlaceTarget { .. })
+        && wf.target.database == target.maintenance_db
+    {
         return Err(AppError::new(
             ErrorKind::Refused,
             format!(
-                "\"{}\" is tagged {}; a Refresh workflow can only replace databases on Local or Dev connections",
-                target.name,
-                target.env_tag.label()
+                "the target database {} is the connection's maintenance database",
+                wf.target.database
             ),
         )
-        .with_hint("re-tag the connection if it really is a local or dev server"));
-    }
-    if source.server_key() == target.server_key() && wf.source.database == wf.target.database {
-        return Err(AppError::new(
-            ErrorKind::Refused,
-            "the source and target are the same database",
+        .with_hint(
+            "set a different maintenance database on the target connection (renames can't run from inside the target)",
         ));
     }
-    if wf.target.database == target.maintenance_db {
-        return Err(AppError::new(
-            ErrorKind::Refused,
-            format!("the target database {} is the connection's maintenance database", wf.target.database),
-        )
-        .with_hint("set a different maintenance database on the target connection (renames can't run from inside the target)"));
-    }
+
     if wf
         .options
         .sanity_query
@@ -251,6 +436,41 @@ pub fn validate(
             ErrorKind::Config,
             "the sanity query is empty",
         ));
+    }
+
+    // Validate declared parameters (syntax, secret no-default rule, uniqueness).
+    let mut seen_params = std::collections::HashSet::new();
+    for p in &wf.parameters {
+        p.validate()?;
+        if !seen_params.insert(p.name.as_str()) {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                format!("duplicate workflow parameter \"{}\"", p.name),
+            ));
+        }
+    }
+
+    // Validate step ids and names.
+    let mut seen_steps = std::collections::HashSet::new();
+    for step in &wf.steps {
+        if step.id.trim().is_empty() {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                "every workflow step needs an id",
+            ));
+        }
+        if !seen_steps.insert(step.id.as_str()) {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                format!("duplicate workflow step id \"{}\"", step.id),
+            ));
+        }
+        if step.name.trim().is_empty() {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                format!("step \"{}\" needs a name", step.id),
+            ));
+        }
     }
     Ok(())
 }
@@ -352,17 +572,21 @@ mod tests {
 
     fn wf(source: &ConnectionEntry, target: &ConnectionEntry) -> RefreshWorkflow {
         RefreshWorkflow {
+            schema_version: crate::pipeline::WORKFLOW_SCHEMA_VERSION,
             id: WorkflowId::new(),
             name: "Refresh local".into(),
             source: DbRef {
                 connection: source.id.clone(),
                 database: "app".into(),
             },
+            source_mode: None,
             target: DbRef {
                 connection: target.id.clone(),
                 database: "app".into(),
             },
             post_restore_script: None,
+            parameters: Vec::new(),
+            steps: Vec::new(),
             options: RefreshOptions::default(),
             remembered_confirmation: None,
             has_succeeded: false,
@@ -370,16 +594,28 @@ mod tests {
     }
 
     #[test]
-    fn production_and_staging_targets_are_refused() {
+    fn workflows_allowed_on_all_environments_but_remember_only_on_local() {
         let src = conn("remote", EnvTag::Production);
-        for tag in [EnvTag::Production, EnvTag::Staging] {
-            let tgt = conn("local", tag);
-            let err = validate(&wf(&src, &tgt), &src, &tgt).unwrap_err();
-            assert_eq!(err.kind, ErrorKind::Refused);
-            assert!(err.message.contains("Local or Dev"), "{}", err.message);
+        for tag in [
+            EnvTag::Production,
+            EnvTag::Staging,
+            EnvTag::Dev,
+            EnvTag::Local,
+        ] {
+            let tgt = conn("target", tag);
+            let mut w = wf(&src, &tgt);
+            validate(&w, &src, &tgt).unwrap();
+            w.has_succeeded = true;
+            w.remembered_confirmation = Some(RememberedConfirmation {
+                fingerprint: w.confirmation_fingerprint(None),
+                remembered_at: "now".into(),
+            });
+            assert_eq!(
+                w.confirmation_remembered(&tgt, None),
+                tag == EnvTag::Local,
+                "remembered confirmation must only apply on Local (not {tag:?})"
+            );
         }
-        let tgt = conn("local", EnvTag::Local);
-        validate(&wf(&src, &tgt), &src, &tgt).unwrap();
     }
 
     #[test]
@@ -440,5 +676,67 @@ mod tests {
         assert_eq!(store.get(&w.id).unwrap(), w);
         store.delete(&w.id).unwrap();
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn v1_toml_loads_and_maps_to_v2_pipeline() {
+        let v1_toml = r#"
+id = "wf-legacy"
+name = "Legacy Refresh"
+post_restore_script = "scrub-users"
+has_succeeded = true
+
+[source]
+connection = "src-1"
+database = "prod_app"
+
+[target]
+connection = "tgt-1"
+database = "local_app"
+
+[options]
+strategy = "staging_swap"
+"#;
+        let wf: RefreshWorkflow = toml::from_str(v1_toml).unwrap();
+        assert_eq!(wf.schema_version, 1);
+        assert_eq!(
+            wf.effective_source(),
+            crate::pipeline::WorkflowSource::FromRemoteDb {
+                source: DbRef {
+                    connection: ConnectionId("src-1".into()),
+                    database: "prod_app".into(),
+                }
+            }
+        );
+        let steps = wf.effective_steps();
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(
+            &steps[0].kind,
+            crate::pipeline::StepKind::Sql {
+                body: crate::pipeline::SqlStepBody::Library { script_id }
+            } if script_id == "scrub-users"
+        ));
+    }
+
+    #[test]
+    fn export_and_import_strip_secrets_and_local_confirmations() {
+        let mut wf = crate::pipeline::starter_templates()[0].workflow.clone();
+        wf.has_succeeded = true;
+        wf.remembered_confirmation = Some(RememberedConfirmation {
+            fingerprint: "abc".into(),
+            remembered_at: "now".into(),
+        });
+        wf.parameters[0].default = Some("should-never-be-exported".into());
+        let exported = wf.export_toml().unwrap();
+        assert!(!exported.contains("should-never-be-exported"));
+        assert!(!exported.contains("remembered_confirmation"));
+        let imported = RefreshWorkflow::import_toml(&exported).unwrap();
+        assert_eq!(
+            imported.schema_version,
+            crate::pipeline::WORKFLOW_SCHEMA_VERSION
+        );
+        assert!(!imported.has_succeeded);
+        assert!(imported.remembered_confirmation.is_none());
+        assert!(imported.parameters[0].default.is_none());
     }
 }

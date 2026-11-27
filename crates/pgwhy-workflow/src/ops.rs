@@ -45,6 +45,28 @@ pub struct Resume {
     pub drop_before_create: Vec<String>,
 }
 
+/// One compiled, ready-to-execute v2 step held in memory only for the duration of a run.
+#[derive(Debug, Clone)]
+pub enum CompiledExec {
+    Sql {
+        sql: String,
+        preview_sql: String,
+    },
+    Verify {
+        assertion: crate::pipeline::VerifyAssertion,
+        sql: String,
+        preview_sql: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledPipelineStep {
+    pub step_id: String,
+    pub step_name: String,
+    pub no_transaction: bool,
+    pub exec: CompiledExec,
+}
+
 /// Everything a run needs, resolved by preflight before the confirmation: entries
 /// and tags snapshotted at run start, tools, names, locale, the script snapshot and
 /// credentials — held in memory only for the run.
@@ -59,8 +81,24 @@ pub struct RunPlan {
     /// The target did not exist at preflight.
     pub create_mode: bool,
     pub tools: Option<PlannedTools>,
+    /// Standalone `pg_dump` (used by `in_place_target` with `pre_run_backup: true`).
+    pub pg_dump_tool: Option<DiscoveredTool>,
+    /// Standalone `pg_restore` (used by `from_backup_file` Custom/Directory).
+    pub pg_restore_tool: Option<DiscoveredTool>,
+    /// Discovered `psql` (used by `from_backup_file` Plain `.sql`).
+    pub psql_tool: Option<DiscoveredTool>,
+    /// Pre-existing archive for `from_backup_file` workflows.
+    pub external_archive: Option<(BackupRecord, pgwhy_pgtools::ArchiveKind)>,
     pub locale: Option<LocaleSpec>,
     pub script: Option<ScriptRecord>,
+    /// Compiled v2 transform + verify steps (held in memory only; may hold substituted secrets).
+    pub pipeline: Vec<CompiledPipelineStep>,
+    /// Pause after Verify so the user can inspect staging before swapping or dropping.
+    pub pause_before_swap: bool,
+    /// In-place dry run: execute transforms + verify in one transaction and unconditionally ROLLBACK.
+    pub dry_run: bool,
+    /// Take a pre-run safety backup of target before mutating (`in_place_target`).
+    pub pre_run_backup: bool,
     pub source_password: Option<ToolPassword>,
     pub target_password: Option<ToolPassword>,
     pub credentials: CredentialsRecord,
@@ -88,6 +126,11 @@ impl RunPlan {
     ) -> Self {
         let target_db = workflow.target.database.clone();
         let fingerprint = workflow.confirmation_fingerprint(None);
+        let pause_before_swap = workflow.options.pause_before_swap;
+        let pre_run_backup = match workflow.effective_source() {
+            crate::pipeline::WorkflowSource::InPlaceTarget { pre_run_backup } => pre_run_backup,
+            _ => false,
+        };
         Self {
             run_id: RunId::new(),
             staging_db: staging::staging_name(&target_db, &staging::compact_timestamp(now)),
@@ -97,8 +140,16 @@ impl RunPlan {
             target,
             create_mode: false,
             tools: None,
+            pg_dump_tool: None,
+            pg_restore_tool: None,
+            psql_tool: None,
+            external_archive: None,
             locale: None,
             script: None,
+            pipeline: Vec::new(),
+            pause_before_swap,
+            dry_run: false,
+            pre_run_backup,
             source_password: None,
             target_password: None,
             credentials: CredentialsRecord {
@@ -121,11 +172,34 @@ impl RunPlan {
     }
 
     pub fn source_db(&self) -> &str {
-        &self.workflow.source.database
+        match self.workflow.effective_source() {
+            crate::pipeline::WorkflowSource::FromRemoteDb { source } => {
+                if !source.database.is_empty() {
+                    return &self.workflow.source.database;
+                }
+                &self.workflow.source.database
+            }
+            _ => &self.workflow.source.database,
+        }
     }
 
-    /// The database restores go into.
+    pub fn resolved_pg_dump(&self) -> Option<&DiscoveredTool> {
+        self.pg_dump_tool
+            .as_ref()
+            .or_else(|| self.tools.as_ref().map(|t| &t.pg_dump))
+    }
+
+    pub fn resolved_pg_restore(&self) -> Option<&DiscoveredTool> {
+        self.pg_restore_tool
+            .as_ref()
+            .or_else(|| self.tools.as_ref().map(|t| &t.pg_restore))
+    }
+
+    /// The database transforms / restores target.
     pub fn work_db(&self) -> &str {
+        if self.workflow.is_in_place() {
+            return self.target_db();
+        }
         match self.workflow.options.strategy {
             crate::definition::ReplaceStrategy::StagingSwap => &self.staging_db,
             crate::definition::ReplaceStrategy::DropFirst => self.target_db(),
@@ -135,20 +209,51 @@ impl RunPlan {
     /// The steps of this run, in order (before resume is applied).
     pub fn steps(&self) -> Vec<StepId> {
         use crate::definition::ReplaceStrategy::*;
-        let mut s = vec![StepId::Dump];
-        if self.workflow.options.strategy == DropFirst {
-            s.push(StepId::DropTarget);
+        use crate::pipeline::WorkflowSource;
+
+        match self.workflow.effective_source() {
+            WorkflowSource::InPlaceTarget { .. } => {
+                let mut s = Vec::new();
+                if self.pre_run_backup && !self.dry_run {
+                    s.push(StepId::Dump);
+                }
+                s.push(StepId::PostRestore);
+                s.push(StepId::Verify);
+                s
+            }
+            WorkflowSource::FromBackupFile { .. } => {
+                let mut s = Vec::new();
+                if self.workflow.options.strategy == DropFirst {
+                    s.push(StepId::DropTarget);
+                }
+                s.extend([
+                    StepId::CreateDatabase,
+                    StepId::Restore,
+                    StepId::PostRestore,
+                    StepId::Verify,
+                ]);
+                if self.workflow.options.strategy == StagingSwap {
+                    s.push(StepId::Swap);
+                }
+                s
+            }
+            WorkflowSource::FromRemoteDb { .. } => {
+                let mut s = vec![StepId::Dump];
+                if self.workflow.options.strategy == DropFirst {
+                    s.push(StepId::DropTarget);
+                }
+                s.extend([
+                    StepId::CreateDatabase,
+                    StepId::Restore,
+                    StepId::PostRestore,
+                    StepId::Verify,
+                ]);
+                if self.workflow.options.strategy == StagingSwap {
+                    s.push(StepId::Swap);
+                }
+                s
+            }
         }
-        s.extend([
-            StepId::CreateDatabase,
-            StepId::Restore,
-            StepId::PostRestore,
-            StepId::Verify,
-        ]);
-        if self.workflow.options.strategy == StagingSwap {
-            s.push(StepId::Swap);
-        }
-        s
     }
 }
 
@@ -376,6 +481,84 @@ pub trait RefreshOps: Send + Sync {
         target: &'a ConnectionId,
         dbs: Vec<String>,
     ) -> BoxFuture<'a, AppResult<QuiesceToken>>;
+
+    /// Restore a plain-text `.sql` backup via `psql` into `into_db`.
+    fn restore_plain_sql<'a>(
+        &'a self,
+        _plan: &'a RunPlan,
+        _sql_path: &'a Path,
+        _into_db: &'a str,
+        _log: &'a Path,
+        _ctx: &'a OpCtx,
+    ) -> BoxFuture<'a, AppResult<ToolStepDone>> {
+        Box::pin(async move {
+            Err(AppError::new(
+                ErrorKind::ToolMissing,
+                "plain .sql restore is not supported by this ops implementation",
+            ))
+        })
+    }
+
+    /// Take a pre-run safety backup of the target database (`in_place_target`).
+    fn dump_target<'a>(
+        &'a self,
+        _plan: &'a RunPlan,
+        _out: &'a Path,
+        _log: &'a Path,
+        _ctx: &'a OpCtx,
+    ) -> BoxFuture<'a, AppResult<DumpDone>> {
+        Box::pin(async move {
+            Err(AppError::new(
+                ErrorKind::ToolMissing,
+                "target pre-run backup is not supported by this ops implementation",
+            ))
+        })
+    }
+
+    /// Execute v2 compiled transform steps (and optionally verify steps inside the same transaction
+    /// for in-place runs or dry-run rollback previews) against `db`.
+    fn run_pipeline<'a>(
+        &'a self,
+        _plan: &'a RunPlan,
+        _db: &'a str,
+        _steps: &'a [CompiledPipelineStep],
+        _dry_run: bool,
+        _ctx: &'a OpCtx,
+    ) -> BoxFuture<'a, AppResult<PipelineRunDone>> {
+        Box::pin(async move {
+            Ok(PipelineRunDone {
+                results: Vec::new(),
+                output_tail: Vec::new(),
+                any_mutated_outside_txn: false,
+            })
+        })
+    }
+
+    /// Evaluate v2 structured `Verify` assertions against `db`.
+    fn run_verify_steps<'a>(
+        &'a self,
+        _plan: &'a RunPlan,
+        _db: &'a str,
+        _steps: &'a [CompiledPipelineStep],
+        _ctx: &'a OpCtx,
+    ) -> BoxFuture<'a, AppResult<PipelineRunDone>> {
+        Box::pin(async move {
+            Ok(PipelineRunDone {
+                results: Vec::new(),
+                output_tail: Vec::new(),
+                any_mutated_outside_txn: false,
+            })
+        })
+    }
+}
+
+/// Outcome of executing a batch of compiled v2 pipeline or verify steps.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineRunDone {
+    pub results: Vec<crate::history::PipelineStepResult>,
+    pub output_tail: Vec<String>,
+    /// True if any step ran outside a transaction before failing (staging is mutated).
+    pub any_mutated_outside_txn: bool,
 }
 
 /// Statements on the target server's maintenance database.

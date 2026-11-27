@@ -587,17 +587,21 @@ pub fn workflow(
     strategy: ReplaceStrategy,
 ) -> RefreshWorkflow {
     RefreshWorkflow {
+        schema_version: WORKFLOW_SCHEMA_VERSION,
         id: WorkflowId("wf-1".into()),
         name: "Refresh app".into(),
         source: DbRef {
             connection: source.id.clone(),
             database: "app".into(),
         },
+        source_mode: None,
         target: DbRef {
             connection: target.id.clone(),
             database: "app".into(),
         },
         post_restore_script: None,
+        parameters: Vec::new(),
+        steps: Vec::new(),
         options: RefreshOptions {
             strategy,
             ..RefreshOptions::default()

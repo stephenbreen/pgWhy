@@ -195,17 +195,21 @@ impl Env {
             self.lib.lock().unwrap().save(&name, content).unwrap().id.0
         });
         let wf = RefreshWorkflow {
+            schema_version: WORKFLOW_SCHEMA_VERSION,
             id: WorkflowId::new(),
             name: format!("Refresh {target_db}"),
             source: DbRef {
                 connection: self.src.id.clone(),
                 database: "shop".into(),
             },
+            source_mode: None,
             target: DbRef {
                 connection: self.tgt.id.clone(),
                 database: target_db.into(),
             },
             post_restore_script: script_id,
+            parameters: Vec::new(),
+            steps: Vec::new(),
             options: RefreshOptions {
                 strategy,
                 ..RefreshOptions::default()
@@ -229,6 +233,7 @@ impl Env {
                 StartRequest {
                     fingerprint: fp,
                     remember: false,
+                    ..Default::default()
                 },
                 Arc::new(|_| {}),
             )
@@ -583,14 +588,34 @@ async fn preflight_refusals_are_actionable_and_harmless() {
     env.engine
         .discard_preflight(report.ticket.as_deref().unwrap());
 
-    // the target re-tagged Production outside the workflow editor → the environment-tag re-check refuses
+    // the target re-tagged Production outside the workflow editor → preflight warns, requires
+    // exact typed database-name confirmation, blocks "remember", and start refuses without it
     let mut prod = env.tgt.clone();
     prod.env_tag = EnvTag::Production;
     env.manager.upsert_entry(prod).await;
     let report = env.engine.preflight(&wf, vec![]).await;
     let c = check(&report, "environment_tag");
-    assert_eq!(c.status, CheckStatus::Fail);
-    assert!(c.message.contains("Local or Dev"));
+    assert_eq!(c.status, CheckStatus::Warn);
+    let conf = report.confirmation.as_ref().expect("confirmation present");
+    assert!(conf.requires_typed_name);
+    assert!(!conf.can_remember);
+    assert!(!conf.remembered);
+    let ticket = report.ticket.as_deref().unwrap();
+    let err = env
+        .engine
+        .start(
+            ticket,
+            StartRequest {
+                fingerprint: conf.fingerprint.clone(),
+                remember: false,
+                typed_name: None,
+                ..Default::default()
+            },
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, pgwhy_core::ErrorKind::Refused);
     env.manager.upsert_entry(env.tgt.clone()).await;
 
     // nothing was touched
@@ -774,6 +799,7 @@ async fn kill_between_renames_recovers_by_rollback() {
             StartRequest {
                 fingerprint: fp,
                 remember: false,
+                ..Default::default()
             },
             Arc::new(|_| {}),
         )

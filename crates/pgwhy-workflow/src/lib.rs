@@ -10,6 +10,7 @@
 //! - [`Engine::reinventory`] / [`Engine::perform`] for the state-aware [`ActionOffer`]s on a
 //!   [`RunRecord`]; [`Engine::list_runs`] / [`Engine::get_run`] for history.
 
+pub mod compiler;
 pub mod definition;
 pub mod destructive;
 pub mod engine;
@@ -17,6 +18,7 @@ pub mod history;
 pub mod lifecycle;
 pub mod lock;
 pub mod ops;
+pub mod pipeline;
 pub mod preflight;
 pub mod real;
 pub mod restore;
@@ -24,27 +26,37 @@ pub mod retry;
 pub mod staging;
 mod swap;
 
+pub use compiler::{compile_step, compile_steps, convert_step_to_sql, CompileMode, CompiledStep};
 pub use definition::{
-    DbRef, ErrorPolicy, RefreshOptions, RefreshWorkflow, RememberedConfirmation, ReplaceStrategy,
-    ScriptMode, WorkflowId, WorkflowStore,
+    validate_workflow, DbRef, ErrorPolicy, RefreshOptions, RefreshWorkflow, RememberedConfirmation,
+    ReplaceStrategy, ScriptMode, WorkflowId, WorkflowStore,
 };
 pub use destructive::{acquire_lock, check_target, require_typed_name, DestructiveContext};
 pub use engine::{Engine, EngineConfig, EventSink, RunEvent, StartRequest};
 pub use history::{
     ActionKind, ActionOffer, BackupRecord, ConnectionRef, DbPresence, EndpointRecord,
     HistoryBackup, HistoryEntry, HistoryKind, HistoryStore, Inventory, OperationDetail,
-    OperationKind, OperationRecord, OperationStep, RestoreDetail, RestoreMode, RetryOffer, RunId,
-    RunRecord, RunStatus, ScriptRecord, SessionInfo, StepId, StepRecord, StepStatus, SwapPhase,
-    SwapState, WorkDbState,
+    OperationKind, OperationRecord, OperationStep, PipelineStepResult, RestoreDetail, RestoreMode,
+    RetryOffer, RunId, RunRecord, RunStatus, ScriptRecord, SessionInfo, StepId, StepRecord,
+    StepStatus, SwapPhase, SwapState, WorkDbState,
 };
 pub use lifecycle::{
     check_drop, CreateDatabaseRequest, DbTarget, DropDatabaseRequest, RenameDatabaseRequest,
 };
 pub use lock::{RunLockGuard, RunLocks};
-pub use ops::{MaintenanceOps, RefreshOps, RunPlan, StepProgress};
+pub use ops::{
+    CompiledExec, CompiledPipelineStep, MaintenanceOps, PipelineRunDone, RefreshOps, RunPlan,
+    StepProgress,
+};
+pub use pipeline::{
+    starter_templates, BackupSource, CellValue, CompareOp, ConflictPolicy, CustomVerifyExpect,
+    DeleteMode, FilterOp, LogicalOp, MaskAssignment, MaskTransform, ParamType, Predicate,
+    SqlStepBody, StepKind, VerifyAssertion, WorkflowParam, WorkflowSource, WorkflowStep,
+    WorkflowTemplate, WORKFLOW_SCHEMA_VERSION,
+};
 pub use preflight::{
     CheckStatus, Confirmation, MissingSecret, PreflightCheck, PreflightFix, PreflightFixKind,
-    PreflightReport, SecretNeed,
+    PreflightOptions, PreflightReport, SecretNeed,
 };
 pub use real::{LoadedScript, RealDeps, RealOps, ScriptSource};
 pub use restore::{

@@ -78,6 +78,21 @@ pub fn parse_line(tool: ToolKind, line: &str) -> LineEvent {
     let Some(body) = body else {
         return LineEvent::Unknown;
     };
+    if tool == ToolKind::Psql {
+        if let Some(rest) = body
+            .strip_prefix("ERROR: ")
+            .or_else(|| body.strip_prefix("error: "))
+        {
+            return LineEvent::Error(rest.to_string());
+        }
+        if let Some(rest) = body
+            .strip_prefix("WARNING: ")
+            .or_else(|| body.strip_prefix("warning: "))
+        {
+            return LineEvent::Warning(rest.to_string());
+        }
+        return LineEvent::Unknown;
+    }
     if let Some(rest) = body.strip_prefix("error: ") {
         return LineEvent::Error(rest.to_string());
     }
@@ -87,12 +102,20 @@ pub fn parse_line(tool: ToolKind, line: &str) -> LineEvent {
     match tool {
         ToolKind::PgDump => parse_dump(body),
         ToolKind::PgRestore => parse_restore(body),
+        ToolKind::Psql => LineEvent::Unknown,
     }
 }
 
-/// `pg_dump: xxx` / `pg_restore: xxx` → `xxx` (also tolerates Windows `pg_dump.exe:`).
+/// `pg_dump: xxx` / `pg_restore: xxx` / `psql: xxx` → `xxx` (also tolerates Windows `.exe`).
 fn strip_prog_prefix(line: &str) -> Option<&str> {
-    for prog in ["pg_dump", "pg_restore", "pg_dump.exe", "pg_restore.exe"] {
+    for prog in [
+        "pg_dump",
+        "pg_restore",
+        "psql",
+        "pg_dump.exe",
+        "pg_restore.exe",
+        "psql.exe",
+    ] {
         if let Some(rest) = line.strip_prefix(prog) {
             if let Some(rest) = rest.strip_prefix(": ") {
                 return Some(rest);

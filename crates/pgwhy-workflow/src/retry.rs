@@ -66,6 +66,12 @@ pub fn headline(rec: &RunRecord, inv: Option<&Inventory>) -> Option<String> {
             "Outage: {target} does not exist right now — the previous database is held as {old}. Complete the swap or roll back."
         ));
     }
+    if rec.status == RunStatus::PausedForInspection {
+        let staging = rec.staging_db.as_deref().unwrap_or("staging");
+        return Some(format!(
+            "Paused before swap: inspect {staging}, then complete the swap, edit & retry transforms, or drop staging."
+        ));
+    }
     if !rec.status.is_failure() {
         return None;
     }
@@ -191,6 +197,58 @@ pub fn derive_actions(rec: &RunRecord, inv: Option<&Inventory>) -> Vec<ActionOff
         }
         out.push(complete);
         out.push(rollback);
+        return out;
+    }
+
+    // Paused before swap: inspect staging, then Complete Swap, Retry transforms, or Drop staging.
+    if rec.status == RunStatus::PausedForInspection {
+        let staging_name = rec.staging_db.as_deref();
+        let mut complete = gate(offer(
+            ActionKind::CompleteSwap,
+            format!("Complete swap into {}", rec.target.database),
+            staging_name,
+        ));
+        if let Some(i) = inv.filter(|_| reachable) {
+            match i.staging.as_ref() {
+                Some(s) if s.exists && s.owned_by_run => {}
+                Some(s) => {
+                    complete = disable(
+                        complete,
+                        drop_refusal(s).unwrap_or_else(|| format!("{} is not usable", s.name)),
+                    );
+                }
+                None => complete = disable(complete, "the staging database is unknown"),
+            }
+        }
+        out.push(complete);
+
+        let mut retry_transforms = gate(offer(
+            ActionKind::Retry,
+            "Edit & retry transforms on staging",
+            staging_name,
+        ));
+        retry_transforms.retry = Some(RetryOffer {
+            from: StepId::PostRestore,
+            begins_at: StepId::PostRestore,
+            reuses_backup: true,
+            reuses_work_db: true,
+        });
+        if let Some(reason) = work_db_problem(rec, inv) {
+            retry_transforms = disable(retry_transforms, reason);
+        }
+        out.push(retry_transforms);
+
+        if let Some(s) = inv.and_then(|i| i.staging.as_ref()).filter(|s| s.exists) {
+            let d = gate(offer(
+                ActionKind::DropStaging,
+                format!("Drop {}", s.name),
+                Some(&s.name),
+            ));
+            out.push(match drop_refusal(s) {
+                Some(r) => disable(d, r),
+                None => d,
+            });
+        }
         return out;
     }
 
@@ -386,13 +444,17 @@ pub fn plan_retry(rec: &RunRecord, from: StepId, inv: Option<&Inventory>) -> App
             "the swap stopped between its two renames; complete it or roll it back instead of retrying",
         ));
     }
-    if !rec.status.is_failure() {
+    if !rec.status.is_failure() && rec.status != RunStatus::PausedForInspection {
         return Err(AppError::new(
             ErrorKind::Refused,
-            "only failed, cancelled or interrupted runs can be retried",
+            "only failed, cancelled, paused or interrupted runs can be retried",
         ));
     }
-    let offers = retry_offers(rec, inv);
+    let offers = if rec.status == RunStatus::PausedForInspection {
+        derive_actions(rec, inv)
+    } else {
+        retry_offers(rec, inv)
+    };
     let pick = offers
         .iter()
         .filter_map(|a| a.retry.as_ref().map(|r| (a, r)))
@@ -424,7 +486,7 @@ pub fn plan_retry(rec: &RunRecord, from: StepId, inv: Option<&Inventory>) -> App
     }
 }
 
-/// Backups retention must keep: those referenced by failed runs that can still be retried
+/// Backups retention must keep: those referenced by failed or paused runs that can still be retried
 /// (no later successful run of the same workflow).
 ///
 /// See [`protected_backups_with_operations`] for the one-off operations' share.
@@ -432,7 +494,11 @@ pub fn protected_backups(records: &[RunRecord]) -> HashSet<PathBuf> {
     let mut out = HashSet::new();
     for r in records {
         let Some(b) = &r.backup else { continue };
-        if !(r.status.is_failure() || r.status == RunStatus::Running) || !b.reusable {
+        if !(r.status.is_failure()
+            || r.status == RunStatus::Running
+            || r.status == RunStatus::PausedForInspection)
+            || !b.reusable
+        {
             continue;
         }
         let superseded = records.iter().any(|o| {

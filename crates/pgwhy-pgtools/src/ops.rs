@@ -272,6 +272,50 @@ pub async fn restore(
     })
 }
 
+/// Restore a plain-text `.sql` dump using `psql --no-psqlrc --file=<sql_path>`.
+///
+/// Uses `--set ON_ERROR_STOP=1` under [`ErrorPolicy::ExitOnError`] so the first SQL error aborts
+/// the restore with a non-zero exit code.
+pub async fn restore_plain_sql(
+    psql: &DiscoveredTool,
+    endpoint: &ToolEndpoint,
+    password: Option<&ToolPassword>,
+    sql_path: &Path,
+    opts: &RestoreOptions,
+    ctx: &RunContext,
+    mut on_progress: impl FnMut(ProgressEvent) + Send,
+) -> AppResult<RestoreOutcome> {
+    expect_kind(psql, ToolKind::Psql)?;
+    if !sql_path.is_file() {
+        return Err(AppError::new(
+            ErrorKind::ToolFailed,
+            format!(
+                "The SQL backup file {} no longer exists",
+                sql_path.display()
+            ),
+        )
+        .with_hint("Choose an existing .sql backup file")
+        .with_data(json!({ "tool": "psql", "cause": FailureCause::ArchiveCorrupt })));
+    }
+    let mut args: Vec<OsString> = vec!["--no-psqlrc".into(), "--echo-errors".into()];
+    if opts.error_policy == ErrorPolicy::ExitOnError {
+        args.push("--set".into());
+        args.push("ON_ERROR_STOP=1".into());
+    }
+    args.push(dbname_arg(endpoint));
+    args.push("--file".into());
+    args.push(sql_path.as_os_str().to_owned());
+
+    let mut spec = ChildSpec::new(psql, args);
+    spec.endpoint = Some(endpoint.clone());
+    spec.password = password.cloned();
+    spec.log_path = opts.log_path.clone();
+    let run = run_child(&spec, ctx, &mut on_progress).await?;
+    Ok(RestoreOutcome {
+        run: run.into_result()?,
+    })
+}
+
 fn restore_spec(
     pg_restore: &DiscoveredTool,
     endpoint: &ToolEndpoint,

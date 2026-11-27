@@ -61,6 +61,50 @@ impl Toc {
     pub fn count_of(&self, desc: &str) -> usize {
         self.entries.iter().filter(|e| e.desc == desc).count()
     }
+
+    /// Unique `(schema, table)` pairs present in this archive's TOC (`TABLE` and `TABLE DATA`
+    /// entries), sorted by schema then table name. Used as a schema-discovery fallback when
+    /// editing workflows against a backup file before restoring.
+    pub fn tables(&self) -> Vec<(String, String)> {
+        let mut seen = std::collections::BTreeSet::new();
+        for e in &self.entries {
+            if e.desc != "TABLE" && e.desc != "TABLE DATA" {
+                continue;
+            }
+            let Some(schema) = e.schema.as_deref() else {
+                continue;
+            };
+            // `rest` is `<table_name> <owner>` (or quoted `"table name" owner`).
+            let rest = e.rest.trim();
+            if rest.is_empty() {
+                continue;
+            }
+            let table = if let Some(after_quote) = rest.strip_prefix('"') {
+                // Parse doubled-quote PostgreSQL identifier.
+                let mut name = String::new();
+                let mut chars = after_quote.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '"' {
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            name.push('"');
+                        } else {
+                            break;
+                        }
+                    } else {
+                        name.push(c);
+                    }
+                }
+                name
+            } else {
+                rest.split_whitespace().next().unwrap_or("").to_string()
+            };
+            if !table.is_empty() {
+                seen.insert((schema.to_string(), table));
+            }
+        }
+        seen.into_iter().collect()
+    }
 }
 
 /// Multi-word TOC descriptors, longest first so `MATERIALIZED VIEW DATA` wins over
@@ -192,10 +236,69 @@ pub struct ArchiveHeader {
 /// Enough for the header: its only variable parts are a database name and two version strings.
 const ARCHIVE_HEADER_LIMIT: u64 = 4096;
 
-/// [`parse_archive_header`] on the start of `path`. `None` for anything unreadable.
-pub fn read_archive_header(path: &Path) -> Option<ArchiveHeader> {
+/// Detected format of a backup archive on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveKind {
+    /// `pg_dump --format=custom` (starts with `PGDMP`).
+    Custom,
+    /// `pg_dump --format=directory` (a folder containing `toc.dat` starting with `PGDMP`).
+    Directory,
+    /// Plain SQL file (`.sql` or text file without `PGDMP` magic, restored via `psql`).
+    PlainSql,
+}
+
+/// Detect whether `path` is a Custom archive, a Directory archive (`toc.dat`), or a Plain SQL file.
+/// Returns `None` if `path` does not exist or cannot be read.
+pub fn detect_archive_kind(path: &Path) -> Option<ArchiveKind> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.is_dir() {
+        let toc_dat = path.join("toc.dat");
+        if has_pgdmp_magic(&toc_dat) {
+            return Some(ArchiveKind::Directory);
+        }
+        return None;
+    }
+    if has_pgdmp_magic(path) {
+        return Some(ArchiveKind::Custom);
+    }
+    let ext_is_sql = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
+    if ext_is_sql {
+        return Some(ArchiveKind::PlainSql);
+    }
+    // Check if the opening bytes are valid UTF-8 text (no NUL bytes).
     let mut head = Vec::new();
     std::fs::File::open(path)
+        .ok()?
+        .take(512)
+        .read_to_end(&mut head)
+        .ok()?;
+    if !head.is_empty() && !head.contains(&0) && std::str::from_utf8(&head).is_ok() {
+        return Some(ArchiveKind::PlainSql);
+    }
+    None
+}
+
+fn has_pgdmp_magic(path: &Path) -> bool {
+    let mut magic = [0u8; 5];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok_and(|_| &magic == b"PGDMP")
+}
+
+/// [`parse_archive_header`] on the start of `path` (or `path/toc.dat` for a directory archive).
+/// `None` for anything unreadable or plain-text SQL.
+pub fn read_archive_header(path: &Path) -> Option<ArchiveHeader> {
+    let header_path = if path.is_dir() {
+        path.join("toc.dat")
+    } else {
+        path.to_path_buf()
+    };
+    let mut head = Vec::new();
+    std::fs::File::open(&header_path)
         .ok()?
         .take(ARCHIVE_HEADER_LIMIT)
         .read_to_end(&mut head)
@@ -320,7 +423,22 @@ pub async fn inspect_archive(
     if pg_restore.kind != ToolKind::PgRestore {
         return Err(AppError::internal("inspect_archive needs pg_restore"));
     }
-    let size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
+    let size_bytes = std::fs::metadata(path).ok().map(|m| {
+        if m.is_dir() {
+            std::fs::read_dir(path)
+                .ok()
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| e.metadata().ok())
+                        .filter(|em| em.is_file())
+                        .map(|em| em.len())
+                        .sum()
+                })
+                .unwrap_or(0)
+        } else {
+            m.len()
+        }
+    });
     let not_reusable = |reason: String, cause: FailureCause, toc: Option<Toc>| ArchiveInspection {
         path: path.to_path_buf(),
         size_bytes,
@@ -499,5 +617,45 @@ mod tests {
         assert!(toc.entries.is_empty());
         assert!(parse_toc("").is_err());
         assert!(parse_toc("garbage\n").is_err());
+    }
+
+    #[test]
+    fn toc_tables_extracts_unique_sorted_schema_and_quoted_table_names() {
+        let text = "\
+; Dumped by pg_dump version: 16.4
+215; 1259 16384 TABLE public users postgres
+216; 1259 16385 TABLE public \"Audit \"\"Log\"\"\" postgres
+3420; 0 16384 TABLE DATA public users postgres
+3421; 0 16390 TABLE DATA app orders postgres
+3422; 0 16391 INDEX public users_pkey postgres
+";
+        let toc = parse_toc(text).unwrap();
+        assert_eq!(
+            toc.tables(),
+            vec![
+                ("app".to_string(), "orders".to_string()),
+                ("public".to_string(), "Audit \"Log\"".to_string()),
+                ("public".to_string(), "users".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_custom_directory_and_plain_sql_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("a.dump");
+        std::fs::write(&custom, PG16).unwrap();
+        assert_eq!(detect_archive_kind(&custom), Some(ArchiveKind::Custom));
+
+        let folder = dir.path().join("dir_backup");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("toc.dat"), PG18).unwrap();
+        assert_eq!(detect_archive_kind(&folder), Some(ArchiveKind::Directory));
+        let hdr = read_archive_header(&folder).unwrap();
+        assert_eq!(hdr.dumped_by.unwrap().major, 18);
+
+        let sql = dir.path().join("plain.sql");
+        std::fs::write(&sql, "-- PostgreSQL dump\nCREATE TABLE t(id int);\n").unwrap();
+        assert_eq!(detect_archive_kind(&sql), Some(ArchiveKind::PlainSql));
     }
 }
