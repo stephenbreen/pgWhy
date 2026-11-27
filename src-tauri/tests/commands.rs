@@ -434,15 +434,34 @@ async fn refresh_workflow_round_trip_over_ipc() {
     let script = invoke(&app, "script_save", json!({ "path": "post/anonymize", "content": "update customers set email = 'user' || id || '@example.test';" })).unwrap();
     let script_id = script["info"]["id"].as_str().unwrap().to_string();
 
-    // a Production target is refused at save time
-    let bad = json!({
-        "id": "w-bad", "name": "bad", "source": {"connection": "c-local", "database": harness::PG_DB},
+    // a Production target workflow can be saved, warns at preflight with requires_typed_name, and
+    // refuses workflow_start without exact typedName confirmation
+    let prod_wf = json!({
+        "id": "w-prod", "name": "prod", "source": {"connection": "c-local", "database": harness::PG_DB},
         "target": {"connection": "c-remote", "database": harness::PG_DB}, "options": {}, "has_succeeded": false
     });
-    assert_eq!(
-        invoke(&app, "workflow_save", json!({ "workflow": bad })).unwrap_err()["kind"],
-        "refused"
-    );
+    invoke(&app, "workflow_save", json!({ "workflow": prod_wf })).expect("save prod workflow");
+    let prod_rep = invoke(
+        &app,
+        "workflow_preflight",
+        json!({ "workflowId": "w-prod" }),
+    )
+    .unwrap();
+    if let Some(ticket) = prod_rep["ticket"].as_str() {
+        assert_eq!(prod_rep["confirmation"]["requires_typed_name"], json!(true));
+        assert_eq!(prod_rep["confirmation"]["can_remember"], json!(false));
+        let fp = prod_rep["confirmation"]["fingerprint"].as_str().unwrap();
+        assert_eq!(
+            invoke(
+                &app,
+                "workflow_start",
+                json!({ "ticket": ticket, "fingerprint": fp, "remember": false }),
+            )
+            .unwrap_err()["kind"],
+            "refused"
+        );
+    }
+    invoke(&app, "workflow_delete", json!({ "id": "w-prod" })).unwrap();
 
     let wf = json!({
         "id": "w1", "name": "Refresh local", "source": {"connection": "c-remote", "database": harness::PG_DB},
