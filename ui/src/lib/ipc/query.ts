@@ -87,6 +87,77 @@ export function editorRun(
   return invoke<void>("editor_run", { tabId, sql, from: range.from, to: range.to, policy, events: channel });
 }
 
+export interface ExplainNode {
+  "Node Type": string;
+  "Relation Name"?: string;
+  Schema?: string;
+  Alias?: string;
+  "Index Name"?: string;
+  "Join Type"?: string;
+  "Strategy"?: string;
+  "Startup Cost"?: number;
+  "Total Cost"?: number;
+  "Plan Rows"?: number;
+  "Plan Width"?: number;
+  "Actual Startup Time"?: number;
+  "Actual Total Time"?: number;
+  "Actual Rows"?: number;
+  "Actual Loops"?: number;
+  "Shared Hit Blocks"?: number;
+  "Shared Read Blocks"?: number;
+  "Shared Dirtied Blocks"?: number;
+  "Shared Written Blocks"?: number;
+  "Temp Read Blocks"?: number;
+  "Temp Written Blocks"?: number;
+  "Filter"?: string;
+  "Rows Removed by Filter"?: number;
+  "Index Cond"?: string;
+  "Hash Cond"?: string;
+  "Merge Cond"?: string;
+  "Join Filter"?: string;
+  "Recheck Cond"?: string;
+  "Sort Key"?: string[];
+  "Sort Method"?: string;
+  "Group Key"?: string[];
+  "Output"?: string[];
+  "Subplan Name"?: string;
+  "Parent Relationship"?: string;
+  Plans?: ExplainNode[];
+  [key: string]: unknown;
+}
+
+export interface ExplainRoot {
+  Plan: ExplainNode;
+  "Planning Time"?: number;
+  "Execution Time"?: number;
+  Triggers?: { "Trigger Name"?: string; Relation?: string; Time?: number; Calls?: number }[];
+}
+
+export interface ExplainOutput {
+  plan: ExplainRoot[] | ExplainRoot | unknown;
+  analyze: boolean;
+  buffers: boolean;
+  rolled_back: boolean;
+  statement: string;
+  duration_ms: number;
+}
+
+export const editorExplain = (
+  tabId: string,
+  sql: string,
+  range: { from: number; to: number },
+  opts: { analyze: boolean; buffers?: boolean; rollback?: boolean },
+) =>
+  invoke<ExplainOutput>("editor_explain", {
+    tabId,
+    sql,
+    from: range.from,
+    to: range.to,
+    analyze: opts.analyze,
+    buffers: opts.buffers ?? opts.analyze,
+    rollback: opts.rollback ?? opts.analyze,
+  });
+
 export const editorCancel = (tabId: string) => invoke<void>("editor_cancel", { tabId });
 
 export const editorTxnState = (tabId: string) => invoke<TxnState>("editor_txn_state", { tabId });

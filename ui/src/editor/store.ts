@@ -2,7 +2,10 @@
 // run's result sets (SSMS-style single results pane with a switcher) and messages.
 
 import { create } from "zustand";
-import type { ColumnInfo, QueryEvent, TxnState, TxnStatus } from "../lib/ipc/query";
+import type { AppError } from "../lib/ipc/errors";
+import type { ColumnInfo, ExplainOutput, QueryEvent, TxnState, TxnStatus } from "../lib/ipc/query";
+
+export type ResultsPaneTab = "results" | "messages" | "plan" | "history";
 
 export interface ResultSet {
   resultId: string;
@@ -30,7 +33,10 @@ export interface EditorTabState {
   running: boolean;
   results: ResultSet[];
   activeResult: number;
+  activePane: ResultsPaneTab;
   messages: Message[];
+  explain: ExplainOutput | null;
+  explainError: AppError | null;
   /** byte offset of the last error, into the text that was run */
   errorAt: { from: number; to: number; message: string; text: string } | null;
   dirty: boolean;
@@ -55,7 +61,7 @@ export const useEditors = create<EditorsState>((set) => ({
         ...s.tabs,
         [tabId]: s.tabs[tabId] ?? {
           connectionId, database, connected: false, txn: "idle", running: false, results: [], activeResult: 0,
-          messages: [], errorAt: null, dirty: false, filePath,
+          activePane: "results", messages: [], explain: null, explainError: null, errorAt: null, dirty: false, filePath,
         },
       },
     })),
@@ -64,7 +70,12 @@ export const useEditors = create<EditorsState>((set) => ({
     set((s) => {
       const t = s.tabs[tabId];
       if (!t) return s;
-      return { tabs: { ...s.tabs, [tabId]: { ...t, running: true, results: [], activeResult: 0, messages: [], errorAt: null } } };
+      return {
+        tabs: {
+          ...s.tabs,
+          [tabId]: { ...t, running: true, results: [], activeResult: 0, activePane: "results", messages: [], explain: null, explainError: null, errorAt: null },
+        },
+      };
     }),
   apply: (tabId, ev, text) =>
     set((s) => {

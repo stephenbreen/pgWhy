@@ -14,6 +14,7 @@ export function shortcut(key: string, opts: { shift?: boolean } = {}): string {
   return `Ctrl+${opts.shift ? "Shift+" : ""}${key}`;
 }
 
-// Explorer commands reachable from anywhere in the app.
+// Explorer & editor commands reachable from anywhere in the app.
 export const FIND_OBJECT_EVENT = "pgwhy:find-object";
 export const FILTER_OBJECTS_EVENT = "pgwhy:filter-objects";
+export const TOGGLE_RESULTS_EVENT = "pgwhy:toggle-results";

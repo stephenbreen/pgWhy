@@ -5,6 +5,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { setCloseGuard, useWorkspace, type Tab } from "../app/workspace";
+import { EDITOR_SPLIT, useLayout } from "../app/layout";
+import { shortcut, TOGGLE_RESULTS_EVENT } from "../app/keys";
 import { useConnections } from "../connection/store";
 import { TagPill } from "../connection/EnvTag";
 import { ErrorNote } from "../connection/ErrorNote";
@@ -14,6 +16,7 @@ import * as scriptsIpc from "../lib/ipc/scripts";
 import { useScriptLibrary } from "../scripts/store";
 import { byteToCharOffset, charToByteOffset, SqlEditor, type RunRequest, type SqlEditorHandle } from "./SqlEditor";
 import { ResultsPane } from "./ResultsPane";
+import { useQueryHistory } from "./history";
 import { useEditors } from "./store";
 import { useCompletionSchema } from "./completion";
 
@@ -80,9 +83,47 @@ export function EditorTab({ tab }: { tab: Tab }) {
   const [saveAs, setSaveAs] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<AppError | null>(null);
   const [metaCmds, setMetaCmds] = useState<scriptsIpc.MetaCommand[]>([]);
+  const [resultsOpen, setResultsOpen] = useState(true);
+  const splitRef = useRef<HTMLDivElement | null>(null);
+  const splitRatio = useLayout((s) => s.editorSplitRatio);
+  const setSplitRatio = useLayout((s) => s.setEditorSplitRatio);
   const metaTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editorHandle = useRef<SqlEditorHandle | null>(null);
   const currentText = () => editorHandle.current?.view.state.doc.toString() ?? textRef.current;
+
+  useEffect(() => {
+    const onToggle = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ tabId?: string }>).detail;
+      if (!detail?.tabId || detail.tabId === tab.id) {
+        setResultsOpen((v) => !v);
+      }
+    };
+    window.addEventListener(TOGGLE_RESULTS_EVENT, onToggle);
+    return () => window.removeEventListener(TOGGLE_RESULTS_EVENT, onToggle);
+  }, [tab.id]);
+
+  const startSplitDrag = (ev: React.PointerEvent<HTMLDivElement>) => {
+    const container = splitRef.current;
+    if (!container) return;
+    ev.preventDefault();
+    const target = ev.currentTarget;
+    target.setPointerCapture?.(ev.pointerId);
+    const rect = container.getBoundingClientRect();
+    const onMove = (e: PointerEvent) => {
+      if (rect.height <= 0) return;
+      const ratio = (e.clientY - rect.top) / rect.height;
+      setSplitRatio(ratio);
+    };
+    const onUp = () => {
+      target.releasePointerCapture?.(ev.pointerId);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  };
 
   const scheduleMetaScan = useCallback((text: string) => {
     if (metaTimer.current) clearTimeout(metaTimer.current);
@@ -171,8 +212,10 @@ export function EditorTab({ tab }: { tab: Tab }) {
       const s = useEditors.getState().tabs[tab.id];
       if (!s || s.running || starting.current) return;
       starting.current = true;
+      setResultsOpen(true);
       if (!s.connected) await open();
       const text = req.text;
+      const submittedSql = text.slice(req.from, req.to);
       // The previous results go only once the core has accepted the run: a refusal (busy,
       // disconnected) must leave what the user was looking at.
       let started = false;
@@ -184,6 +227,7 @@ export function EditorTab({ tab }: { tab: Tab }) {
       if (data.filePath) {
         void scriptsIpc.recordRecent({ path: data.filePath, library_id: data.scriptId, action: "run", connection_id: data.connectionId, database: data.database });
       }
+      const connName = useConnections.getState().entries.find((e) => e.id === data.connectionId)?.name ?? data.connectionId;
       try {
         await q.editorRun(
           tab.id,
@@ -193,6 +237,19 @@ export function EditorTab({ tab }: { tab: Tab }) {
           (ev) => {
             begin();
             useEditors.getState().apply(tab.id, ev, text);
+            if (ev.type === "finished") {
+              useQueryHistory.getState().record({
+                connectionId: data.connectionId,
+                connectionName: connName,
+                database: data.database,
+                sql: submittedSql,
+                durationMs: ev.duration_ms,
+                statements: ev.statements,
+                errors: ev.errors,
+                cancelled: ev.cancelled,
+                kind: "run",
+              });
+            }
           },
         );
       } catch (e) {
@@ -209,6 +266,17 @@ export function EditorTab({ tab }: { tab: Tab }) {
           { type: "finished", cancelled: false, errors: 1, statements: 0, succeeded: 0, skipped: 0, connection_lost: err.kind === "disconnected", transaction_lost: false, txn: "idle", duration_ms: 0 },
           text,
         );
+        useQueryHistory.getState().record({
+          connectionId: data.connectionId,
+          connectionName: connName,
+          database: data.database,
+          sql: submittedSql,
+          durationMs: 0,
+          statements: 0,
+          errors: 1,
+          cancelled: false,
+          kind: "run",
+        });
         if (err.kind === "disconnected") patch(tab.id, { connected: false, txn: "disconnected" });
       } finally {
         starting.current = false;
@@ -216,6 +284,73 @@ export function EditorTab({ tab }: { tab: Tab }) {
     },
     [tab.id, open, policy, patch, data.filePath, data.scriptId, data.connectionId, data.database],
   );
+
+  const runExplain = useCallback(
+    async (analyze: boolean) => {
+      const s = useEditors.getState().tabs[tab.id];
+      if (!s || s.running || starting.current) return;
+      starting.current = true;
+      setResultsOpen(true);
+      if (!s.connected) await open();
+      const view = editorHandle.current?.view;
+      const text = currentText();
+      const sel = view?.state.selection.main;
+      const hasSel = !!sel && !sel.empty;
+      const fromChar = hasSel ? sel.from : 0;
+      const toChar = hasSel ? sel.to : text.length;
+      const submittedSql = text.slice(fromChar, toChar);
+      const connName = useConnections.getState().entries.find((e) => e.id === data.connectionId)?.name ?? data.connectionId;
+      patch(tab.id, { running: true, explain: null, explainError: null, activePane: "plan" });
+      try {
+        const out = await q.editorExplain(
+          tab.id,
+          text,
+          { from: charToByteOffset(text, fromChar), to: charToByteOffset(text, toChar) },
+          { analyze, buffers: analyze, rollback: analyze },
+        );
+        patch(tab.id, { running: false, explain: out, explainError: null, activePane: "plan" });
+        useQueryHistory.getState().record({
+          connectionId: data.connectionId,
+          connectionName: connName,
+          database: data.database,
+          sql: out.statement || submittedSql,
+          durationMs: out.duration_ms,
+          statements: 1,
+          errors: 0,
+          cancelled: false,
+          kind: analyze ? "explain_analyze" : "explain",
+        });
+      } catch (e) {
+        const err = toAppError(e);
+        patch(tab.id, { running: false, explain: null, explainError: err, activePane: "plan" });
+        useQueryHistory.getState().record({
+          connectionId: data.connectionId,
+          connectionName: connName,
+          database: data.database,
+          sql: submittedSql,
+          durationMs: 0,
+          statements: 1,
+          errors: 1,
+          cancelled: err.kind === "cancelled",
+          kind: analyze ? "explain_analyze" : "explain",
+        });
+        if (err.kind === "disconnected") patch(tab.id, { connected: false, txn: "disconnected" });
+      } finally {
+        starting.current = false;
+      }
+    },
+    [tab.id, open, patch, data.connectionId, data.database],
+  );
+
+  const loadSql = (sql: string) => {
+    const view = editorHandle.current?.view;
+    if (view) {
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: sql } });
+    }
+    textRef.current = sql;
+    patch(tab.id, { dirty: true });
+    scheduleMetaScan(sql);
+  };
 
   const setData = (patchData: Partial<EditorTabData>) => updateTab(tab.id, { data: { ...data, ...patchData } });
 
@@ -324,6 +459,22 @@ export function EditorTab({ tab }: { tab: Tab }) {
         <button type="button" disabled={!state.running} onClick={() => void q.editorCancel(tab.id)} title="Cancel (Esc)">
           ■ Cancel
         </button>
+        <button
+          type="button"
+          disabled={state.running}
+          onClick={() => void runExplain(false)}
+          title="EXPLAIN (FORMAT JSON) — estimated plan without executing the query"
+        >
+          Explain
+        </button>
+        <button
+          type="button"
+          disabled={state.running}
+          onClick={() => void runExplain(true)}
+          title="EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) — runs inside BEGIN…ROLLBACK when idle so DML is not persisted"
+        >
+          Analyze
+        </button>
         <label className="check">
           <input type="checkbox" checked={policy === "continue"} onChange={(e) => setPolicy(e.target.checked ? "continue" : "stop")} /> continue on error
         </label>
@@ -431,7 +582,16 @@ export function EditorTab({ tab }: { tab: Tab }) {
           </span>
         </div>
       )}
-      <div className="editor-split">
+      <div
+        className="editor-split"
+        ref={splitRef}
+        data-results-open={resultsOpen ? "true" : "false"}
+        style={
+          resultsOpen
+            ? { gridTemplateRows: `${Math.round(splitRatio * 100)}% 5px 1fr` }
+            : { gridTemplateRows: "1fr" }
+        }
+      >
         <div className="editor-host">
           <SqlEditor
             handleRef={editorHandle}
@@ -447,7 +607,26 @@ export function EditorTab({ tab }: { tab: Tab }) {
             onCancel={state.running ? () => void q.editorCancel(tab.id) : undefined}
           />
         </div>
-        <ResultsPane state={state} onSelectResult={(i) => patch(tab.id, { activeResult: i })} />
+        {resultsOpen && (
+          <>
+            <div
+              className="editor-splitter"
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="Resize editor and results"
+              title="Drag to resize; double-click to reset"
+              onPointerDown={startSplitDrag}
+              onDoubleClick={() => setSplitRatio(EDITOR_SPLIT.default)}
+            />
+            <ResultsPane
+              state={state}
+              onSelectResult={(i) => patch(tab.id, { activeResult: i })}
+              onSelectPane={(activePane) => patch(tab.id, { activePane })}
+              onLoadSql={loadSql}
+              onOpenHistoryTab={(item) => openEditorTab(item.connectionId, item.database, { text: item.sql })}
+            />
+          </>
+        )}
       </div>
       <div className="editor-status">
         {state.lastRun && (
@@ -455,6 +634,15 @@ export function EditorTab({ tab }: { tab: Tab }) {
             {state.lastRun.statements} statement{state.lastRun.statements === 1 ? "" : "s"}, {state.lastRun.errors} error{state.lastRun.errors === 1 ? "" : "s"} · {state.lastRun.durationMs} ms
           </span>
         )}
+        <button
+          type="button"
+          className="link results-toggle-btn"
+          aria-pressed={resultsOpen}
+          title={`Toggle results pane (${shortcut("R")})`}
+          onClick={() => setResultsOpen((v) => !v)}
+        >
+          {resultsOpen ? "Hide results" : "Show results"} ({shortcut("R")})
+        </button>
         <span className="spacer" />
         <span>{entry ? `${entry.user}@${entry.host}:${entry.port}/${data.database}` : ""}</span>
       </div>

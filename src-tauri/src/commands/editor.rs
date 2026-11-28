@@ -6,10 +6,11 @@ use crate::state::AppState;
 use pgwhy_core::config::ConnectionId;
 use pgwhy_core::conn::{ConnInfo, Purpose};
 use pgwhy_core::query::{
-    BufferEvent, BufferOptions, BufferSink, CancelHandle, ErrorPolicy, QuerySession, RunOptions,
-    SessionState,
+    BufferEvent, BufferOptions, BufferSink, CancelHandle, CollectSink, ErrorPolicy, QuerySession,
+    RunOptions, SessionState,
 };
 use pgwhy_core::{AppError, AppResult, ErrorKind};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -271,4 +272,174 @@ pub async fn editor_run(
         state.release_results_of(&tab_id);
     }
     outcome.map(|_| ())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainOutput {
+    pub plan: serde_json::Value,
+    pub analyze: bool,
+    pub buffers: bool,
+    pub rolled_back: bool,
+    pub statement: String,
+    pub duration_ms: f64,
+}
+
+fn build_explain_sql(stmt: &str, analyze: bool, buffers: bool) -> AppResult<String> {
+    let trimmed = stmt.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::new(ErrorKind::Config, "nothing to explain"));
+    }
+    // Avoid double-wrapping when the user already wrote `EXPLAIN ...`.
+    let first_word = trimmed
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    if first_word.eq_ignore_ascii_case("explain") {
+        return Err(
+            AppError::new(
+                ErrorKind::Refused,
+                "statement already starts with EXPLAIN",
+            )
+            .with_hint(
+                "remove the EXPLAIN prefix — pgWhy adds EXPLAIN (FORMAT JSON) automatically, or click Run to execute it directly",
+            ),
+        );
+    }
+    let mut opts = Vec::new();
+    if analyze {
+        opts.push("ANALYZE");
+        if buffers {
+            opts.push("BUFFERS");
+        }
+    }
+    opts.push("FORMAT JSON");
+    Ok(format!("EXPLAIN ({}) {trimmed}", opts.join(", ")))
+}
+
+/// Run `EXPLAIN (FORMAT JSON)` or `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` on a single
+/// statement in `sql[from..to]`. When `analyze && rollback` and the tab has no open
+/// transaction, wraps execution in `BEGIN` .. `ROLLBACK` so DML statements can be analyzed
+/// without persisting mutations.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn editor_explain(
+    state: State<'_, AppState>,
+    tab_id: String,
+    sql: String,
+    from: usize,
+    to: usize,
+    analyze: bool,
+    buffers: bool,
+    rollback: bool,
+) -> AppResult<ExplainOutput> {
+    let tab = state.editors.get(&tab_id)?;
+    tab.session.check_can_start()?;
+
+    let end = to.min(sql.len());
+    let start = from.min(end);
+    let statements = tab.session.split_range(&sql, start..end).await;
+    if statements.is_empty() {
+        return Err(AppError::new(ErrorKind::Config, "nothing to explain"));
+    }
+    if statements.len() > 1 {
+        return Err(
+            AppError::new(ErrorKind::Refused, "select a single statement to EXPLAIN")
+                .with_hint("highlight one statement in the editor and run Explain again"),
+        );
+    }
+    let stmt_text = sql[statements[0].trimmed.clone()].trim().to_string();
+    let explain_sql = build_explain_sql(&stmt_text, analyze, buffers)?;
+
+    let wrap_rollback = analyze && rollback && tab.session.state() == SessionState::Idle;
+    let started = std::time::Instant::now();
+    let mut sink = CollectSink::new();
+    let opts = RunOptions {
+        on_error: ErrorPolicy::StopOnError,
+        ..RunOptions::default()
+    };
+
+    if wrap_rollback {
+        let mut begin_sink = CollectSink::new();
+        tab.session
+            .run_text("BEGIN", &opts, &mut begin_sink)
+            .await?;
+        if let Some(err) = begin_sink.statements.first().and_then(|s| s.error.clone()) {
+            return Err(AppError::new(ErrorKind::Sql, err.message));
+        }
+        let res = tab.session.run_text(&explain_sql, &opts, &mut sink).await;
+        // Always roll back the safety transaction even if EXPLAIN failed or was cancelled.
+        let _ = tab.session.rollback().await;
+        res?;
+    } else {
+        tab.session.run_text(&explain_sql, &opts, &mut sink).await?;
+    }
+
+    let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let first = sink
+        .statements
+        .first()
+        .ok_or_else(|| AppError::new(ErrorKind::Sql, "PostgreSQL returned no EXPLAIN output"))?;
+    if first.cancelled {
+        return Err(AppError::new(ErrorKind::Cancelled, "EXPLAIN cancelled"));
+    }
+    if let Some(err) = &first.error {
+        let mut app_err = AppError::new(ErrorKind::Sql, err.message.clone());
+        if let Some(detail) = &err.detail {
+            app_err = app_err.with_detail(detail.clone());
+        }
+        if let Some(hint) = &err.hint {
+            app_err = app_err.with_hint(hint.clone());
+        }
+        return Err(app_err);
+    }
+
+    // PostgreSQL returns EXPLAIN (FORMAT JSON) as one row with one JSON text column
+    // (though some versions/proxies may split lines across rows).
+    let raw_json: String = first
+        .rows
+        .iter()
+        .filter_map(|r| r.first().and_then(|cell| cell.as_deref()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let plan: serde_json::Value = serde_json::from_str(&raw_json).map_err(|e| {
+        AppError::new(ErrorKind::Sql, format!("could not parse EXPLAIN JSON: {e}"))
+            .with_detail(raw_json)
+    })?;
+
+    Ok(ExplainOutput {
+        plan,
+        analyze,
+        buffers: analyze && buffers,
+        rolled_back: wrap_rollback,
+        statement: stmt_text,
+        duration_ms,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_explain_sql;
+
+    #[test]
+    fn builds_explain_and_analyze_buffers_sql() {
+        assert_eq!(
+            build_explain_sql("SELECT 1", false, true).unwrap(),
+            "EXPLAIN (FORMAT JSON) SELECT 1"
+        );
+        assert_eq!(
+            build_explain_sql("SELECT 1", true, true).unwrap(),
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1"
+        );
+        assert_eq!(
+            build_explain_sql("SELECT 1", true, false).unwrap(),
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1"
+        );
+    }
+
+    #[test]
+    fn refuses_empty_or_double_explain() {
+        assert!(build_explain_sql("   ", false, false).is_err());
+        assert!(build_explain_sql("EXPLAIN SELECT 1", false, false).is_err());
+        assert!(build_explain_sql("explain(analyze) SELECT 1", true, true).is_err());
+    }
 }

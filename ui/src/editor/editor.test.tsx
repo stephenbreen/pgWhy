@@ -8,7 +8,9 @@ import { useWorkspace } from "../app/workspace";
 import { useConnections } from "../connection/store";
 import type { ConnectionEntry } from "../lib/ipc/connections";
 import type { QueryEvent } from "../lib/ipc/query";
+import { TOGGLE_RESULTS_EVENT } from "../app/keys";
 import { EditorTab, openEditorTab } from "./EditorTab";
+import { useQueryHistory } from "./history";
 import { useEditors } from "./store";
 
 const ws0 = useWorkspace.getState();
@@ -56,6 +58,7 @@ beforeEach(() => {
   useWorkspace.setState(ws0, true);
   useConnections.setState({ ...conn0, entries: [entry], loaded: true }, true);
   useEditors.setState({ tabs: {} });
+  useQueryHistory.getState().clear();
   registerTab("editor", EditorTab);
 });
 
@@ -187,5 +190,133 @@ describe("editor tab", () => {
     act(() => void openEditorTab("c1", "app", { text: "\\c prod\nSELECT 1;" }));
     const banner = await screen.findByRole("status", { name: "psql meta-command warning" });
     expect(banner).toHaveTextContent(/\\c \(line 1\)/);
+  });
+
+  it("renders a visual EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) plan tree and toggles raw JSON", async () => {
+    const user = userEvent.setup();
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args: args as Record<string, unknown> });
+      if (cmd === "editor_open")
+        return { handle: 7, connection_id: "c1", database: "app", purpose: "editor_tab", server_version_num: 160000, backend_pid: 9, tls: "plaintext" };
+      if (cmd === "editor_explain") {
+        return {
+          analyze: true,
+          buffers: true,
+          rolled_back: true,
+          statement: "SELECT * FROM users JOIN orders ON orders.user_id = users.id",
+          duration_ms: 14.5,
+          plan: [
+            {
+              "Planning Time": 0.42,
+              "Execution Time": 12.3,
+              Plan: {
+                "Node Type": "Hash Join",
+                "Join Type": "Inner",
+                "Hash Cond": "(orders.user_id = users.id)",
+                "Startup Cost": 1.0,
+                "Total Cost": 45.2,
+                "Plan Rows": 10,
+                "Actual Rows": 250,
+                "Actual Loops": 1,
+                "Actual Total Time": 11.8,
+                "Shared Hit Blocks": 90,
+                "Shared Read Blocks": 10,
+                Plans: [
+                  {
+                    "Node Type": "Seq Scan",
+                    Schema: "public",
+                    "Relation Name": "orders",
+                    "Startup Cost": 0,
+                    "Total Cost": 30.0,
+                    "Plan Rows": 100,
+                    "Actual Rows": 250,
+                    "Actual Loops": 1,
+                    "Actual Total Time": 8.0,
+                  },
+                  {
+                    "Node Type": "Index Scan",
+                    Schema: "public",
+                    "Relation Name": "users",
+                    "Index Name": "users_pkey",
+                    "Startup Cost": 0.15,
+                    "Total Cost": 8.2,
+                    "Plan Rows": 10,
+                    "Actual Rows": 10,
+                    "Actual Loops": 1,
+                    "Actual Total Time": 1.2,
+                  },
+                ],
+              },
+            },
+          ],
+        };
+      }
+      return null;
+    });
+
+    render(<App />);
+    act(() => void openEditorTab("c1", "app", { text: "SELECT * FROM users JOIN orders ON orders.user_id = users.id;" }));
+    await user.click(await screen.findByRole("button", { name: "Analyze" }));
+
+    expect(calls.find((c) => c.cmd === "editor_explain")?.args).toMatchObject({
+      analyze: true,
+      buffers: true,
+      rollback: true,
+    });
+
+    const tree = await screen.findByRole("list", { name: "Plan tree" });
+    expect(tree).toHaveTextContent("Hash Join (Inner)");
+    expect(tree).toHaveTextContent("Seq Scan");
+    expect(tree).toHaveTextContent("users_pkey");
+    expect(tree).toHaveTextContent(/25\.0× underestimated/);
+    expect(screen.getByText("rolled back safely")).toBeInTheDocument();
+    expect(screen.getByText(/90% cache/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "JSON" }));
+    expect(screen.queryByRole("list", { name: "Plan tree" })).not.toBeInTheDocument();
+    expect(screen.getByText(/"Node Type": "Hash Join"/)).toBeInTheDocument();
+  });
+
+  it("records executed queries in searchable History and loads them back into the editor", async () => {
+    const user = userEvent.setup();
+    backend((emit) => {
+      emit({ type: "statement_done", index: 0, command: "SELECT", rows_affected: 1, duration_ms: 5, truncated: false });
+      emit(finished());
+    });
+    render(<App />);
+    act(() => void openEditorTab("c1", "app", { text: "SELECT count(*) FROM public.users;" }));
+    await user.click(await screen.findByRole("button", { name: /Run/ }));
+    await screen.findByText(/1 statement, 0 errors/);
+
+    await user.click(screen.getByRole("tab", { name: /History/ }));
+    const search = await screen.findByLabelText("Search query history");
+    expect(screen.getByText("SELECT count(*) FROM public.users;")).toBeInTheDocument();
+
+    await user.type(search, "nonexistent");
+    expect(screen.getByText("No matching history entries.")).toBeInTheDocument();
+    await user.clear(search);
+    await user.click(screen.getByRole("button", { name: "Load" }));
+    expect(document.querySelector(".cm-content")?.textContent).toContain("SELECT count(*) FROM public.users;");
+  });
+
+  it("toggles the results pane via Ctrl+R event and renders a horizontal resize splitter", async () => {
+    const user = userEvent.setup();
+    backend((emit) => {
+      emit(finished());
+    });
+    render(<App />);
+    act(() => void openEditorTab("c1", "app", { text: "SELECT 1;" }));
+    expect(await screen.findByRole("separator", { name: "Resize editor and results" })).toBeInTheDocument();
+    expect(screen.getByRole("tablist", { name: "Results" })).toBeInTheDocument();
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(TOGGLE_RESULTS_EVENT));
+    });
+    expect(screen.queryByRole("tablist", { name: "Results" })).not.toBeInTheDocument();
+
+    // Running automatically expands the collapsed results pane again.
+    await user.click(screen.getByRole("button", { name: /Run/ }));
+    expect(await screen.findByRole("tablist", { name: "Results" })).toBeInTheDocument();
   });
 });

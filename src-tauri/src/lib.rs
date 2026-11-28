@@ -61,6 +61,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         commands::editor::editor_txn_state,
         commands::editor::editor_close,
         commands::editor::editor_run,
+        commands::editor::editor_explain,
         commands::results::result_subscribe,
         commands::results::result_window,
         commands::results::result_release,

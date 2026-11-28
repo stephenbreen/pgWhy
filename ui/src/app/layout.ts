@@ -7,6 +7,7 @@ import { create } from "zustand";
 export const ZOOM_STEPS = [0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
 export const SIDEBAR_W = { default: 300, min: 180, max: 900 };
 export const DETAILS_W = { default: 340, min: 240, max: 900 };
+export const EDITOR_SPLIT = { default: 0.45, min: 0.15, max: 0.85 };
 // the main area never gets squeezed below this by a pane drag
 const MAIN_MIN = 320;
 const ACTIVITY_W = 44;
@@ -17,9 +18,15 @@ interface Stored {
   zoom: number;
   sidebarWidth: number;
   detailsWidth: number;
+  editorSplitRatio: number;
 }
 
-const DEFAULTS: Stored = { zoom: 1, sidebarWidth: SIDEBAR_W.default, detailsWidth: DETAILS_W.default };
+const DEFAULTS: Stored = {
+  zoom: 1,
+  sidebarWidth: SIDEBAR_W.default,
+  detailsWidth: DETAILS_W.default,
+  editorSplitRatio: EDITOR_SPLIT.default,
+};
 
 function load(): Stored {
   try {
@@ -28,6 +35,7 @@ function load(): Stored {
       zoom: ZOOM_STEPS.includes(raw.zoom as number) ? (raw.zoom as number) : DEFAULTS.zoom,
       sidebarWidth: num(raw.sidebarWidth, SIDEBAR_W),
       detailsWidth: num(raw.detailsWidth, DETAILS_W),
+      editorSplitRatio: num(raw.editorSplitRatio, EDITOR_SPLIT),
     };
   } catch {
     return DEFAULTS;
@@ -52,13 +60,14 @@ interface LayoutState extends Stored {
   stepZoom: (dir: -1 | 0 | 1) => void;
   setSidebarWidth: (w: number) => void;
   setDetailsWidth: (w: number) => void;
+  setEditorSplitRatio: (ratio: number) => void;
 }
 
 export const useLayout = create<LayoutState>((set, get) => {
   const update = (patch: Partial<Stored>) => {
     set(patch);
-    const { zoom, sidebarWidth, detailsWidth } = get();
-    save({ zoom, sidebarWidth, detailsWidth });
+    const { zoom, sidebarWidth, detailsWidth, editorSplitRatio } = get();
+    save({ zoom, sidebarWidth, detailsWidth, editorSplitRatio });
   };
   return {
     ...load(),
@@ -71,6 +80,7 @@ export const useLayout = create<LayoutState>((set, get) => {
     },
     setSidebarWidth: (w) => update({ sidebarWidth: Math.round(w) }),
     setDetailsWidth: (w) => update({ detailsWidth: Math.round(w) }),
+    setEditorSplitRatio: (ratio) => update({ editorSplitRatio: num(ratio, EDITOR_SPLIT) }),
   };
 });
 
