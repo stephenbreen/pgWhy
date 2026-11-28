@@ -20,6 +20,7 @@ use crate::preflight::{self, PreflightReport};
 use crate::real::{RealDeps, RealOps};
 use crate::retry;
 use crate::staging::{self, now_rfc3339, Marker, MarkerRole};
+use crate::swap::SwapWindow;
 use pgwhy_core::config::{ConnectionId, ServerKey};
 use pgwhy_core::{AppError, AppResult, ErrorClass, ErrorKind};
 use pgwhy_pgtools::FailureCause;
@@ -120,9 +121,18 @@ pub struct StartRequest {
 
 struct ActiveRun {
     cancel: RunCancel,
-    in_window: Arc<AtomicBool>,
+    in_window: SwapWindow,
     done: watch::Receiver<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// A running one-off operation (restore, create, rename, drop): how to cancel it, whether it is
+/// inside a rename window, and how to wait for it.
+struct ActiveOp {
+    cancel: RunCancel,
+    window: SwapWindow,
+    done: watch::Receiver<bool>,
+    done_tx: watch::Sender<bool>,
 }
 
 struct Ticket {
@@ -142,9 +152,22 @@ pub(crate) struct Inner {
     // settings change never hands out a second, empty lock table or loses a run's cancel handle.
     tickets: Arc<Mutex<HashMap<String, Ticket>>>,
     active: Arc<Mutex<HashMap<RunId, ActiveRun>>>,
-    /// Cancellation handles for one-off operations (restore, …), keyed by their record id.
-    operation_cancels: Arc<Mutex<HashMap<RunId, RunCancel>>>,
+    /// One-off operations in flight (restore, create, rename, drop), keyed by their record id.
+    operation_cancels: Arc<Mutex<HashMap<RunId, ActiveOp>>>,
     shutting_down: Arc<AtomicBool>,
+}
+
+fn prune_history(history: &HistoryStore) {
+    if let Err(e) = history.prune(KEEP_RUNS_PER_WORKFLOW, KEEP_OPERATIONS) {
+        tracing::warn!(error = %e, "could not prune the run history");
+    }
+}
+
+fn swap_window_refusal() -> AppError {
+    AppError::new(
+        ErrorKind::Refused,
+        "the swap is between its two renames; stopping now would leave no database under the target name — it finishes in a moment",
+    )
 }
 
 /// The Refresh engine. Cheap to clone; clones share state.
@@ -311,7 +334,18 @@ impl Engine {
         };
         lock(&self.inner.tickets).retain(|_, t| t.plan.workflow.id != workflow.id);
         let inv = scan_inventory(&*self.inner.ops, &rec, None, true).await;
-        let offer = match retry::plan_retry(&rec, from, Some(&inv)) {
+        let planned = retry::plan_retry(&rec, from, Some(&inv)).and_then(|offer| {
+            // Reusing this run's backup or staging puts its (older) data in place; refuse when a
+            // newer run of the workflow has swapped something in since.
+            let all = self.inner.history.list(Some(&rec.workflow_id))?;
+            match retry::superseded_by(&rec, &all) {
+                Some(newer) if offer.reuses_backup || offer.reuses_work_db => {
+                    Err(retry::superseded_refusal(&rec, newer))
+                }
+                _ => Ok(offer),
+            }
+        });
+        let offer = match planned {
             Ok(o) => o,
             Err(e) => {
                 let mut rep = PreflightReport::refused_early(&workflow, e);
@@ -431,7 +465,7 @@ impl Engine {
         }
         let run_id = plan.run_id.clone();
         let cancel = RunCancel::new();
-        let in_window = Arc::new(AtomicBool::new(false));
+        let in_window = SwapWindow::default();
         let (done_tx, done_rx) = watch::channel(false);
         let mut runner = Runner::new(
             self.inner.clone(),
@@ -476,19 +510,17 @@ impl Engine {
     }
 
     /// Cancel a run: kills the active pg_dump/pg_restore or cancels the active statement.
-    /// Refused between the swap's two renames.
+    /// Refused between the swap's two renames. The window check and the cancel are one atomic
+    /// step with the swap entering the window, so a cancel is either honoured or refused here —
+    /// never acknowledged and then ignored.
     pub fn cancel(&self, run_id: &RunId) -> AppResult<()> {
         let active = lock(&self.inner.active);
         let run = active
             .get(run_id)
             .ok_or_else(|| AppError::new(ErrorKind::Refused, "that run is not running"))?;
-        if run.in_window.load(Ordering::SeqCst) {
-            return Err(AppError::new(
-                ErrorKind::Refused,
-                "the swap is between its two renames; stopping now would leave no database under the target name — it finishes in a moment",
-            ));
+        if !run.in_window.cancel(&run.cancel) {
+            return Err(swap_window_refusal());
         }
-        run.cancel.cancel();
         Ok(())
     }
 
@@ -501,9 +533,11 @@ impl Engine {
         self.inner.history.load(run_id)
     }
 
-    /// App-quit hook: cancel every run (except one inside the rename window, which gets the
-    /// grace period to finish), wait up to `grace`, then stop whatever is left. Every stopped
-    /// run is recorded `Interrupted` with `renames_completed` as persisted.
+    /// App-quit hook: cancel every run and every one-off operation (except one inside a rename
+    /// window, which gets the grace period to finish), wait up to `grace` for all of them, then
+    /// stop whatever is left. Every stopped run is recorded `Interrupted` with
+    /// `renames_completed` as persisted; an operation still going after the grace period is
+    /// recorded `Interrupted` too (its task belongs to the caller, so it cannot be aborted here).
     pub async fn shutdown(&self, grace: Duration) {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         lock(&self.inner.tickets).clear();
@@ -512,16 +546,35 @@ impl Engine {
             active
                 .iter()
                 .map(|(id, r)| {
-                    if !r.in_window.load(Ordering::SeqCst) {
-                        r.cancel.cancel();
-                    }
+                    // refused (not cancelled) inside the window: it finishes within the grace
+                    r.in_window.cancel(&r.cancel);
                     (id.clone(), r.done.clone())
                 })
                 .collect()
         };
+        let operations: Vec<(RunId, watch::Receiver<bool>)> = {
+            let ops = lock(&self.inner.operation_cancels);
+            ops.iter()
+                .map(|(id, o)| {
+                    o.window.cancel(&o.cancel);
+                    (id.clone(), o.done.clone())
+                })
+                .collect()
+        };
         let deadline = tokio::time::Instant::now() + grace;
-        for (_, mut rx) in runs.clone() {
+        for (_, mut rx) in runs.iter().cloned().chain(operations.iter().cloned()) {
             let _ = tokio::time::timeout_at(deadline, rx.wait_for(|d| *d)).await;
+        }
+        for (id, _) in operations {
+            if !lock(&self.inner.operation_cancels).contains_key(&id) {
+                continue;
+            }
+            if let Ok(mut rec) = self.inner.history.load_operation(&id) {
+                if !rec.status.is_terminal() {
+                    rec.mark_interrupted("pgWhy quit while the operation was in progress");
+                    let _ = self.inner.history.save_operation(&rec);
+                }
+            }
         }
         for (id, _) in runs {
             let task = lock(&self.inner.active)
@@ -593,28 +646,46 @@ impl Engine {
         self.inner.ops.clone()
     }
 
-    /// Register an operation's cancel handle so the UI can cancel it by record id.
-    pub(crate) fn register_operation_cancel(&self, id: &RunId, cancel: crate::ops::RunCancel) {
-        lock(&self.inner.operation_cancels).insert(id.clone(), cancel);
+    /// Register a running one-off operation so the UI can cancel it by record id and
+    /// [`shutdown`](Self::shutdown) can cancel and wait for it. The returned window is the
+    /// operation's rename window: it opens it around a rename that must not be cut short.
+    pub(crate) fn register_operation_cancel(&self, id: &RunId, cancel: RunCancel) -> SwapWindow {
+        let window = SwapWindow::default();
+        let (done_tx, done) = watch::channel(false);
+        lock(&self.inner.operation_cancels).insert(
+            id.clone(),
+            ActiveOp {
+                cancel,
+                window: window.clone(),
+                done,
+                done_tx,
+            },
+        );
+        window
     }
 
     pub(crate) fn unregister_operation_cancel(&self, id: &RunId) {
-        lock(&self.inner.operation_cancels).remove(id);
+        if let Some(op) = lock(&self.inner.operation_cancels).remove(id) {
+            let _ = op.done_tx.send(true);
+        }
     }
 
-    /// Whether a one-off operation that can be cancelled (a restore) is running.
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.inner.shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// Whether a one-off operation (restore, create, rename, drop, recovery) is running.
     pub fn has_active_operations(&self) -> bool {
         !lock(&self.inner.operation_cancels).is_empty()
     }
 
-    /// Cancel a running one-off operation. Returns whether one was running under `id`.
-    pub fn cancel_operation(&self, id: &RunId) -> bool {
+    /// Cancel a running one-off operation. `Ok(false)` when none is running under `id`; refused
+    /// while it is inside its rename window (it finishes in a moment; the cancel is not queued).
+    pub fn cancel_operation(&self, id: &RunId) -> AppResult<bool> {
         match lock(&self.inner.operation_cancels).get(id) {
-            Some(c) => {
-                c.cancel();
-                true
-            }
-            None => false,
+            Some(o) if o.window.cancel(&o.cancel) => Ok(true),
+            Some(_) => Err(swap_window_refusal()),
+            None => Ok(false),
         }
     }
 
@@ -631,7 +702,18 @@ impl Engine {
     /// Persist an operation record (callers rewrite it at every step boundary, exactly like a run
     /// record, so a crash leaves the last truth on disk).
     pub fn save_operation(&self, rec: &OperationRecord) -> AppResult<()> {
-        self.inner.history.save_operation(rec)
+        self.inner.history.save_operation(rec)?;
+        if rec.status.is_terminal() {
+            self.prune_history();
+        }
+        Ok(())
+    }
+
+    /// Drop the oldest finished records beyond the retention bounds (see
+    /// [`HistoryStore::prune`]); never anything still running or awaiting recovery. Failure is
+    /// logged, not surfaced: history housekeeping must not fail a run.
+    pub(crate) fn prune_history(&self) {
+        prune_history(&self.inner.history);
     }
 
     /// Every operation record on disk, newest first.
@@ -756,6 +838,150 @@ impl Engine {
         result.map(|_| rec)
     }
 
+    /// The recovery actions a standalone restore (an operation record) offers right now, from
+    /// a live scan of its server: complete or roll back a replace whose swap stopped between its
+    /// renames, and drop the staging / `_old` database an unfinished or finished swap left.
+    /// Nothing is offered for an operation that is still running or had no swap.
+    pub async fn operation_actions(&self, id: &RunId) -> AppResult<Vec<ActionOffer>> {
+        let rec = self.operation_for_recovery(id)?;
+        let Some(conn) = operation_connection(&rec) else {
+            return Ok(Vec::new());
+        };
+        let inv = scan_operation_inventory(&*self.inner.ops, &rec, &conn, None).await;
+        Ok(retry::derive_operation_actions(&rec, Some(&inv)))
+    }
+
+    /// Perform one of [`operation_actions`](Self::operation_actions): `CompleteSwap`,
+    /// `RollbackSwap`, `DropStaging` or `DropOld`. Re-scans the server and refuses unless the
+    /// action is enabled by what is there now (the same marker/ownership checks as a Refresh
+    /// run's recovery); runs under the target server's lock; persists the record before and
+    /// after.
+    pub async fn perform_operation(
+        &self,
+        id: &RunId,
+        action: ActionKind,
+    ) -> AppResult<OperationRecord> {
+        if matches!(action, ActionKind::Retry | ActionKind::KeepStaging) {
+            return Err(AppError::new(
+                ErrorKind::Refused,
+                "that action does not apply to a restore",
+            ));
+        }
+        let mut rec = self.operation_for_recovery(id)?;
+        let conn = operation_connection(&rec).ok_or_else(|| {
+            AppError::new(ErrorKind::Refused, "this operation has no swap to recover")
+        })?;
+        let server_key = rec
+            .restore()
+            .map(|r| r.target.server_key.clone())
+            .ok_or_else(|| AppError::internal("operation has no restore detail"))?;
+        let _guard = self
+            .inner
+            .locks
+            .try_acquire(&server_key, format!("recovery of {}", rec.name))?;
+        // From here the action is an in-flight operation: shutdown waits for it, and its renames
+        // are a window nothing may cut short.
+        let cancel = RunCancel::new();
+        let window = self.register_operation_cancel(&rec.id, cancel.clone());
+        let result = self
+            .perform_operation_inner(&mut rec, action, &conn, &window)
+            .await;
+        self.unregister_operation_cancel(&rec.id);
+        result?;
+        Ok(rec)
+    }
+
+    async fn perform_operation_inner(
+        &self,
+        rec: &mut OperationRecord,
+        action: ActionKind,
+        conn: &ConnectionId,
+        window: &SwapWindow,
+    ) -> AppResult<()> {
+        let maint: Arc<dyn MaintenanceOps> = Arc::from(self.inner.ops.maintenance(conn).await?);
+        let inv = scan_operation_inventory(&*self.inner.ops, rec, conn, Some(&*maint)).await;
+        let offer = retry::derive_operation_actions(rec, Some(&inv))
+            .into_iter()
+            .find(|a| a.kind == action)
+            .ok_or_else(|| {
+                AppError::new(
+                    ErrorKind::Refused,
+                    "that action is not available for this restore in its current state",
+                )
+            })?;
+        if !offer.enabled {
+            return Err(AppError::new(
+                ErrorKind::Refused,
+                offer
+                    .disabled_reason
+                    .unwrap_or_else(|| "that action is not available right now".into()),
+            ));
+        }
+        let timeout = self.inner.config.session_drain_timeout;
+        let ops = self.inner.ops.clone();
+        // Persisted first: if pgWhy dies mid-recovery the record says a recovery was under way.
+        rec.warnings
+            .push(format!("recovery started: {}", offer.label));
+        self.save_operation(rec)?;
+        window.enter(None)?;
+        let result = match action {
+            ActionKind::RollbackSwap => {
+                crate::swap::rollback_operation(&*ops, &*maint, rec, timeout).await
+            }
+            ActionKind::CompleteSwap => {
+                crate::swap::complete_operation(&*ops, &*maint, rec, timeout).await
+            }
+            ActionKind::DropStaging | ActionKind::DropOld => {
+                let db = offer.database.clone().unwrap_or_default();
+                let role = (action == ActionKind::DropOld).then_some(MarkerRole::Old);
+                crate::swap::drop_marked(&*maint, &db, &rec.id, role, timeout)
+                    .await
+                    .map(|_| {
+                        if let OperationDetail::Restore(r) = &mut rec.detail {
+                            if let Some(s) = &mut r.swap {
+                                if action == ActionKind::DropStaging {
+                                    s.staging_db = None;
+                                    s.work_db_state = WorkDbState::Dropped;
+                                }
+                            }
+                        }
+                        if action == ActionKind::DropOld
+                            && rec.status == RunStatus::SucceededCleanupRequired
+                        {
+                            rec.status = RunStatus::Succeeded;
+                        }
+                    })
+            }
+            ActionKind::Retry | ActionKind::KeepStaging => unreachable!(),
+        };
+        window.leave();
+        if let Err(e) = &result {
+            rec.warnings
+                .push(format!("{} failed: {}", offer.label, e.message));
+        }
+        self.save_operation(rec)?;
+        result
+    }
+
+    /// An operation record that may be acted on: it exists, is finished, and is not running here.
+    fn operation_for_recovery(&self, id: &RunId) -> AppResult<OperationRecord> {
+        if lock(&self.inner.operation_cancels).contains_key(id) {
+            return Err(AppError::new(
+                ErrorKind::Refused,
+                "that operation is still running",
+            ));
+        }
+        let rec = self.inner.history.load_operation(id)?;
+        if !rec.status.is_terminal() {
+            return Err(
+                AppError::new(ErrorKind::Refused, "that operation is still running").with_hint(
+                    "if pgWhy stopped while it ran, restart pgWhy to mark it interrupted",
+                ),
+            );
+        }
+        Ok(rec)
+    }
+
     /// Fix a preflight finding: drop a marked leftover (marker-verified) or `ROLLBACK PREPARED`
     /// a named prepared transaction on the target. Re-run preflight afterwards.
     pub async fn apply_preflight_fix(
@@ -815,13 +1041,89 @@ fn mark_interrupted(rec: &mut RunRecord, why: &str) {
     rec.actions = retry::derive_actions(rec, None);
 }
 
+/// The connection an operation's recovery runs on, when it is a replace-restore with a swap.
+fn operation_connection(rec: &OperationRecord) -> Option<ConnectionId> {
+    rec.swap_state()?;
+    rec.restore().map(|r| r.target.connection_id.clone())
+}
+
+/// Live inventory for a replace-restore record: the target, its staging and `_old` databases as
+/// the server has them now, with ownership judged by the operation's id (what its markers name).
+pub(crate) async fn scan_operation_inventory(
+    ops: &dyn RefreshOps,
+    rec: &OperationRecord,
+    conn: &ConnectionId,
+    maint: Option<&dyn MaintenanceOps>,
+) -> Inventory {
+    let owned;
+    let maint: AppResult<&dyn MaintenanceOps> = match maint {
+        Some(m) if !m.is_closed() => Ok(m),
+        _ => match ops.maintenance(conn).await {
+            Ok(m) => {
+                owned = m;
+                Ok(&*owned)
+            }
+            Err(e) => Err(e),
+        },
+    };
+    let target_name = rec
+        .restore()
+        .map(|r| r.target.database.clone())
+        .unwrap_or_default();
+    let swap = rec.swap_state();
+    let mut inv = Inventory {
+        scanned_at: now_rfc3339(),
+        reachable: false,
+        error: None,
+        target: DbPresence {
+            name: target_name.clone(),
+            exists: false,
+            marker: None,
+            owned_by_run: false,
+            sessions: 0,
+        },
+        staging: None,
+        old: None,
+        sessions: Vec::new(),
+        source_reachable: None,
+        source_error: None,
+    };
+    match maint {
+        Err(e) => inv.error = Some(e),
+        Ok(m) => match m.databases().await {
+            Err(e) => inv.error = Some(e),
+            Ok(dbs) => {
+                let mut names = vec![target_name.clone()];
+                names.extend(swap.and_then(|s| s.staging_db.clone()));
+                names.extend(swap.and_then(|s| s.old_db.clone()));
+                let sessions = m.sessions(&names).await.unwrap_or_default();
+                inv.reachable = true;
+                inv.target = presence(&dbs, &target_name, &rec.id, &sessions);
+                inv.staging = swap
+                    .and_then(|s| s.staging_db.as_deref())
+                    .map(|s| presence(&dbs, s, &rec.id, &sessions));
+                inv.old = swap
+                    .and_then(|s| s.old_db.as_deref())
+                    .map(|o| presence(&dbs, o, &rec.id, &sessions));
+                inv.sessions = sessions;
+            }
+        },
+    }
+    inv
+}
+
 pub(crate) fn apply_inventory(rec: &mut RunRecord, inv: Inventory) {
     rec.headline = retry::headline(rec, Some(&inv));
     rec.actions = retry::derive_actions(rec, Some(&inv));
     rec.inventory = Some(inv);
 }
 
-fn presence(dbs: &[DbFact], name: &str, run: &RunId, sessions: &[SessionInfo]) -> DbPresence {
+pub(crate) fn presence(
+    dbs: &[DbFact],
+    name: &str,
+    run: &RunId,
+    sessions: &[SessionInfo],
+) -> DbPresence {
     let fact = dbs.iter().find(|d| d.name == name);
     let marker = fact
         .and_then(|f| f.comment.as_deref())
@@ -956,7 +1258,8 @@ fn new_record(plan: &RunPlan) -> RunRecord {
             .map(|s| StepRecord::pending(s, strategy))
             .collect(),
         backup: None,
-        script: plan.script.clone(),
+        // The text stays in the plan, which runs it; the record keeps name, mode, hash and size.
+        script: plan.script.as_ref().map(ScriptRecord::redacted),
         locale: plan.locale.clone(),
         renames_completed: 0,
         swap_phase: None,
@@ -982,7 +1285,7 @@ pub(crate) struct Runner {
     pub(crate) rec: RunRecord,
     pub(crate) sink: EventSink,
     pub(crate) cancel: RunCancel,
-    pub(crate) in_window: Arc<AtomicBool>,
+    pub(crate) in_window: SwapWindow,
     maint: Option<Arc<dyn MaintenanceOps>>,
     step_started: Option<Instant>,
     step_lines: Arc<Mutex<VecDeque<String>>>,
@@ -996,7 +1299,7 @@ impl Runner {
         plan: RunPlan,
         sink: EventSink,
         cancel: RunCancel,
-        in_window: Arc<AtomicBool>,
+        in_window: SwapWindow,
     ) -> Self {
         let rec = new_record(&plan);
         Self {
@@ -1147,6 +1450,12 @@ impl Runner {
                 self.reuse_step(step);
                 continue;
             }
+            if i == begin_idx {
+                if let Err(e) = self.adopt_work_db().await {
+                    self.begin_step(step);
+                    return self.fail(step, e).await;
+                }
+            }
             if self.skip(step) {
                 self.mark_step(step, StepStatus::Skipped, None);
                 self.save_quiet();
@@ -1172,6 +1481,55 @@ impl Runner {
             }
         }
         self.succeed().await;
+    }
+
+    /// A retry that resumes against the retried run's work database takes it over: the database
+    /// must still carry that run's marker (and nothing else's), and is re-stamped with this run's
+    /// so every ownership check from here on (swap, "Complete the swap", drop/keep staging) sees
+    /// the database as this run's. Without it the marker keeps naming the old run and the new
+    /// run's own record could not act on the database it built on.
+    async fn adopt_work_db(&mut self) -> AppResult<()> {
+        let Some(resume) = self.plan.resume.clone().filter(|r| r.adopt_work_db) else {
+            return Ok(());
+        };
+        let role = match self.rec.strategy {
+            ReplaceStrategy::StagingSwap => MarkerRole::Staging,
+            ReplaceStrategy::DropFirst => MarkerRole::WorkTarget,
+        };
+        let db = self.plan.work_db().to_string();
+        let target = self.plan.target_db().to_string();
+        let wf_id = self.plan.workflow.id.0.clone();
+        let maint = self.maint().await?;
+        let dbs = maint.databases().await?;
+        let refuse = |why: String| AppError::new(ErrorKind::Refused, why);
+        let fact = dbs
+            .iter()
+            .find(|d| d.name == db)
+            .ok_or_else(|| refuse(format!("{db} no longer exists, so it cannot be reused")))?;
+        let marker = fact
+            .comment
+            .as_deref()
+            .and_then(Marker::parse)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "{db} is not marked by pgWhy and may be a real database, so it was not reused"
+                ))
+            })?;
+        if marker.run_id != resume.retry_of.0
+            || marker.role != role
+            || marker.workflow_id != wf_id
+            || marker.original_target != target
+        {
+            return Err(refuse(format!(
+                "{db} is not the database of run {}, so it was not reused",
+                resume.retry_of
+            )));
+        }
+        let restamped = Marker::new(role, &self.rec.run_id.0, &wf_id, &target);
+        maint
+            .set_comment(&db, Some(&restamped.to_comment()))
+            .await?;
+        Ok(())
     }
 
     fn skip(&self, step: StepId) -> bool {
@@ -1222,7 +1580,7 @@ impl Runner {
         let ts = staging::compact_timestamp(SystemTime::now());
         let stem = format!("{}_{}", sanitize(self.plan.source_db()), ts);
         let out = unique_dump_path(&self.plan.backup_dir, &stem);
-        let log_dir = self.inner.history.log_dir(&self.rec.run_id);
+        let log_dir = self.inner.history.log_dir(&self.rec.run_id)?;
         std::fs::create_dir_all(&log_dir).map_err(|e| {
             AppError::new(ErrorKind::Disk, "could not create the run's log folder")
                 .with_detail(format!("{}: {e}", log_dir.display()))
@@ -1351,7 +1709,7 @@ impl Runner {
         let log = self
             .inner
             .history
-            .log_dir(&self.rec.run_id)
+            .log_dir(&self.rec.run_id)?
             .join("restore.log");
         if let Some(parent) = log.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1392,7 +1750,7 @@ impl Runner {
         let Some(script) = self.plan.script.clone() else {
             return Ok(());
         };
-        self.rec.script = Some(script.clone());
+        self.rec.script = Some(script.redacted());
         let db = self.plan.work_db().to_string();
         let ctx = self.step_ctx(StepId::PostRestore);
         let ops = self.inner.ops.clone();
@@ -1455,7 +1813,7 @@ impl Runner {
         } else {
             (StepStatus::Failed, RunStatus::FailedAtStep)
         };
-        self.in_window.store(false, Ordering::SeqCst);
+        self.in_window.leave();
         self.end_step(step, step_status, Some(err.clone()));
         self.rec.failed_step = Some(step);
         self.rec.error = Some(err);
@@ -1495,6 +1853,7 @@ impl Runner {
         self.save_quiet();
         self.apply_retention();
         self.save_quiet();
+        prune_history(&self.inner.history);
         // Release server connections before announcing the end (the UI reconnects on it).
         self.maint = None;
         self.emit(RunEvent::RunFinished {

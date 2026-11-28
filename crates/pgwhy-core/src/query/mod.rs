@@ -33,7 +33,7 @@ pub use splitter::{
     statement_at, ScriptAnalysis, StatementInfo, StatementRange, TxnControl, Unterminated,
 };
 pub use topn::{
-    build_topn, run_topn, safe_type_name, text_expr, CriteriaOp, Criterion, SortKey, TopNColumn,
-    TopNOutcome, TopNOutputColumn, TopNQuery, TopNRequest, DEFAULT_TOP_N,
+    build_topn, run_topn, run_topn_cancellable, safe_type_name, text_expr, CriteriaOp, Criterion,
+    SortKey, TopNColumn, TopNOutcome, TopNOutputColumn, TopNQuery, TopNRequest, DEFAULT_TOP_N,
 };
 pub use txn::{SessionState, TxnStatus};

@@ -30,6 +30,34 @@ impl std::fmt::Display for WorkflowId {
     }
 }
 
+/// Longest id accepted as a file name. Real ids are 36-character UUIDs.
+const MAX_ID_LEN: usize = 128;
+
+/// Check that `id` is safe to use as a single file or folder name under a store directory.
+///
+/// Ids reach the stores from the UI (an IPC argument) and are formatted straight into paths, so
+/// they are validated here, at the choke points, rather than trusted. Real ids are UUIDs; the
+/// accepted shape is the slightly wider `[A-Za-z0-9_-]` plus interior dots (hand-edited workflow
+/// files and older ids), with no separators, no leading dot (so no `.`, `..` or hidden files) and
+/// no whitespace.
+pub(crate) fn require_safe_id(what: &str, id: &str) -> AppResult<()> {
+    let ok = !id.is_empty()
+        && id.len() <= MAX_ID_LEN
+        && !id.starts_with('.')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            ErrorKind::Config,
+            format!("{what} {id:?} is not a valid id"),
+        )
+        .with_hint("ids are letters, digits, '-', '_' and '.' only"))
+    }
+}
+
 /// A database on a saved connection.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DbRef {
@@ -252,8 +280,9 @@ impl WorkflowStore {
         &self.dir
     }
 
-    fn path(&self, id: &WorkflowId) -> PathBuf {
-        self.dir.join(format!("{id}.toml"))
+    fn path(&self, id: &WorkflowId) -> AppResult<PathBuf> {
+        require_safe_id("the workflow id", &id.0)?;
+        Ok(self.dir.join(format!("{id}.toml")))
     }
 
     pub fn list(&self) -> AppResult<Vec<RefreshWorkflow>> {
@@ -269,29 +298,31 @@ impl WorkflowStore {
                 out.push(read(&p)?);
             }
         }
-        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.sort_by_key(|w| w.name.to_lowercase());
         Ok(out)
     }
 
     pub fn get(&self, id: &WorkflowId) -> AppResult<RefreshWorkflow> {
-        read(&self.path(id))
+        read(&self.path(id)?)
     }
 
     pub fn save(&self, wf: &RefreshWorkflow) -> AppResult<()> {
+        let path = self.path(&wf.id)?;
         let text = toml::to_string_pretty(wf).map_err(|e| {
             AppError::internal("could not serialize the workflow").with_detail(e.to_string())
         })?;
         std::fs::create_dir_all(&self.dir).map_err(|e| io(&self.dir, e))?;
         let tmp = self.dir.join(format!(".{}.tmp", wf.id));
         std::fs::write(&tmp, text).map_err(|e| io(&tmp, e))?;
-        std::fs::rename(&tmp, self.path(&wf.id)).map_err(|e| io(&self.path(&wf.id), e))
+        std::fs::rename(&tmp, &path).map_err(|e| io(&path, e))
     }
 
     pub fn delete(&self, id: &WorkflowId) -> AppResult<()> {
-        match std::fs::remove_file(self.path(id)) {
+        let path = self.path(id)?;
+        match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io(&self.path(id), e)),
+            Err(e) => Err(io(&path, e)),
         }
     }
 }
@@ -419,5 +450,32 @@ mod tests {
         assert_eq!(store.get(&w.id).unwrap(), w);
         store.delete(&w.id).unwrap();
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ids_that_are_not_one_safe_path_component_are_refused() {
+        for good in ["wf-1", "a_b.c", "0b8d6f0e-5a0e-4c3a-9d36-3f2b6e2a9c11"] {
+            require_safe_id("id", good).unwrap();
+        }
+        for bad in [
+            "", ".", "..", "../x", "a/b", "a\\b", "/abs", ".hidden", "a b", "x\0y", "..\\x",
+        ] {
+            assert!(
+                require_safe_id("id", bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(require_safe_id("id", &"a".repeat(MAX_ID_LEN + 1)).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::new(dir.path().join("workflows"));
+        let src = conn("remote", EnvTag::Production);
+        let tgt = conn("local", EnvTag::Local);
+        let mut w = wf(&src, &tgt);
+        w.id = WorkflowId("../../escaped".into());
+        assert!(store.save(&w).is_err());
+        assert!(store.get(&w.id).is_err());
+        assert!(store.delete(&w.id).is_err());
+        assert!(!dir.path().join("escaped.toml").exists());
     }
 }

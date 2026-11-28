@@ -18,6 +18,7 @@
 //! the editor), `inet` (`abbrev()`, which equals the output function) and `character(n)`
 //! (`format('%s')`, keeping the padding).
 
+use super::cancel::CancelHandle;
 use super::edit::{EditColumn, EditTarget};
 use super::executor::ColumnMeta;
 use super::results::{ResultSet, ResultState};
@@ -572,20 +573,63 @@ pub struct TopNOutcome {
     pub duration_ms: f64,
 }
 
-/// Run `query` on the grid's dedicated connection, streaming rows into `set` (from
-/// [`TopNQuery::new_result_set`]). Cancel with the connection's cancel token: a server-side
-/// cancel ends the run with `cancelled` and the partial rows kept. Other failures mark the
-/// set interrupted and return the classified error.
+/// SQLSTATE 57014 (query_canceled) is also what a server `statement_timeout` raises, so it
+/// only counts as the user's cancel when one was actually requested.
+fn is_user_cancel(sqlstate_57014: bool, cancel_requested: bool) -> bool {
+    sqlstate_57014 && cancel_requested
+}
+
+/// Clears the handle's in-flight flag however the run ends.
+struct InFlight<'a>(Option<&'a CancelHandle>);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if let Some(c) = self.0 {
+            c.shared
+                .in_flight
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// [`run_topn_cancellable`] with no cancel handle: nothing can have requested a cancel, so a
+/// 57014 (a server `statement_timeout`) is an error like any other.
 pub async fn run_topn(
     client: &tokio_postgres::Client,
     query: &TopNQuery,
     set: &ResultSet,
 ) -> AppResult<TopNOutcome> {
+    run_topn_cancellable(client, query, set, None).await
+}
+
+/// Run `query` on the grid's dedicated connection, streaming rows into `set` (from
+/// [`TopNQuery::new_result_set`]). With a `cancel` handle for the same connection
+/// ([`CancelHandle::new`]), `cancel.cancel()` ends the run with `cancelled` and the partial
+/// rows kept. Other failures, including a server-side 57014 nobody asked for (a
+/// `statement_timeout`), mark the set interrupted and return the classified error.
+pub async fn run_topn_cancellable(
+    client: &tokio_postgres::Client,
+    query: &TopNQuery,
+    set: &ResultSet,
+    cancel: Option<&CancelHandle>,
+) -> AppResult<TopNOutcome> {
     let started = Instant::now();
+    // Set in-flight before reading the flag (see `super::cancel`), so a cancel is either seen
+    // here or sends the request to the running statement.
+    let _in_flight = InFlight(cancel);
+    if let Some(c) = cancel {
+        c.shared
+            .in_flight
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let fail = |e: &tokio_postgres::Error, set: &ResultSet| -> AppResult<TopNOutcome> {
-        if e.as_db_error()
-            .is_some_and(|db| db.code().code() == "57014")
-        {
+        let timeout_or_cancel = e
+            .as_db_error()
+            .is_some_and(|db| db.code().code() == "57014");
+        if is_user_cancel(
+            timeout_or_cancel,
+            cancel.is_some_and(CancelHandle::requested),
+        ) {
             set.finish(ResultState::Cancelled);
             return Ok(TopNOutcome {
                 rows: set.row_count(),
@@ -597,6 +641,15 @@ pub async fn run_topn(
         set.finish(ResultState::Interrupted);
         Err(classify_pg(e, "load the rows"))
     };
+    if cancel.is_some_and(CancelHandle::requested) {
+        set.finish(ResultState::Cancelled);
+        return Ok(TopNOutcome {
+            rows: set.row_count(),
+            truncated: set.truncated(),
+            cancelled: true,
+            duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
     let stream = match client
         .query_raw(query.sql.as_str(), params_refs(&query.params))
         .await
@@ -634,6 +687,14 @@ pub async fn run_topn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_requested_57014_is_a_user_cancel() {
+        assert!(is_user_cancel(true, true));
+        // statement_timeout: 57014 with no cancel requested is a real error
+        assert!(!is_user_cancel(true, false));
+        assert!(!is_user_cancel(false, true));
+    }
 
     #[test]
     fn type_name_grammar() {

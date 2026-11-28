@@ -1006,3 +1006,159 @@ async fn reinventory_never_writes_while_someone_holds_the_server() {
     assert!(on_disk.inventory.is_some());
     assert!(on_disk.warnings.iter().any(|w| w == "saved by the cleanup"));
 }
+
+#[tokio::test]
+async fn a_retry_that_adopts_staging_restamps_it_with_its_own_run() {
+    let h = Harness::new();
+    let fail_verify = || {
+        h.fake.fail(
+            Point::Verify,
+            AppError::new(ErrorKind::Sql, "verification failed"),
+        )
+    };
+    fail_verify();
+    let first = h.run(h.plan(ReplaceStrategy::StagingSwap)).await;
+    let staging = first.staging_db.clone().unwrap();
+    let marker = |h: &Harness| Marker::parse(&h.fake.comment(&staging).unwrap()).unwrap();
+    assert_eq!(marker(&h).run_id, first.run_id.0);
+
+    // the retry takes the staging database over, then fails again before the swap
+    fail_verify();
+    let second = h.run(retry_plan(&h, &first, StepId::Verify)).await;
+    assert_eq!(second.status, RunStatus::FailedAtStep);
+    let m = marker(&h);
+    assert_eq!(m.run_id, second.run_id.0, "the marker names the new run");
+    assert_eq!(m.role, MarkerRole::Staging);
+    assert_eq!(m.workflow_id, "wf-1");
+    let staging_presence = second.inventory.as_ref().unwrap().staging.as_ref().unwrap();
+    assert!(
+        staging_presence.owned_by_run,
+        "the new run's record owns the database it built on"
+    );
+    // so the new run's own record can drop it
+    assert!(second
+        .actions
+        .iter()
+        .any(|a| a.kind == ActionKind::DropStaging && a.enabled));
+    let dropped = h
+        .engine
+        .perform(&second.run_id, ActionKind::DropStaging)
+        .await
+        .unwrap();
+    assert_eq!(dropped.work_db_state, WorkDbState::Dropped);
+    assert!(!h.fake.has_db(&staging));
+}
+
+#[tokio::test]
+async fn a_retry_refuses_to_adopt_a_staging_database_marked_for_another_run() {
+    let h = Harness::new();
+    h.fake.fail(
+        Point::Verify,
+        AppError::new(ErrorKind::Sql, "verification failed"),
+    );
+    let first = h.run(h.plan(ReplaceStrategy::StagingSwap)).await;
+    let staging = first.staging_db.clone().unwrap();
+    let plan = retry_plan(&h, &first, StepId::Verify);
+    // between preflight and start, the database was re-marked by something else
+    let foreign = Marker::new(MarkerRole::Staging, "another-run", "wf-1", "app").to_comment();
+    h.fake
+        .server
+        .lock()
+        .unwrap()
+        .dbs
+        .get_mut(&staging)
+        .unwrap()
+        .comment = Some(foreign.clone());
+    let verifies = h.fake.calls_matching("verify");
+
+    let second = h.run(plan).await;
+    assert_eq!(second.status, RunStatus::FailedAtStep);
+    assert_eq!(second.error.as_ref().unwrap().kind, ErrorKind::Refused);
+    assert_eq!(
+        h.fake.calls_matching("verify"),
+        verifies,
+        "nothing ran on it"
+    );
+    assert_eq!(h.fake.comment(&staging), Some(foreign), "marker untouched");
+}
+
+#[tokio::test]
+async fn the_history_keeps_a_script_hash_and_size_never_its_text() {
+    let h = Harness::new();
+    let mut plan = h.plan(ReplaceStrategy::StagingSwap);
+    Harness::with_script(&mut plan, ScriptMode::Transaction);
+    let text = "update users set email = null;";
+    let rec = h.run(plan).await;
+    assert_eq!(rec.status, RunStatus::Succeeded);
+    let s = rec.script.as_ref().unwrap();
+    assert_eq!(
+        (s.name.as_str(), s.sha256.as_str()),
+        ("anonymize", "abc123")
+    );
+    assert!(s.content.is_empty());
+    assert_eq!(s.size_bytes, Some(text.len() as u64));
+    // the script did run (the fake saw its hash), and the text is nowhere on disk
+    assert_eq!(h.fake.calls_matching("script app_staging"), 1);
+    let on_disk =
+        std::fs::read_to_string(h.engine.history().record_path(&rec.run_id).unwrap()).unwrap();
+    assert!(!on_disk.contains("email"), "{on_disk}");
+    // records written before the redaction still load
+    let old: ScriptRecord = serde_json::from_value(serde_json::json!({
+        "id": "s", "name": "n", "mode": "transaction", "sha256": "h", "content": "select 1"
+    }))
+    .unwrap();
+    assert_eq!(old.content, "select 1");
+    assert_eq!(old.redacted().size_bytes, Some(8));
+}
+
+#[tokio::test]
+async fn finishing_runs_prunes_old_records_but_keeps_unfinished_business() {
+    let h = Harness::new();
+    // a failed run that keeps staging is pending cleanup: it must survive any pruning
+    h.fake.fail(
+        Point::Verify,
+        AppError::new(ErrorKind::Sql, "verification failed"),
+    );
+    let kept = h.run(h.plan(ReplaceStrategy::StagingSwap)).await;
+    assert!(kept
+        .actions
+        .iter()
+        .any(|a| a.kind == ActionKind::DropStaging));
+    let removed = h.engine.history().prune(0, 0).unwrap();
+    assert_eq!(removed, 0);
+    assert!(h.engine.get_run(&kept.run_id).is_ok());
+}
+
+#[tokio::test]
+async fn a_retry_is_refused_once_a_newer_run_has_swapped_in_fresher_data() {
+    let h = Harness::new();
+    h.fake.fail(
+        Point::Verify,
+        AppError::new(ErrorKind::Sql, "verification failed"),
+    );
+    let stale = h.run(h.plan(ReplaceStrategy::StagingSwap)).await;
+    assert_eq!(stale.status, RunStatus::FailedAtStep);
+    let all = h.engine.list_runs(Some(&stale.workflow_id)).unwrap();
+    assert!(
+        retry::superseded_by(&stale, &all).is_none(),
+        "nothing newer yet"
+    );
+
+    // the user drops the kept staging and refreshes again, successfully
+    h.engine
+        .perform(&stale.run_id, ActionKind::DropStaging)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await; // started_at is second-granular
+    let fresh = h.run(h.plan(ReplaceStrategy::StagingSwap)).await;
+    assert_eq!(fresh.status, RunStatus::Succeeded);
+
+    let all = h.engine.list_runs(Some(&stale.workflow_id)).unwrap();
+    let newer = retry::superseded_by(&stale, &all).expect("the fresh run supersedes it");
+    assert_eq!(newer.run_id, fresh.run_id);
+    let e = retry::superseded_refusal(&stale, newer);
+    assert_eq!(e.kind, ErrorKind::Refused);
+    assert!(e.message.contains(&fresh.run_id.0) && e.message.contains("older data"));
+    // the newer run itself is never superseded by the older one
+    assert!(retry::superseded_by(&fresh, &all).is_none());
+}

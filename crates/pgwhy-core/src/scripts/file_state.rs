@@ -119,6 +119,43 @@ pub fn read_script_file(path: &Path) -> AppResult<ScriptFile> {
 /// Atomically write `content` to `path` (creating parent directories) and return the new
 /// fingerprint, which the editor stores as its loaded state.
 pub fn write_script_file(path: &Path, content: &str) -> AppResult<FileFingerprint> {
+    write_script_file_checked(path, content, None)
+}
+
+/// Value of `data.code` on the error [`changed_on_disk`] builds; the UI matches on it.
+pub const CHANGED_ON_DISK_CODE: &str = "changed_on_disk";
+
+/// The refusal for a save whose file changed since the editor loaded it: kind
+/// [`ErrorKind::Refused`] (nothing was written), `data` =
+/// `{ "code": "changed_on_disk", "current": <FileFingerprint of what is on disk now> }`.
+pub fn changed_on_disk(path: &Path, current: &FileFingerprint) -> AppError {
+    AppError::new(
+        ErrorKind::Refused,
+        format!("{} was changed on disk since it was opened", path.display()),
+    )
+    .with_hint("reload it to see the new content, or save again to overwrite it")
+    .with_data(serde_json::json!({ "code": CHANGED_ON_DISK_CODE, "current": current }))
+}
+
+/// [`write_script_file`] that first compares the file's current bytes with `expected` (what
+/// the editor loaded or last saved) and refuses with [`changed_on_disk`] when they differ.
+/// `None` writes unconditionally; a file that no longer exists is simply recreated. The
+/// check and the write are not one atomic step: an edit landing between them is still
+/// overwritten, but the window is a few milliseconds instead of the whole editing session.
+pub fn write_script_file_checked(
+    path: &Path,
+    content: &str,
+    expected: Option<&FileFingerprint>,
+) -> AppResult<FileFingerprint> {
+    if let Some(expected) = expected {
+        if let Some(bytes) = read_bytes(path)? {
+            let meta = std::fs::metadata(path).ok();
+            let current = FileFingerprint::of(&bytes, meta.as_ref());
+            if current.sha256 != expected.sha256 {
+                return Err(changed_on_disk(path, &current));
+            }
+        }
+    }
     write_file_atomic(path, content.as_bytes())?;
     let meta = std::fs::metadata(path).ok();
     Ok(FileFingerprint::of(content.as_bytes(), meta.as_ref()))
@@ -204,5 +241,28 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o664
         );
+    }
+
+    #[test]
+    fn checked_write_refuses_a_file_changed_since_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.sql");
+        let loaded = write_script_file(&path, "select 1;").unwrap();
+        // unchanged: the save goes through and returns the new fingerprint
+        let saved = write_script_file_checked(&path, "select 2;", Some(&loaded)).unwrap();
+        std::fs::write(&path, "select 3;").unwrap();
+        let err = write_script_file_checked(&path, "select 4;", Some(&saved)).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Refused);
+        let data = err.data.unwrap();
+        assert_eq!(data["code"], CHANGED_ON_DISK_CODE);
+        assert_eq!(
+            data["current"]["sha256"],
+            FileFingerprint::of(b"select 3;", None).sha256
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "select 3;");
+        // no expectation, or a deleted file, writes
+        write_script_file_checked(&path, "select 5;", None).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        write_script_file_checked(&path, "select 6;", Some(&saved)).unwrap();
     }
 }

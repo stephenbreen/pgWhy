@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -14,7 +14,7 @@ const conn0 = useConnections.getState();
 
 const rows = [["1", "ada"], ["2", "grace"], ["3", "edsger"]];
 
-function backend(opts: { editable?: boolean; commitError?: boolean } = {}) {
+function backend(opts: { editable?: boolean; commitError?: boolean; requeryError?: boolean; requeryGate?: Promise<void> } = {}) {
   const calls: { cmd: string; args: Record<string, unknown> }[] = [];
   let pending = 0;
   let subscribed: ((m: ArrayBuffer) => void) | null = null;
@@ -28,8 +28,11 @@ function backend(opts: { editable?: boolean; commitError?: boolean } = {}) {
     const a = args as Record<string, unknown>;
     calls.push({ cmd, args: a });
     switch (cmd) {
-      case "grid_open":
       case "grid_requery":
+        if (opts.requeryError) throw { kind: "sql", class: "retriable", message: "requery went wrong" };
+        if (opts.requeryGate) return opts.requeryGate.then(() => view());
+        return view();
+      case "grid_open":
         return view();
       case "result_subscribe":
         subscribed = (m) => (a.channel as { onmessage: (m: ArrayBuffer) => void }).onmessage(m);
@@ -130,6 +133,62 @@ describe("top-N grid", () => {
     expect(ask).toHaveTextContent("discards 1 pending change");
     await user.click(within(ask).getByRole("button", { name: "Keep editing" }));
     expect(screen.getByRole("status", { name: "Pending changes" })).toBeInTheDocument();
+  });
+
+  it("a declined or failed sort leaves the header arrow and the next refresh on the old sort", async () => {
+    const user = userEvent.setup();
+    const calls = backend();
+    await openPeople();
+    await editCell(user, "ada", "ADA");
+    await user.click(screen.getByRole("button", { name: "Sort by name" }));
+    await user.click(within(await screen.findByRole("alert")).getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByRole("columnheader", { name: /^name/ })).not.toHaveAttribute("aria-sort");
+    expect(calls.filter((c) => c.cmd === "grid_requery")).toHaveLength(0);
+
+    await user.click(screen.getByRole("button", { name: /Refresh/ }));
+    await user.click(within(await screen.findByRole("alert")).getByRole("button", { name: "Discard" }));
+    await screen.findByText("ada");
+    expect(calls.filter((c) => c.cmd === "grid_requery").at(-1)?.args.sort).toEqual([]);
+  });
+
+  it("a sort whose requery fails is not kept", async () => {
+    const user = userEvent.setup();
+    backend({ requeryError: true });
+    await openPeople();
+    await user.click(screen.getByRole("button", { name: "Sort by name" }));
+    expect(await screen.findByText(/requery went wrong/)).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: /^name/ })).not.toHaveAttribute("aria-sort");
+  });
+
+  it("ignores a second sort while a requery is in flight", async () => {
+    const user = userEvent.setup();
+    let release!: () => void;
+    const calls = backend({ requeryGate: new Promise<void>((r) => (release = r)) });
+    await openPeople();
+    await user.click(screen.getByRole("button", { name: "Sort by name" }));
+    await user.click(screen.getByRole("button", { name: "Sort by id" }));
+    expect(calls.filter((c) => c.cmd === "grid_requery")).toHaveLength(1);
+    await act(async () => release());
+    await waitFor(() => expect(screen.getByRole("columnheader", { name: /^name/ })).toHaveAttribute("aria-sort", "ascending"));
+  });
+
+  it("when the commit went through but the refresh fails, the pending state is cleared and the failure said separately", async () => {
+    const user = userEvent.setup();
+    const calls = backend();
+    await openPeople();
+    await editCell(user, "grace", "GRACE");
+    // the commit succeeds; only the requery after it fails
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args: args as Record<string, unknown> });
+      if (cmd === "grid_commit") return { updated: 1, inserted: 0, deleted: 0 };
+      if (cmd === "grid_requery") throw { kind: "sql", class: "retriable", message: "requery went wrong" };
+      return null;
+    });
+    await user.click(screen.getByRole("button", { name: "Commit" }));
+    expect(await screen.findByText(/Changes were committed.*refreshing the rows failed/)).toBeInTheDocument();
+    expect(screen.getByText(/requery went wrong/)).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Pending changes" })).not.toBeInTheDocument();
+    expect(calls.filter((c) => c.cmd === "grid_commit")).toHaveLength(1);
   });
 
   it("filters are parameterized criteria, not SQL text", async () => {

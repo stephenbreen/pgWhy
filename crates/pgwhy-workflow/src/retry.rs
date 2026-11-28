@@ -141,9 +141,62 @@ fn drop_refusal(p: &DbPresence) -> Option<String> {
     }
 }
 
+/// The only two actions while a swap is between its renames: complete it, or roll it back. Each
+/// is enabled only when the live inventory shows what it needs: staging that is this run's own to
+/// finish; a marked `_old` and a free target name to roll back.
+fn swap_window_offers(
+    target: &str,
+    staging: Option<&str>,
+    old: Option<&str>,
+    inv: Option<&Inventory>,
+) -> Vec<ActionOffer> {
+    let reachable = inv.is_some_and(|i| i.reachable);
+    let gate = |a: ActionOffer| -> ActionOffer {
+        match inv {
+            Some(i) if !i.reachable => disable(a, unreachable_reason(i)),
+            None => disable(a, "re-check the target server first"),
+            _ => a,
+        }
+    };
+    let mut complete = gate(offer(
+        ActionKind::CompleteSwap,
+        "Complete the swap",
+        staging,
+    ));
+    let mut rollback = gate(offer(
+        ActionKind::RollbackSwap,
+        "Roll back to the previous database",
+        old,
+    ));
+    if let Some(i) = inv.filter(|_| reachable) {
+        match i.staging.as_ref() {
+            Some(s) if s.exists && s.owned_by_run => {}
+            Some(s) => {
+                complete = disable(
+                    complete,
+                    drop_refusal(s).unwrap_or_else(|| format!("{} is not usable", s.name)),
+                )
+            }
+            None => complete = disable(complete, "the staging database is unknown"),
+        }
+        match i.old.as_ref() {
+            Some(o) if o.exists && o.marker.is_some() => {}
+            _ => {
+                rollback = disable(
+                    rollback,
+                    "the previous database is not available under its _old name",
+                )
+            }
+        }
+        if i.target.exists {
+            rollback = disable(rollback, format!("{target} already exists"));
+        }
+    }
+    vec![complete, rollback]
+}
+
 /// The full state-aware action set for a record given a (preferably fresh) inventory.
 pub fn derive_actions(rec: &RunRecord, inv: Option<&Inventory>) -> Vec<ActionOffer> {
-    let reachable = inv.is_some_and(|i| i.reachable);
     let gate = |a: ActionOffer| -> ActionOffer {
         match inv {
             Some(i) if !i.reachable => disable(a, unreachable_reason(i)),
@@ -154,44 +207,12 @@ pub fn derive_actions(rec: &RunRecord, inv: Option<&Inventory>) -> Vec<ActionOff
     let mut out = Vec::new();
 
     if in_swap_window(rec, inv) {
-        let staging = rec.staging_db.as_deref();
-        let mut complete = gate(offer(
-            ActionKind::CompleteSwap,
-            "Complete the swap",
-            staging,
-        ));
-        let mut rollback = gate(offer(
-            ActionKind::RollbackSwap,
-            "Roll back to the previous database",
+        return swap_window_offers(
+            &rec.target.database,
+            rec.staging_db.as_deref(),
             rec.old_db.as_deref(),
-        ));
-        if let Some(i) = inv.filter(|_| reachable) {
-            match i.staging.as_ref() {
-                Some(s) if s.exists && s.owned_by_run => {}
-                Some(s) => {
-                    complete = disable(
-                        complete,
-                        drop_refusal(s).unwrap_or_else(|| format!("{} is not usable", s.name)),
-                    )
-                }
-                None => complete = disable(complete, "the staging database is unknown"),
-            }
-            match i.old.as_ref() {
-                Some(o) if o.exists && o.marker.is_some() => {}
-                _ => {
-                    rollback = disable(
-                        rollback,
-                        "the previous database is not available under its _old name",
-                    )
-                }
-            }
-            if i.target.exists {
-                rollback = disable(rollback, format!("{} already exists", rec.target.database));
-            }
-        }
-        out.push(complete);
-        out.push(rollback);
-        return out;
+            inv,
+        );
     }
 
     // Success with leftovers: cleanup only.
@@ -424,6 +445,33 @@ pub fn plan_retry(rec: &RunRecord, from: StepId, inv: Option<&Inventory>) -> App
     }
 }
 
+/// The newest run of the same workflow that succeeded after `rec` started, if any. Such a run
+/// swapped newer data into the target, so anything `rec` kept (its backup, its staging database)
+/// is stale: reusing it would put older data over the newer refresh.
+pub fn superseded_by<'a>(rec: &RunRecord, all: &'a [RunRecord]) -> Option<&'a RunRecord> {
+    all.iter()
+        .filter(|o| {
+            o.run_id != rec.run_id
+                && o.workflow_id == rec.workflow_id
+                && o.status.is_success()
+                && o.started_at > rec.started_at
+        })
+        .max_by(|a, b| a.started_at.cmp(&b.started_at))
+}
+
+/// The refusal for a retry that would reuse a superseded run's backup or staging database.
+pub fn superseded_refusal(rec: &RunRecord, newer: &RunRecord) -> AppError {
+    AppError::new(
+        ErrorKind::Refused,
+        format!(
+            "a newer refresh of \"{}\" (run {}, started {}) has since completed; reusing this \
+             run's backup or staging database would put older data over it",
+            rec.workflow_name, newer.run_id, newer.started_at
+        ),
+    )
+    .with_hint("re-dump from scratch, or start a new run of the workflow")
+}
+
 /// Backups retention must keep: those referenced by failed runs that can still be retried
 /// (no later successful run of the same workflow).
 ///
@@ -475,5 +523,83 @@ pub fn protected_backups_with_operations(
             _ => {}
         }
     }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Operation records (a replace-restore's swap)
+// ---------------------------------------------------------------------------------------------
+
+/// True when a replace-restore's working database exists only under the `_old` name.
+pub fn operation_in_swap_window(rec: &OperationRecord, inv: Option<&Inventory>) -> bool {
+    let Some(swap) = rec.swap_state() else {
+        return false;
+    };
+    if swap.create_mode || rec.status.is_success() || !rec.status.is_terminal() {
+        return false;
+    }
+    match inv.filter(|i| i.reachable) {
+        Some(i) => !i.target.exists && i.old.as_ref().is_some_and(|o| o.exists),
+        // Can't look: trust the record, conservatively (it can lag by one rename).
+        None => {
+            swap.renames_completed == 1
+                || (swap.renames_completed == 0
+                    && swap.swap_phase == Some(SwapPhase::RenamingTargetToOld))
+        }
+    }
+}
+
+/// The actions a replace-restore record offers, from a live inventory: complete or roll back an
+/// interrupted swap, and drop what a finished or abandoned one left behind. Records that were not
+/// a replace-restore, or are still running, offer nothing.
+pub fn derive_operation_actions(
+    rec: &OperationRecord,
+    inv: Option<&Inventory>,
+) -> Vec<ActionOffer> {
+    let Some(swap) = rec.swap_state() else {
+        return Vec::new();
+    };
+    let Some(target) = rec.restore().map(|r| r.target.database.as_str()) else {
+        return Vec::new();
+    };
+    if !rec.status.is_terminal() || swap.create_mode {
+        return Vec::new();
+    }
+    if operation_in_swap_window(rec, inv) {
+        return swap_window_offers(
+            target,
+            swap.staging_db.as_deref(),
+            swap.old_db.as_deref(),
+            inv,
+        );
+    }
+    let gate = |a: ActionOffer| -> ActionOffer {
+        match inv {
+            Some(i) if !i.reachable => disable(a, unreachable_reason(i)),
+            None => disable(a, "re-check the target server first"),
+            _ => a,
+        }
+    };
+    let mut out = Vec::new();
+    let leftovers = |p: Option<&DbPresence>, kind: ActionKind| -> Option<ActionOffer> {
+        let p = p.filter(|p| p.exists)?;
+        let a = gate(offer(kind, format!("Drop {}", p.name), Some(&p.name)));
+        Some(match drop_refusal(p) {
+            Some(r) => disable(a, r),
+            None => a,
+        })
+    };
+    // A finished swap's staging name is gone (it became the target); only an unfinished one
+    // leaves staging behind.
+    if !rec.status.is_success() {
+        out.extend(leftovers(
+            inv.and_then(|i| i.staging.as_ref()),
+            ActionKind::DropStaging,
+        ));
+    }
+    out.extend(leftovers(
+        inv.and_then(|i| i.old.as_ref()),
+        ActionKind::DropOld,
+    ));
     out
 }

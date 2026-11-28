@@ -105,6 +105,8 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         commands::runs::run_list,
         commands::runs::history_list,
         commands::runs::operation_get,
+        commands::runs::operation_actions,
+        commands::runs::operation_action,
         commands::runs::run_get,
         commands::runs::run_reinventory,
         commands::runs::run_action,
@@ -140,7 +142,7 @@ async fn forward_connection_events(
 /// transactions; a webview that crashed (or never wired its listener) would otherwise leave an
 /// app that cannot be closed. The UI acknowledges each request at once. A close request that
 /// arrives while the previous one is still unacknowledged means the UI is not answering: the
-/// backend then asks itself (a native dialog when transactions are open) and quits. There is
+/// backend then asks itself (a native dialog) and quits. There is
 /// no timer, so a page that is merely slow is never closed out from under the user.
 struct CloseGate {
     requested: std::sync::atomic::AtomicBool,
@@ -156,11 +158,18 @@ static CLOSE_GATE: CloseGate = CloseGate {
 /// back when the process goes.
 pub(crate) async fn stop_background_work<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(state) = app.try_state::<state::AppState>() {
+        // standalone backups are not the engine's: stop their pg_dump here
+        state.backups.cancel_all();
         // quitting mid-run kills the children and records the run as Interrupted
         let _ = state
             .engine()
             .shutdown(std::time::Duration::from_secs(5))
             .await;
+        // a cancelled pg_dump takes a moment to die and remove its partial file and pgpass
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.backups.any_running() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         state.tunnels.close_all();
     }
 }
@@ -213,37 +222,47 @@ fn on_close_requested<R: tauri::Runtime>(window: &tauri::Window<R>, api: &tauri:
     let _ = window.emit("close-requested", ());
 }
 
-/// Quit without the UI. Open transactions would be rolled back by the server when their
-/// connections go, so when there are any, the user confirms that in a native dialog first.
+/// Quit without the UI, after the user confirms in a native dialog: open transactions would be
+/// rolled back by the server when their connections go, and the UI never got to ask about
+/// unsaved work.
 async fn force_quit<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     let open = app
         .try_state::<state::AppState>()
         .map(|s| s.editors.open_transactions().len())
         .unwrap_or(0);
-    if open > 0 {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        app.dialog()
-            .message(format!(
-                "The window is not responding. {open} editor tab{} {} an open transaction; \
-                 quitting now rolls {} back.",
-                if open == 1 { "" } else { "s" },
-                if open == 1 { "has" } else { "have" },
-                if open == 1 { "it" } else { "them" },
-            ))
-            .title("Quit pgWhy?")
-            .kind(MessageDialogKind::Warning)
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "Quit and roll back".into(),
-                "Keep open".into(),
-            ))
-            .show(move |quit| {
-                let _ = tx.send(quit);
-            });
-        if !rx.await.unwrap_or(false) {
-            close_abort();
-            return;
-        }
+    // Always asked: a second close request that merely outran the UI's acknowledgement (two quick
+    // presses, a slow webview) must not skip the UI's own prompts for unsaved work silently.
+    let detail = if open > 0 {
+        format!(
+            " {open} editor tab{} {} an open transaction; quitting now rolls {} back.",
+            if open == 1 { "" } else { "s" },
+            if open == 1 { "has" } else { "have" },
+            if open == 1 { "it" } else { "them" },
+        )
+    } else {
+        " Unsaved changes will be lost.".to_string()
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .message(format!("The window is not responding.{detail}"))
+        .title("Quit pgWhy?")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            if open > 0 {
+                "Quit and roll back"
+            } else {
+                "Quit"
+            }
+            .into(),
+            "Keep open".into(),
+        ))
+        .show(move |quit| {
+            let _ = tx.send(quit);
+        });
+    if !rx.await.unwrap_or(false) {
+        close_abort();
+        return;
     }
     shutdown_and_exit(app).await;
 }

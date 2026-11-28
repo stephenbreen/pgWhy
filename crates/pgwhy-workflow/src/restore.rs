@@ -22,13 +22,13 @@ use crate::history::{
 };
 use crate::ops::StepProgress;
 use crate::ops::{OpCtx, OpEvent, RunCancel};
-use crate::staging::LocaleSpec;
+use crate::staging::{LocaleSpec, Marker, MarkerRole};
+use crate::swap::SwapWindow;
 use pgwhy_core::config::ConnectionEntry;
 use pgwhy_core::{AppError, AppResult, ErrorClass, ErrorKind};
 use pgwhy_pgtools::{ArchiveInspection, DiscoveredTool, RestoreOptions, ToolPassword};
 use serde::Serialize;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -175,7 +175,7 @@ impl Engine {
         self.save_operation(&rec)?;
 
         let cancel = RunCancel::new();
-        self.register_operation_cancel(&rec.id, cancel.clone());
+        let window = self.register_operation_cancel(&rec.id, cancel.clone());
         if let Some(sink) = req.on_event.as_ref() {
             sink(RestoreEvent::Started {
                 id: rec.id.0.clone(),
@@ -183,7 +183,7 @@ impl Engine {
                 mode: req.mode,
             });
         }
-        let result = self.restore_steps(&req, &mut rec, &cancel).await;
+        let result = self.restore_steps(&req, &mut rec, &cancel, &window).await;
         self.unregister_operation_cancel(&rec.id);
 
         match result {
@@ -206,7 +206,10 @@ impl Engine {
                         s.fail(e.clone());
                     }
                 }
-                rec.status = if e.kind == ErrorKind::Cancelled {
+                rec.status = if e.kind == ErrorKind::Cancelled && self.is_shutting_down() {
+                    // stopped by the app quitting, not by the user
+                    RunStatus::Interrupted
+                } else if e.kind == ErrorKind::Cancelled {
                     RunStatus::Cancelled
                 } else {
                     RunStatus::FailedAtStep
@@ -225,6 +228,7 @@ impl Engine {
         req: &RestoreRequest,
         rec: &mut OperationRecord,
         cancel: &RunCancel,
+        window: &SwapWindow,
     ) -> AppResult<()> {
         let ops = self.refresh_ops();
         let emit = sink(req);
@@ -291,6 +295,20 @@ impl Engine {
                 }
                 return Err(e);
             }
+            if req.mode == RestoreMode::Replace {
+                // Staging must carry this operation's marker: the swap refuses a staging
+                // database it cannot prove is its own, and recovery (complete / drop) acts on
+                // nothing else.
+                let marker = Marker::new(MarkerRole::Staging, &rec.id.0, &rec.id.0, &req.database);
+                if let Err(e) = maint
+                    .set_comment(&staging, Some(&marker.to_comment()))
+                    .await
+                {
+                    // Created moments ago by this step: dropping it is safe without the marker.
+                    let _ = maint.drop_database(&staging).await;
+                    return Err(e);
+                }
+            }
             set_step(
                 self,
                 rec,
@@ -335,7 +353,7 @@ impl Engine {
             "restore",
             StepStatus::Running,
         )?;
-        let log = self.history().log_dir(&rec.id).join("restore.log");
+        let log = self.history().log_dir(&rec.id)?.join("restore.log");
         if let Some(dir) = log.parent() {
             std::fs::create_dir_all(dir).map_err(|e| {
                 AppError::new(
@@ -363,7 +381,9 @@ impl Engine {
         // From here on a failure must leave a clean state: a new or staging database is dropped,
         // an in-place restore says plainly that what was applied stays.
         let tail = self
-            .finish_restore(req, rec, &*ops, &*maint, &opctx, cancel, &staging, outcome)
+            .finish_restore(
+                req, rec, &*ops, &*maint, &opctx, cancel, window, &staging, outcome,
+            )
             .await;
         if let Err(e) = tail {
             match req.mode {
@@ -388,8 +408,18 @@ impl Engine {
                             req.database, req.database
                         ));
                     } else {
-                        self.discard_half_restored(&staging, rec, &*maint, cancel)
+                        let dropped = self
+                            .discard_half_restored(&staging, rec, &*maint, cancel)
                             .await;
+                        if dropped {
+                            // nothing is left to recover or clean up for this record
+                            if let OperationDetail::Restore(r) = &mut rec.detail {
+                                if let Some(swap) = &mut r.swap {
+                                    swap.staging_db = None;
+                                    swap.work_db_state = WorkDbState::Dropped;
+                                }
+                            }
+                        }
                     }
                 }
                 RestoreMode::OnTop => rec.warnings.push(
@@ -412,6 +442,7 @@ impl Engine {
         maint: &dyn crate::ops::MaintenanceOps,
         opctx: &OpCtx,
         cancel: &RunCancel,
+        window: &SwapWindow,
         staging: &str,
         restore_outcome: AppResult<crate::ops::ToolStepDone>,
     ) -> AppResult<()> {
@@ -452,7 +483,7 @@ impl Engine {
         )?;
 
         if req.mode == RestoreMode::Replace {
-            self.swap_replace(req, rec, ops, maint, cancel, staging)
+            self.swap_replace(req, rec, ops, maint, cancel, window, staging)
                 .await?;
         }
         Ok(())
@@ -461,6 +492,7 @@ impl Engine {
     /// Swap the verified staging database over the target. The shared step persists the swap
     /// state into this operation's record at every boundary, so an interruption can always be
     /// finished or rolled back.
+    #[allow(clippy::too_many_arguments)]
     async fn swap_replace(
         &self,
         req: &RestoreRequest,
@@ -468,6 +500,7 @@ impl Engine {
         ops: &dyn crate::ops::RefreshOps,
         maint: &dyn crate::ops::MaintenanceOps,
         cancel: &RunCancel,
+        window: &SwapWindow,
         staging: &str,
     ) -> AppResult<()> {
         use crate::swap::{swap_into_place, SwapJob, SwapProgress};
@@ -511,7 +544,6 @@ impl Engine {
             }
             self.save_operation(rec)
         };
-        let in_window = AtomicBool::new(false);
         let job = SwapJob {
             ops,
             maint,
@@ -524,12 +556,12 @@ impl Engine {
             owner: &id.0,
             timeout: self.config().session_drain_timeout,
             cancel: Some(cancel),
-            in_window: &in_window,
+            in_window: window,
             progress: progress.clone(),
             persist: &mut persist,
         };
         let outcome = swap_into_place(job).await;
-        in_window.store(false, std::sync::atomic::Ordering::SeqCst);
+        window.leave();
 
         let swapped_in = match outcome {
             Ok(out) => {
@@ -632,27 +664,33 @@ impl Engine {
         rec: &mut OperationRecord,
         maint: &dyn crate::ops::MaintenanceOps,
         cancel: &RunCancel,
-    ) {
+    ) -> bool {
         if db.is_empty() {
-            return;
+            return false;
         }
         if cancel.is_cancelled() {
             // the user stopped it; leave the database alone and say where it is
             rec.warnings.push(format!(
                 "{db} holds whatever was restored before the cancel; drop it when you are done"
             ));
-            return;
+            return false;
         }
         let timeout = std::time::Duration::from_secs(5);
         match crate::swap::drop_with_drain(maint, db, timeout).await {
-            Ok(()) => rec.warnings.push(format!(
-                "the database {db} created for this restore was dropped again"
-            )),
-            Err(e) => rec.warnings.push(format!(
-                "the database {db} created for this restore could not be dropped ({}); it was kept \
-                 for inspection",
-                e.message
-            )),
+            Ok(()) => {
+                rec.warnings.push(format!(
+                    "the database {db} created for this restore was dropped again"
+                ));
+                true
+            }
+            Err(e) => {
+                rec.warnings.push(format!(
+                    "the database {db} created for this restore could not be dropped ({}); it was kept \
+                     for inspection",
+                    e.message
+                ));
+                false
+            }
         }
     }
 }

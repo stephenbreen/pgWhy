@@ -233,6 +233,12 @@ export function RunTab({ tab }: { tab: Tab }) {
     }
   }, [data.workflowId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // getRun answers can arrive in any order, and one can be older than a record an event already
+  // delivered: a finished run is never replaced by a record that still says it is running
+  const mergeRecord = (runId: string, record: r.RunRecord) =>
+    setPhase((p) => (p.kind === "run" && p.runId === runId && !(p.record && p.record.status !== "running" && record.status === "running") ? { ...p, record } : p));
+  const fetchSeq = useRef(0);
+
   const start = async (report: r.PreflightReport, remember: boolean) => {
     if (!report.ticket || !report.confirmation) return;
     setBusy(true);
@@ -243,7 +249,7 @@ export function RunTab({ tab }: { tab: Tab }) {
       setLive({});
       setPhase({ kind: "run", runId, record: null });
       updateTab(tab.id, { data: { ...data, runId } });
-      setPhase({ kind: "run", runId, record: await r.getRun(runId) });
+      mergeRecord(runId, await r.getRun(runId));
     } catch (e) {
       setError(toAppError(e));
     } finally {
@@ -252,19 +258,21 @@ export function RunTab({ tab }: { tab: Tab }) {
   };
 
   useEffect(() => {
-    if (data.runId) void r.getRun(data.runId).then((record) => setPhase({ kind: "run", runId: data.runId!, record })).catch((e) => setError(toAppError(e)));
+    if (data.runId) void r.getRun(data.runId).then((record) => mergeRecord(data.runId!, record)).catch((e) => setError(toAppError(e)));
     else void runPreflight();
     const unlisten = r.onRunEvent((ev) => {
       if (ev.run_id !== runRef.current) return;
       if (ev.event === "progress") setLive((l) => ({ ...l, [ev.step]: ev.progress }));
       else if (ev.event === "run_started" || ev.event === "run_finished") {
+        fetchSeq.current++; // a fetch started before this record is older than it
         setPhase({ kind: "run", runId: ev.run_id, record: ev.record });
         if (ev.event === "run_finished" && (ev.status === "succeeded" || ev.status === "succeeded_cleanup_required")) {
           // the explorer re-reads the replaced database
           useTrees.getState().invalidate(ev.record.target.connection_id, ev.record.target.database);
         }
       } else {
-        void r.getRun(ev.run_id).then((record) => setPhase((p) => (p.kind === "run" && p.runId === ev.run_id ? { ...p, record } : p)));
+        const seq = ++fetchSeq.current;
+        void r.getRun(ev.run_id).then((record) => seq === fetchSeq.current && mergeRecord(ev.run_id, record)).catch(() => {});
       }
     });
     return () => {

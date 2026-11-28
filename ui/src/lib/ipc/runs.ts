@@ -184,6 +184,10 @@ export const operationGet = (id: string) => invoke<import("./databases").Operati
 export const listRuns = (workflowId?: string) => invoke<RunRecord[]>("run_list", { workflowId: workflowId ?? null });
 export const getRun = (runId: string) => invoke<RunRecord>("run_get", { runId });
 export const reinventory = (runId: string) => invoke<RunRecord>("run_reinventory", { runId });
+/** Recovery for a restore that stopped part-way: finish or undo its swap, drop its leftovers. */
+export const operationActions = (id: string) => invoke<ActionOffer[]>("operation_actions", { id });
+export const operationAction = (id: string, action: ActionKind) =>
+  invoke<import("./databases").OperationRecord>("operation_action", { id, action });
 export const runAction = (runId: string, action: ActionKind) => invoke<RunRecord>("run_action", { runId, action });
 
 export function onRunEvent(handler: (ev: RunEvent) => void): Promise<UnlistenFn> {

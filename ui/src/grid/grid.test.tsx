@@ -180,6 +180,60 @@ describe("result grid", () => {
     expect(onSort).not.toHaveBeenCalled();
   });
 
+  it("keeps resized widths when the parent re-renders with an equal but new columns array", async () => {
+    const { store } = fakeSource(rows, 3);
+    const { rerender } = render(<ResultGrid columns={cols.map((c) => ({ ...c }))} store={store} rowCount={rows.length} />);
+    await screen.findByText("name 1");
+    const header = () => screen.getByRole("columnheader", { name: /^name/ });
+    const w0 = parseFloat(header().style.width);
+    fireEvent.mouseDown(header().querySelector(".col-resizer")!, { clientX: 100 });
+    fireEvent.mouseMove(window, { clientX: 150 });
+    fireEvent.mouseUp(window, { clientX: 150 });
+    expect(parseFloat(header().style.width)).toBe(w0 + 50);
+
+    rerender(<ResultGrid columns={cols.map((c) => ({ ...c }))} store={store} rowCount={rows.length} />);
+    expect(parseFloat(header().style.width)).toBe(w0 + 50);
+
+    // a really different column set starts from the defaults again
+    rerender(<ResultGrid columns={cols.slice(0, 2)} store={store} rowCount={rows.length} />);
+    expect(parseFloat(header().style.width)).toBe(w0);
+  });
+
+  it("detaches the column-resize listeners when unmounted mid-drag", async () => {
+    const { store } = fakeSource(rows, 3);
+    const remove = vi.spyOn(window, "removeEventListener");
+    const { unmount } = render(<ResultGrid columns={cols} store={store} rowCount={rows.length} />);
+    await screen.findByText("name 1");
+    const grip = screen.getByRole("columnheader", { name: /^name/ }).querySelector(".col-resizer")!;
+    fireEvent.mouseDown(grip, { clientX: 100 });
+    remove.mockClear();
+    unmount();
+    const removed = remove.mock.calls.map((c) => c[0]);
+    expect(removed).toContain("mousemove");
+    remove.mockRestore();
+  });
+
+  it("reports a rejected clipboard write instead of leaving it unhandled", async () => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) } });
+    const { store } = fakeSource(rows, 3);
+    render(<ResultGrid columns={cols} store={store} rowCount={rows.length} />);
+    const grid = screen.getByRole("grid");
+    await within(grid).findByText("name 1");
+    fireEvent.mouseDown(within(grid.querySelector(".grid-row") as HTMLElement).getAllByRole("gridcell")[0]);
+    fireEvent.keyDown(grid.querySelector(".grid-scroll")!, { key: "c", ctrlKey: true });
+    expect(await screen.findByRole("alert")).toHaveTextContent(/denied/);
+  });
+
+  it("commits a cell edit exactly once", async () => {
+    const user = userEvent.setup();
+    const onEdit = vi.fn();
+    const { store } = fakeSource(rows, 3);
+    render(<ResultGrid columns={cols} store={store} rowCount={rows.length} onEditCell={onEdit} />);
+    await user.dblClick(await screen.findByText("name 3"));
+    await user.type(screen.getByLabelText("Cell value"), "x{Enter}");
+    expect(onEdit).toHaveBeenCalledTimes(1);
+  });
+
   it("tsv quoting", () => {
     expect(toTsv([["a\tb", 'say "hi"', null]])).toBe('"a\tb"\t"say ""hi"""\t');
   });

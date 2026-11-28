@@ -256,7 +256,7 @@ async fn progress_and_steps_are_reported_live_and_the_restore_can_be_cancelled()
     };
     // keep cancelling until the hung restore notices (registration raced the Started event)
     for _ in 0..200 {
-        if h.engine.cancel_operation(&RunId(id.clone())) {
+        if h.engine.cancel_operation(&RunId(id.clone())).unwrap() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;

@@ -39,6 +39,7 @@ function backend(report: PreflightReport, opts: { secretFirst?: boolean } = {}) 
   const calls: { cmd: string; args: Record<string, unknown> }[] = [];
   let needSecret = !!opts.secretFirst;
   let current = record();
+  let getHook: (() => Promise<RunRecord>) | null = null;
   mockIPC(
     (cmd, args) => {
       const a = args as Record<string, unknown>;
@@ -54,7 +55,7 @@ function backend(report: PreflightReport, opts: { secretFirst?: boolean } = {}) 
         case "workflow_start":
           return "run1";
         case "run_get":
-          return current;
+          return getHook ? getHook() : current;
         case "run_action":
           current = { ...current, status: "succeeded", headline: "Rolled back", actions: [] };
           return current;
@@ -64,7 +65,7 @@ function backend(report: PreflightReport, opts: { secretFirst?: boolean } = {}) 
     },
     { shouldMockEvents: true },
   );
-  return { calls, set: (r: RunRecord) => (current = r) };
+  return { calls, set: (r: RunRecord) => (current = r), hookGet: (f: (() => Promise<RunRecord>) | null) => (getHook = f) };
 }
 
 async function event(ev: RunEvent) {
@@ -157,5 +158,25 @@ describe("refresh run view", () => {
     expect(screen.getByRole("status")).toHaveTextContent("exists only as shop_old");
     await user.click(within(actions).getByRole("button", { name: "Roll back to the old database" }));
     expect(b.calls.find((c) => c.cmd === "run_action")?.args).toEqual({ runId: "run1", action: "rollback_swap" });
+  });
+
+  it("a slow getRun answer from a step event cannot put a finished run back to Running", async () => {
+    const user = userEvent.setup();
+    const b = backend({ ticket: "t1", checks: [], confirmation: conf() as PreflightReport["confirmation"], missing_secrets: [] });
+    render(<App />);
+    act(() => openRunTab({ workflowId: "w1", workflowName: "Refresh shop" }));
+    await user.click(await screen.findByRole("button", { name: "Replace shop" }));
+    await screen.findByRole("list", { name: "Steps" });
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    b.hookGet(() => gate.then(() => record()));
+    await event({ event: "step_finished", run_id: "run1", step: "dump", status: "succeeded", duration_ms: 5 });
+    const done = record({ status: "succeeded", headline: "Replaced shop" });
+    await event({ event: "run_finished", run_id: "run1", status: "succeeded", record: done });
+    expect(screen.getByRole("status")).toHaveTextContent("Replaced shop");
+
+    await act(async () => release());
+    expect(screen.getByRole("status")).toHaveTextContent("Replaced shop");
   });
 });

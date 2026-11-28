@@ -291,6 +291,21 @@ impl ConnectionManager {
             // that beat the insert above (its callback found nothing to remove) shows here.
             conn.shared.is_closed()
         };
+        // A connection its owner simply drops (maintenance, editor tab, grid) never reaches the
+        // driver's loss callback (the drop aborts the driver first), so remove its entry here;
+        // otherwise a later disconnect would report it closed long after it was gone. No event:
+        // the owner knows, and `forget_live`/`close_where` already removed it when they closed it.
+        let weak = Arc::downgrade(&self.inner);
+        conn.set_drop_hook(Box::new(move |handle| {
+            if let Some(inner) = weak.upgrade() {
+                inner
+                    .live
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .conns
+                    .remove(&handle);
+            }
+        }));
         let _ = self.inner.events.send(ConnEvent::Opened {
             info: conn.info.clone(),
         });

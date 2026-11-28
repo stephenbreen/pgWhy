@@ -500,3 +500,28 @@ async fn quiesce_during_connect_discards_the_late_connection() {
     assert!(m.live_connections().is_empty());
     drop(guard);
 }
+
+/// A connection its owner just drops is forgotten on the spot: a later disconnect must not
+/// report it (or anything else long gone) as closed.
+#[tokio::test]
+async fn dropped_connections_leave_no_live_entry_behind() {
+    let Some(pg) = harness::pg(16).await else {
+        return;
+    };
+    let e = entry(&pg, "127.0.0.1", SslMode::Disable);
+    let m = manager(&[&e]);
+    let kept = m.open(&e.id, PG_DB, Purpose::Grid).await.unwrap();
+    let dropped = m.open(&e.id, PG_DB, Purpose::Maintenance).await.unwrap();
+    let dropped_handle = dropped.handle();
+    drop(dropped);
+    let mut events = m.subscribe();
+    m.disconnect(&e.id).await;
+    let mut closed = Vec::new();
+    while let Ok(ev) = events.try_recv() {
+        if let ConnEvent::Closed { handle, .. } = ev {
+            closed.push(handle);
+        }
+    }
+    assert_eq!(closed, vec![kept.handle()]);
+    assert!(!closed.contains(&dropped_handle));
+}

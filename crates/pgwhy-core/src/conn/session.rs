@@ -90,6 +90,8 @@ pub(crate) struct ConnShared {
     last_used: Mutex<Instant>,
     closed_tx: watch::Sender<bool>,
     lost_error: Mutex<Option<String>>,
+    /// Set once somebody has taken the notice stream; until then notices are discarded.
+    notices_wanted: AtomicBool,
 }
 
 impl ConnShared {
@@ -100,6 +102,7 @@ impl ConnShared {
             last_used: Mutex::new(Instant::now()),
             closed_tx: watch::channel(false).0,
             lost_error: Mutex::new(None),
+            notices_wanted: AtomicBool::new(false),
         }
     }
 
@@ -138,6 +141,9 @@ impl ConnShared {
 /// text if any.
 pub(crate) type LostCallback = Box<dyn FnOnce(ConnHandle, Option<String>) + Send + 'static>;
 
+/// Called once when a connection is dropped by its owner, with its handle.
+pub(crate) type DropHook = Box<dyn FnOnce(ConnHandle) + Send + 'static>;
+
 /// A live connection. Dropping it closes the socket.
 pub struct PgConn {
     pub client: Client,
@@ -148,6 +154,8 @@ pub struct PgConn {
     cancel_tls: tokio_postgres_rustls::MakeRustlsConnect,
     notices: Mutex<Option<mpsc::UnboundedReceiver<Notice>>>,
     pub(crate) shared: Arc<ConnShared>,
+    /// Run once when the owner drops the connection (the manager's registry cleanup).
+    drop_hook: Mutex<Option<DropHook>>,
     _lease: Option<TunnelLease>,
 }
 
@@ -187,9 +195,21 @@ impl PgConn {
         self.cancel_tls.clone()
     }
 
-    /// Take the notice stream (one consumer: the executor or the editor tab).
+    /// Take the notice stream (one consumer: the executor or the editor tab). Notices are only
+    /// kept for a connection whose stream has been taken: grid, introspection and maintenance
+    /// connections never drain it, so before this call (and for them, always) the driver
+    /// discards notices instead of queueing them without bound.
     pub fn take_notices(&self) -> Option<mpsc::UnboundedReceiver<Notice>> {
-        self.notices.lock().unwrap().take()
+        let rx = self.notices.lock().unwrap().take();
+        if rx.is_some() {
+            self.shared.notices_wanted.store(true, Ordering::Release);
+        }
+        rx
+    }
+
+    /// Register what to do when the owner drops this connection (replaces any earlier hook).
+    pub(crate) fn set_drop_hook(&self, hook: DropHook) {
+        *self.drop_hook.lock().unwrap_or_else(|p| p.into_inner()) = Some(hook);
     }
 
     pub fn touch(&self) {
@@ -239,6 +259,9 @@ impl PgConn {
             while let Some(msg) = messages.next().await {
                 match msg {
                     Ok(AsyncMessage::Notice(n)) => {
+                        if !driver_shared.notices_wanted.load(Ordering::Acquire) {
+                            continue;
+                        }
                         let _ = ntx.send(Notice {
                             severity: n.severity().to_string(),
                             code: n.code().code().to_string(),
@@ -289,6 +312,7 @@ impl PgConn {
             cancel_tls: setup.connector,
             notices: Mutex::new(Some(nrx)),
             shared,
+            drop_hook: Mutex::new(None),
             _lease: lease,
         })
     }
@@ -305,5 +329,13 @@ impl PgConn {
 impl Drop for PgConn {
     fn drop(&mut self) {
         self.shared.close();
+        let hook = self
+            .drop_hook
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook(self.info.handle);
+        }
     }
 }

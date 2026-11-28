@@ -8,7 +8,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
-import { useWorkspace, type Tab } from "../app/workspace";
+import { setCloseGuard, useWorkspace, type Tab } from "../app/workspace";
 import { ErrorNote } from "../connection/ErrorNote";
 import { editorTheme } from "../editor/SqlEditor";
 import { toAppError, type AppError } from "../lib/ipc/errors";
@@ -84,15 +84,29 @@ export function TextTab({ tab }: { tab: Tab }) {
   const updateTab = useWorkspace((s) => s.updateTab);
   const textRef = useRef(data.text);
   const viewRef = useRef<EditorView | null>(null);
-  const [dirty, setDirty] = useState(false);
+  const [dirty, setDirtyState] = useState(false);
+  // the close guard runs outside render, so it reads the flag from here
+  const dirtyRef = useRef(false);
+  const setDirty = (d: boolean) => {
+    dirtyRef.current = d;
+    setDirtyState(d);
+  };
+  const [unsaved, setUnsaved] = useState<{ resolve: (answer: "save" | "discard" | "cancel") => void } | null>(null);
   const [saveAs, setSaveAs] = useState<string | null>(null);
   const [error, setError] = useState<AppError | null>(null);
   const [disk, setDisk] = useState<"changed" | "deleted" | null>(null);
   const ext = data.filePath?.match(/\.(txt|md)$/i)?.[0] ?? ".md";
 
+  const diskCurrent = useRef<ipc.FileFingerprint | null>(null);
+  // "Keep mine" accepts the file as it is on disk now as the one the next save replaces
+  const keepMine = () => {
+    if (diskCurrent.current) setData({ fingerprint: diskCurrent.current });
+    diskCurrent.current = null;
+    setDisk(null);
+  };
   const setData = (patch: Partial<TextTabData>) => updateTab(tab.id, { data: { ...data, ...patch } });
 
-  const save = async (asPath?: string) => {
+  const save = async (asPath?: string): Promise<boolean> => {
     setError(null);
     // read from the editor at save time rather than copying the document on every keystroke
     const text = viewRef.current?.state.doc.toString() ?? textRef.current;
@@ -103,21 +117,52 @@ export function TextTab({ tab }: { tab: Tab }) {
         void ipc.recordRecent({ path: opened.path, library_id: opened.info.id, action: "save" });
         setSaveAs(null);
       } else if (data.scriptId) {
-        const info = await ipc.scriptWrite(data.scriptId, text);
+        const info = await ipc.scriptWrite(data.scriptId, text, data.fingerprint);
         setData({ fingerprint: info.fingerprint });
       } else if (data.filePath) {
-        setData({ fingerprint: await ipc.fileWrite(data.filePath, text) });
+        setData({ fingerprint: await ipc.fileWrite(data.filePath, text, data.fingerprint) });
         void ipc.recordRecent({ path: data.filePath, action: "save" });
       } else {
         setSaveAs(tab.title.replace(/\s+/g, "_").toLowerCase());
-        return;
+        return false;
       }
-      setDirty(false);
+      // keystrokes typed while the save was in flight are not on disk: only a buffer still equal
+      // to what was written is clean
+      if ((viewRef.current?.state.doc.toString() ?? textRef.current) === text) setDirty(false);
       setDisk(null);
+      return true;
     } catch (e) {
-      setError(toAppError(e));
+      const current = ipc.changedOnDisk(e);
+      if (current) {
+        // someone else wrote the file since this tab read it: ask, rather than replace their work
+        diskCurrent.current = current;
+        setDisk("changed");
+      } else setError(toAppError(e));
+      return false;
     }
   };
+  const asking = useRef(false);
+  const saveRef = useRef(save);
+  saveRef.current = save;
+
+  // Closing with unsaved text asks first. A note that was never saved and is empty has nothing to lose.
+  useEffect(() => {
+    setCloseGuard(tab.id, async () => {
+      if (!dirtyRef.current) return true;
+      const text = viewRef.current?.state.doc.toString() ?? textRef.current;
+      if (!text.trim() && !data.filePath && !data.scriptId) return true;
+      if (asking.current) return false; // a second close request while the prompt is up
+      asking.current = true;
+      const answer = await new Promise<"save" | "discard" | "cancel">((resolve) => setUnsaved({ resolve }));
+      asking.current = false;
+      setUnsaved(null);
+      if (answer === "discard") return true;
+      if (answer === "save") return saveRef.current();
+      return false;
+    });
+    return () => setCloseGuard(tab.id, null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.id, data.filePath, data.scriptId]);
 
   const reloadFromDisk = async () => {
     if (!data.filePath) return;
@@ -138,7 +183,10 @@ export function TextTab({ tab }: { tab: Tab }) {
         if (res.state === "unchanged") return setDisk(null);
         if (res.state === "deleted_on_disk") return setDisk("deleted");
         if (!dirty) await reloadFromDisk();
-        else setDisk("changed");
+        else {
+          diskCurrent.current = res.current ?? null;
+          setDisk("changed");
+        }
       } catch {
         /* unreadable: leave the buffer alone */
       }
@@ -164,6 +212,14 @@ export function TextTab({ tab }: { tab: Tab }) {
           Save{dirty ? " •" : ""}
         </button>
       </div>
+      {unsaved && (
+        <div className="txn-ask" role="alert">
+          <span>{tab.title} has unsaved changes.</span>
+          <button type="button" onClick={() => unsaved.resolve("save")}>Save</button>
+          <button type="button" onClick={() => unsaved.resolve("discard")}>Discard</button>
+          <button type="button" onClick={() => unsaved.resolve("cancel")}>Cancel</button>
+        </div>
+      )}
       {saveAs !== null && (
         <form
           className="editor-banner"
@@ -183,7 +239,7 @@ export function TextTab({ tab }: { tab: Tab }) {
         <div className="editor-banner" role="alert">
           <span>This file changed on disk.</span>
           <button type="button" onClick={() => void reloadFromDisk()}>Reload</button>
-          <button type="button" onClick={() => setDisk(null)}>Keep mine</button>
+          <button type="button" onClick={keepMine}>Keep mine</button>
         </div>
       )}
       {disk === "deleted" && (

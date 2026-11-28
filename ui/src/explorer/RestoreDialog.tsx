@@ -8,6 +8,7 @@ import { create } from "zustand";
 import { ErrorNote } from "../connection/ErrorNote";
 import { toAppError, type AppError } from "../lib/ipc/errors";
 import type { OperationRecord, StepStatus } from "../lib/ipc/databases";
+import { backupCancel } from "../lib/ipc/backup";
 import * as rs from "../lib/ipc/restore";
 import { useConnections } from "../connection/store";
 import { registerNodeAction, type NodeTarget } from "./actions";
@@ -61,6 +62,8 @@ export function RestoreDialog() {
   const [log, setLog] = useState<string[]>([]);
   const [report, setReport] = useState<OperationRecord | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
+  // the safety backup taken first has its own id: the restore's does not exist until it is done
+  const [backupId, setBackupId] = useState<string | null>(null);
   const logRef = useRef<HTMLPreElement>(null);
 
   const open = connectionId !== "";
@@ -81,6 +84,7 @@ export function RestoreDialog() {
     setLog([]);
     setReport(null);
     setRunId(null);
+    setBackupId(null);
     let live = true;
     if (preselected) {
       void rs
@@ -114,6 +118,14 @@ export function RestoreDialog() {
   const tagBlocked = envTag !== undefined && envTag !== "local" && envTag !== "dev";
   const canCreate = targets?.can_create_database ?? false;
   const blockers = inspection?.blockers ?? [];
+  // A confirmation typed for one mode must not arm another: switching starts it over.
+  const chooseMode = (next: Mode) => {
+    if (next === mode) return;
+    setMode(next);
+    setTyped("");
+    setBackupFirst(true);
+  };
+
   const databaseName = mode === "new_database" ? name.trim() : (database ?? "");
   const startBlocked =
     busy ||
@@ -156,6 +168,8 @@ export function RestoreDialog() {
       no_privileges: noPrivileges,
       stop_on_first_error: stopOnFirst,
     };
+    const safetyBackup = mode !== "new_database" && backupFirst ? `prerestore:${crypto.randomUUID()}` : null;
+    setBackupId(safetyBackup);
     try {
       const rec = await rs.restoreStart(
         connectionId,
@@ -166,10 +180,12 @@ export function RestoreDialog() {
           locale_from: mode === "new_database" ? localeFrom || null : null,
           settings,
           typed_name: mode === "new_database" ? null : typed,
-          backup_first: mode !== "new_database" && backupFirst,
+          backup_first: safetyBackup !== null,
+          backup_id: safetyBackup,
         },
         (e) => {
           if (e.type === "started") {
+            setBackupId(null); // the backup is done; from here the restore itself is what stops
             setRunId(e.id);
             return;
           }
@@ -199,6 +215,7 @@ export function RestoreDialog() {
     } finally {
       setBusy(false);
       setRunId(null);
+      setBackupId(null);
     }
   };
 
@@ -291,7 +308,7 @@ export function RestoreDialog() {
                   aria-label="New database"
                   checked={mode === "new_database"}
                   disabled={busy || !canCreate}
-                  onChange={() => setMode("new_database")}
+                  onChange={() => chooseMode("new_database")}
                 />
                 New database {!canCreate && <span className="note">(needs CREATEDB)</span>}
               </label>
@@ -302,7 +319,7 @@ export function RestoreDialog() {
                   aria-label="Replace database"
                   checked={mode === "replace"}
                   disabled={busy || !database || !canCreate}
-                  onChange={() => setMode("replace")}
+                  onChange={() => chooseMode("replace")}
                 />
                 Replace <b>{database}</b> (restore into a copy, then swap it in)
               </label>
@@ -313,7 +330,7 @@ export function RestoreDialog() {
                   aria-label="Restore on top"
                   checked={mode === "on_top"}
                   disabled={busy || !database}
-                  onChange={() => setMode("on_top")}
+                  onChange={() => chooseMode("on_top")}
                 />
                 Restore over <b>{database}</b> in place
               </label>
@@ -457,6 +474,11 @@ export function RestoreDialog() {
               <button type="button" onClick={close} disabled={busy}>
                 Cancel
               </button>
+              {busy && !runId && backupId && (
+                <button type="button" onClick={() => void backupCancel(backupId)}>
+                  Stop the backup
+                </button>
+              )}
               {busy && runId && (
                 <button type="button" onClick={() => void rs.restoreCancel(runId)}>
                   Stop the restore

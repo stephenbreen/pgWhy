@@ -220,7 +220,7 @@ impl ChildSpec {
         let mut cmd = Command::new(&self.tool.path);
         cmd.args(&self.args);
         for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("PG") {
+            if is_pg_env_var(&key) {
                 cmd.env_remove(&key);
             }
         }
@@ -887,9 +887,29 @@ pub fn classify_failure(run: &ToolRun) -> AppError {
     err
 }
 
+/// Whether an inherited variable is a libpq setting (`PG*`) that must not leak into the
+/// tool. Windows environment names are case-insensitive, so `pgpassword` counts there.
+fn is_pg_env_var(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    if cfg!(windows) {
+        name.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("PG"))
+    } else {
+        name.starts_with("PG")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pg_env_scrub_is_case_insensitive_only_on_windows() {
+        use std::ffi::OsStr;
+        assert!(is_pg_env_var(OsStr::new("PGPASSWORD")));
+        assert!(!is_pg_env_var(OsStr::new("PATH")));
+        assert_eq!(is_pg_env_var(OsStr::new("pgpassword")), cfg!(windows));
+        assert_eq!(is_pg_env_var(OsStr::new("PgService")), cfg!(windows));
+    }
 
     fn run(tool: ToolKind, lines: &[&str], code: Option<i32>) -> ToolRun {
         let mut fc = FailureCollector::default();

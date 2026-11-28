@@ -53,6 +53,8 @@ export interface OperationRecord {
   warnings: string[];
   error?: { kind: string; class: string; message: string; hint?: string; detail?: string };
   failed_step?: string;
+  /** What it acted on; only a restore's target is read here. */
+  detail?: { kind: string; target?: { connection_id: string } };
 }
 
 export const dbCapabilities = (connectionId: string) =>

@@ -19,27 +19,40 @@ export interface Tab {
   data?: unknown;
 }
 
-/** A tab can veto/postpone closing (e.g. an editor with an open transaction asks first). */
+/**
+ * A tab can veto/postpone closing (e.g. an editor with unsaved text or an open transaction asks
+ * first). The guard only asks; whatever must be released when the tab really goes (a server
+ * connection, per-tab state) belongs in `teardown`, which runs once every guard has agreed and
+ * the tab is actually being closed.
+ */
 export type CloseGuard = () => Promise<boolean>;
-const closeGuards = new Map<string, CloseGuard>();
+const closeGuards = new Map<string, { guard: CloseGuard; teardown?: () => Promise<void> | void }>();
 
-export function setCloseGuard(tabId: string, guard: CloseGuard | null) {
-  if (guard) closeGuards.set(tabId, guard);
+export function setCloseGuard(tabId: string, guard: CloseGuard | null, teardown?: () => Promise<void> | void) {
+  if (guard) closeGuards.set(tabId, { guard, teardown });
   else closeGuards.delete(tabId);
 }
 
 /** Close a tab after its guard (if any) agrees. */
 export async function requestCloseTab(tabId: string): Promise<boolean> {
-  const guard = closeGuards.get(tabId);
-  if (guard && !(await guard())) return false;
+  const g = closeGuards.get(tabId);
+  if (g) {
+    // the prompt lives inside the tab's own panel, which is hidden unless the tab is in front
+    useWorkspace.getState().activateTab(tabId);
+    if (!(await g.guard())) return false;
+    await g.teardown?.();
+  }
   closeGuards.delete(tabId);
   useWorkspace.getState().closeTab(tabId);
   return true;
 }
 
-/** Ask every guarded tab (quit / window close). */
+/**
+ * Ask every guarded tab (quit / update restart). Asking has no side effects on the tabs: nothing is
+ * torn down here, so an aborted quit, or a restart that then fails, leaves every tab as it was.
+ */
 export async function requestCloseAll(): Promise<boolean> {
-  for (const [id, guard] of [...closeGuards]) {
+  for (const [id, { guard }] of [...closeGuards]) {
     useWorkspace.getState().activateTab(id);
     if (!(await guard())) return false;
   }

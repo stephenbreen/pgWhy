@@ -108,6 +108,9 @@ pub async fn settings_set(
         ));
     }
     {
+        // Library before settings, the order `with_library` and the engine's script lookup take
+        // them in: the other way round, a save racing a first library open deadlocks both.
+        let mut library = state.library.lock().unwrap_or_else(|p| p.into_inner());
         // compare, persist and swap under one lock so two saves cannot interleave
         let mut live = state.settings.lock().unwrap_or_else(|p| p.into_inner());
         let library_changed = live.script_library_dir != settings.script_library_dir;
@@ -121,7 +124,7 @@ pub async fn settings_set(
             .set_idle_close(std::time::Duration::from_secs(settings.idle_close_secs));
         *live = settings;
         if library_changed {
-            *state.library.lock().unwrap_or_else(|p| p.into_inner()) = None; // reopened lazily at the new location
+            *library = None; // reopened lazily at the new location
         }
     }
     if engine_changed {

@@ -27,6 +27,10 @@ pub struct Grid {
 #[derive(Default)]
 pub struct Grids {
     grids: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Grid>>>>,
+    /// Grids whose `grid_open` is still connecting or loading. A close that arrives in that time
+    /// takes the id out, and the open then discards what it built instead of installing a grid
+    /// nothing will ever close.
+    opening: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Grids {
@@ -137,7 +141,11 @@ async fn execute(
     let query = build_topn(&request)?;
     let result = Arc::new(query.new_result_set(1_000_000));
     state.results.register(grid_id, result.clone());
-    run_topn(&conn.client, &query, &result).await?;
+    if let Err(e) = run_topn(&conn.client, &query, &result).await {
+        // nothing will show this set; left registered it would count against the grid's budget
+        state.release_result(result.id());
+        return Err(e);
+    }
     Ok((query, result))
 }
 
@@ -154,9 +162,69 @@ pub async fn grid_open(
     criteria: Vec<Criterion>,
     sort: Vec<UiSort>,
 ) -> AppResult<GridView> {
+    state
+        .grids
+        .opening
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(grid_id.clone());
+    let built = build_grid(
+        &state,
+        &grid_id,
+        &connection_id,
+        database,
+        &schema,
+        &name,
+        n,
+        criteria,
+        sort,
+    )
+    .await;
+    let still_wanted = state
+        .grids
+        .opening
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&grid_id);
+    let grid = built?;
+    if !still_wanted {
+        // closed while it was loading: dropping the grid closes its connection
+        state.release_result(grid.result.id());
+        return Err(
+            AppError::new(ErrorKind::Disconnected, "this grid is closed")
+                .with_hint("open the table again"),
+        );
+    }
+    let v = view(&grid);
+    let old = state
+        .grids
+        .grids
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(grid_id.clone(), Arc::new(tokio::sync::Mutex::new(grid)));
+    if let Some(old) = old {
+        // re-opened under the same id: the replaced grid's rows are no longer reachable
+        let old = old.lock().await;
+        state.release_result(old.result.id());
+    }
+    Ok(v)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_grid(
+    state: &AppState,
+    grid_id: &str,
+    connection_id: &ConnectionId,
+    database: String,
+    schema: &str,
+    name: &str,
+    n: Option<u64>,
+    criteria: Vec<Criterion>,
+    sort: Vec<UiSort>,
+) -> AppResult<Grid> {
     let details = state
         .introspector
-        .refresh_relation(&connection_id, &database, &schema, &name)
+        .refresh_relation(connection_id, &database, schema, name)
         .await?
         .ok_or_else(|| {
             AppError::new(
@@ -174,31 +242,20 @@ pub async fn grid_open(
     let mut request = TopNRequest::for_relation(&details.relation, &details.provenance, limit);
     request.criteria = criteria;
     request.sort = sort_keys(sort);
-    let entry = state.manager.entry(&connection_id)?;
+    let entry = state.manager.entry(connection_id)?;
     let conn = state
         .manager
-        .open(&connection_id, &database, Purpose::Grid)
+        .open(connection_id, &database, Purpose::Grid)
         .await?;
-    let (query, result) = execute(&state, &grid_id, &conn, &request).await?;
-    let grid = Grid {
+    let (query, result) = execute(state, grid_id, &conn, &request).await?;
+    Ok(Grid {
         conn,
         server: entry.server_key(),
         database,
         request,
         query,
         result,
-    };
-    let v = view(&grid);
-    if let Some(old) = state
-        .grids
-        .grids
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(grid_id.clone(), Arc::new(tokio::sync::Mutex::new(grid)))
-    {
-        drop(old);
-    }
-    Ok(v)
+    })
 }
 
 /// Re-run with new criteria/sort/N (server-side). Pending edits must be discarded first —
@@ -334,6 +391,12 @@ pub async fn grid_discard(state: State<'_, AppState>, grid_id: String) -> AppRes
 
 #[tauri::command]
 pub fn grid_close(state: State<'_, AppState>, grid_id: String) {
+    state
+        .grids
+        .opening
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&grid_id);
     state
         .grids
         .grids

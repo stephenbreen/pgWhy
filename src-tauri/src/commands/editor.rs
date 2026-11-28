@@ -87,27 +87,32 @@ pub async fn editor_open(
     connection_id: ConnectionId,
     database: String,
 ) -> AppResult<ConnInfo> {
-    if let Ok(old) = state.editors.get(&tab_id) {
+    let refuse_if_busy = || -> AppResult<()> {
+        let Ok(old) = state.editors.get(&tab_id) else {
+            return Ok(());
+        };
         match old.session.state() {
-            SessionState::InTransaction | SessionState::FailedTransaction => {
-                return Err(
-                    AppError::new(ErrorKind::Refused, "this tab has an open transaction")
-                        .with_hint("commit or roll back before reconnecting"),
-                )
-            }
-            SessionState::Running => {
-                return Err(
-                    AppError::new(ErrorKind::Refused, "this tab is running a query")
-                        .with_hint("cancel the run before reconnecting"),
-                )
-            }
-            _ => {}
+            SessionState::InTransaction | SessionState::FailedTransaction => Err(AppError::new(
+                ErrorKind::Refused,
+                "this tab has an open transaction",
+            )
+            .with_hint("commit or roll back before reconnecting")),
+            SessionState::Running => Err(AppError::new(
+                ErrorKind::Refused,
+                "this tab is running a query",
+            )
+            .with_hint("cancel the run before reconnecting")),
+            _ => Ok(()),
         }
-    }
+    };
+    refuse_if_busy()?;
     let conn = state
         .manager
         .open(&connection_id, &database, Purpose::EditorTab)
         .await?;
+    // Connecting took a while: a run or a transaction started on the old session since the first
+    // check would be dropped (and rolled back) by the swap below.
+    refuse_if_busy()?;
     let info = conn.info.clone();
     let session = QuerySession::new(conn);
     let cancel = session.cancel_handle();
@@ -174,7 +179,9 @@ pub async fn editor_close(
             .tabs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(tab_id.clone(), tab);
+            // unless the tab reconnected in the meantime: that session is the live one now
+            .entry(tab_id.clone())
+            .or_insert(tab);
     };
     let open = matches!(
         tab.session.state(),
@@ -262,7 +269,8 @@ pub async fn editor_run(
         sink.finish(summary);
     }
     // The tab was closed mid-run: the sink kept appending under an owner nobody will evict.
-    if tab.closed.load(Ordering::SeqCst) {
+    // (A tab that reconnected under the same id since owns its results again.)
+    if tab.closed.load(Ordering::SeqCst) && state.editors.get(&tab_id).is_err() {
         state.release_results_of(&tab_id);
     }
     outcome.map(|_| ())

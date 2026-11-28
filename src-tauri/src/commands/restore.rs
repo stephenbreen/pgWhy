@@ -203,6 +203,10 @@ pub struct RestoreStartRequest {
     /// Take a custom-format backup before an in-place restore.
     #[serde(default)]
     pub backup_first: bool,
+    /// The id that safety backup runs under, chosen by the dialog so it can cancel it
+    /// (`backup_cancel`): the restore's own id does not exist until the backup is done.
+    #[serde(default)]
+    pub backup_id: Option<String>,
 }
 
 /// The destructive-operation gate for a restore, with the same context the engine builds.
@@ -304,7 +308,10 @@ pub async fn restore_start(
 
     let mut backup = None;
     if request.mode != RestoreMode::NewDatabase && request.backup_first {
-        let id = format!("prerestore-{}-{}", request.database, chrono_stamp());
+        let id = request
+            .backup_id
+            .clone()
+            .unwrap_or_else(|| format!("prerestore-{}-{}", request.database, chrono_stamp()));
         let done = run_backup(
             &state,
             &id,
@@ -345,7 +352,7 @@ pub async fn restore_start(
 /// Cancel a running restore by its record id (from the `started` event).
 #[tauri::command]
 pub fn restore_cancel(state: State<'_, AppState>, run_id: RunId) -> AppResult<bool> {
-    Ok(state.engine().cancel_operation(&run_id))
+    state.engine().cancel_operation(&run_id)
 }
 
 /// The connection's own capabilities + database list, for the dialog's target pickers.

@@ -74,6 +74,25 @@ interface TreesState {
 
 const empty = (): ConnTree => ({ schemas: {}, contents: {}, expanded: new Set(), restored: false });
 
+// An invalidation makes whatever catalog loads are still in flight stale: they were started
+// against the old state and must not land over the fresh load. Generations are kept per
+// connection (invalidating everything) and per database.
+const connGen: Record<string, number> = {};
+const dbGen: Record<string, number> = {};
+const dbGenKey = (connectionId: string, db: string) => `${connectionId}${SEP}${db}`;
+function bumpGen(connectionId: string, db?: string) {
+  if (db === undefined) connGen[connectionId] = (connGen[connectionId] ?? 0) + 1;
+  else dbGen[dbGenKey(connectionId, db)] = (dbGen[dbGenKey(connectionId, db)] ?? 0) + 1;
+}
+const genToken = (connectionId: string, db?: string) => ({
+  connectionId,
+  db,
+  conn: connGen[connectionId] ?? 0,
+  dbg: db === undefined ? 0 : (dbGen[dbGenKey(connectionId, db)] ?? 0),
+});
+const genCurrent = (t: ReturnType<typeof genToken>) =>
+  t.conn === (connGen[t.connectionId] ?? 0) && t.dbg === (t.db === undefined ? 0 : (dbGen[dbGenKey(t.connectionId, t.db)] ?? 0));
+
 const persistTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 function persist(connectionId: string, expanded: Set<string>) {
   clearTimeout(persistTimers[connectionId]);
@@ -98,11 +117,14 @@ export const useTrees = create<TreesState>((set, get) => {
     ensure: (connectionId) => get().trees[connectionId] ?? empty(),
 
     loadDatabases: async (connectionId) => {
+      const token = genToken(connectionId);
       update(connectionId, (t) => ({ ...t, databases: { state: "loading" } }));
       try {
         const value = await ex.listDatabases(connectionId);
+        if (!genCurrent(token)) return;
         update(connectionId, (t) => ({ ...t, databases: { state: "loaded", value } }));
       } catch (e) {
+        if (!genCurrent(token)) return;
         update(connectionId, (t) => ({ ...t, databases: { state: "error", error: toAppError(e) } }));
       }
     },
@@ -110,11 +132,14 @@ export const useTrees = create<TreesState>((set, get) => {
     loadSchemas: async (connectionId, db) => {
       const cur = get().trees[connectionId]?.schemas[db];
       if (cur?.state === "loaded" || cur?.state === "loading") return;
+      const token = genToken(connectionId, db);
       update(connectionId, (t) => ({ ...t, schemas: { ...t.schemas, [db]: { state: "loading" } } }));
       try {
         const value = await ex.listSchemas(connectionId, db);
+        if (!genCurrent(token)) return;
         update(connectionId, (t) => ({ ...t, schemas: { ...t.schemas, [db]: { state: "loaded", value } } }));
       } catch (e) {
+        if (!genCurrent(token)) return;
         update(connectionId, (t) => ({ ...t, schemas: { ...t.schemas, [db]: { state: "error", error: toAppError(e) } } }));
       }
     },
@@ -123,13 +148,16 @@ export const useTrees = create<TreesState>((set, get) => {
       const key = contentKey(db, schema);
       const cur = get().trees[connectionId]?.contents[key];
       if (!refresh && (cur?.state === "loaded" || cur?.state === "loading")) return;
+      const token = genToken(connectionId, db);
       if (refresh) await ex.refreshExplorer(connectionId, db, schema).catch(() => {});
       update(connectionId, (t) => ({ ...t, contents: { ...t.contents, [key]: { state: "loading" } } }));
       try {
         const value = await ex.schemaContents(connectionId, db, schema);
+        if (!genCurrent(token)) return;
         update(connectionId, (t) => ({ ...t, contents: { ...t.contents, [key]: { state: "loaded", value } } }));
         completionChanged();
       } catch (e) {
+        if (!genCurrent(token)) return;
         update(connectionId, (t) => ({ ...t, contents: { ...t.contents, [key]: { state: "error", error: toAppError(e) } } }));
       }
     },
@@ -167,6 +195,7 @@ export const useTrees = create<TreesState>((set, get) => {
 
     // post-swap / manual refresh: drop cached catalog, keep expansion (re-loads by name)
     invalidate: (connectionId, db) => {
+      bumpGen(connectionId, db);
       update(connectionId, (t) => {
         if (!db) return { ...empty(), expanded: t.expanded, restored: false };
         const schemas = { ...t.schemas };

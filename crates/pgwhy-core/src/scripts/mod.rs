@@ -18,8 +18,9 @@ mod meta;
 mod recents;
 
 pub use file_state::{
-    check_file, fingerprint_file, read_script_file, write_script_file, FileCheck, FileFingerprint,
-    FileState, ScriptFile,
+    changed_on_disk, check_file, fingerprint_file, read_script_file, write_script_file,
+    write_script_file_checked, FileCheck, FileFingerprint, FileState, ScriptFile,
+    CHANGED_ON_DISK_CODE,
 };
 pub use library::{Library, RescanReport, ScriptId, ScriptInfo, ScriptMove, INDEX_FILE_NAME};
 pub use meta::{has_meta_commands, scan_meta_commands, MetaCommand, MetaPosition};
@@ -30,7 +31,7 @@ pub use recents::{
 
 use crate::{AppError, AppResult, ErrorKind};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Lower-case hex SHA-256 of `bytes`.
@@ -72,6 +73,10 @@ pub(crate) fn fs_error(path: &Path, action: &str, e: std::io::Error) -> AppError
 /// `.sql` files often live in shared repos, so the original mode (or a conventional 0644 for
 /// new files) is restored afterwards.
 pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
+    // Rename-over would replace a symlinked file with a regular one; the library follows
+    // symlinked files on purpose, so write to the link's real target and keep the link.
+    let resolved = resolve_symlink(path);
+    let path = resolved.as_path();
     let previous = std::fs::metadata(path).ok().map(|m| m.permissions());
     crate::config::write_atomic(path, bytes)?;
     let perms = match previous {
@@ -85,6 +90,23 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+/// The file a symlink at `path` ultimately points to (`path` itself when it is not a symlink).
+/// A dangling link resolves one level through `read_link`, so the target is created in place.
+fn resolve_symlink(path: &Path) -> PathBuf {
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return path.to_path_buf();
+    }
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    match std::fs::read_link(path) {
+        Ok(target) if target.is_absolute() => target,
+        Ok(target) => path.parent().map_or(target.clone(), |p| p.join(&target)),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 #[cfg(unix)]
@@ -108,5 +130,33 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sql");
+        let link = dir.path().join("link.sql");
+        std::fs::write(&real, "old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_file_atomic(&link, b"new").unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        // relative, dangling link: the target is created where the link points
+        let dangling = dir.path().join("d.sql");
+        std::os::unix::fs::symlink("made.sql", &dangling).unwrap();
+        write_file_atomic(&dangling, b"x").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("made.sql")).unwrap(),
+            "x"
+        );
+        assert!(std::fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

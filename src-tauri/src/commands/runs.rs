@@ -149,6 +149,32 @@ pub fn operation_get(state: State<'_, AppState>, id: RunId) -> AppResult<Operati
     state.engine().get_operation(&id)
 }
 
+/// What can still be done about a restore that stopped part-way (finish or undo its swap, drop
+/// what it left behind), judged against the databases on the server now.
+#[tauri::command]
+pub async fn operation_actions(
+    state: State<'_, AppState>,
+    id: RunId,
+) -> AppResult<Vec<pgwhy_workflow::history::ActionOffer>> {
+    state.engine().operation_actions(&id).await
+}
+
+#[tauri::command]
+pub async fn operation_action(
+    state: State<'_, AppState>,
+    id: RunId,
+    action: ActionKind,
+) -> AppResult<OperationRecord> {
+    let rec = state.engine().perform_operation(&id, action).await?;
+    // databases were renamed or dropped under the explorer
+    if let pgwhy_workflow::OperationDetail::Restore(detail) = &rec.detail {
+        state
+            .introspector
+            .invalidate_server(&detail.target.connection_id);
+    }
+    Ok(rec)
+}
+
 #[tauri::command]
 pub fn run_get(state: State<'_, AppState>, run_id: RunId) -> AppResult<RunRecord> {
     state.engine().get_run(&run_id)

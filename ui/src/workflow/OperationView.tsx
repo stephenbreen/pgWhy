@@ -7,6 +7,7 @@ import { ErrorNote } from "../connection/ErrorNote";
 import type { OperationRecord } from "../lib/ipc/databases";
 import { toAppError, type AppError } from "../lib/ipc/errors";
 import * as r from "../lib/ipc/runs";
+import { useTrees } from "../explorer/tree/model";
 
 export function openOperationTab(id: string, name: string) {
   useWorkspace.getState().openTab({
@@ -21,12 +22,41 @@ export function OperationView({ tab }: { tab: Tab }) {
   const { id } = tab.data as { id: string };
   const [rec, setRec] = useState<OperationRecord | null>(null);
   const [error, setError] = useState<AppError | null>(null);
+  // what can still be done about a restore that stopped part-way, per the server as it is now
+  const [actions, setActions] = useState<r.ActionOffer[]>([]);
+  const [busy, setBusy] = useState(false);
+  const loadActions = (rec: OperationRecord) => {
+    if (rec.kind !== "restore") return;
+    void r
+      .operationActions(rec.id)
+      .then(setActions)
+      .catch(() => setActions([])); // still running, or the server is unreachable: nothing to offer
+  };
   useEffect(() => {
     void r
       .operationGet(id)
-      .then(setRec)
+      .then((rec) => {
+        setRec(rec);
+        loadActions(rec);
+      })
       .catch((e) => setError(toAppError(e)));
   }, [id]);
+
+  const act = async (a: r.ActionOffer) => {
+    setError(null);
+    setBusy(true);
+    try {
+      const next = await r.operationAction(id, a.kind);
+      setRec(next);
+      const conn = next.detail?.target?.connection_id;
+      if (conn) useTrees.getState().invalidate(conn);
+      loadActions(next);
+    } catch (e) {
+      setError(toAppError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="run-view" aria-label="Operation report">
@@ -63,6 +93,15 @@ export function OperationView({ tab }: { tab: Tab }) {
               </li>
             ))}
           </ol>
+          {actions.length > 0 && (
+            <div className="run-actions" role="group" aria-label="Actions">
+              {actions.map((a) => (
+                <button key={`${a.kind}:${a.database ?? ""}`} type="button" disabled={!a.enabled || busy} title={a.disabled_reason ?? undefined} onClick={() => void act(a)}>
+                  {a.label}
+                </button>
+              ))}
+            </div>
+          )}
           <p className="note">Record id {rec.id}</p>
         </>
       )}

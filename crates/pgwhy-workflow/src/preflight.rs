@@ -783,17 +783,16 @@ pub(crate) async fn run(
             )),
         }
         if let (Some(f), Some(tm)) = (&src, target_major) {
-            if let Some(w) = pgwhy_pgtools::target_version_warning(
+            if let Some(check) = target_version_check(
+                strategy,
+                create_mode,
                 PgVersion::major_from_version_num(f.version_num as u32),
                 tm,
             ) {
-                warnings.push(w.message.clone());
-                report.checks.push(PreflightCheck::warn(
-                    "target_version",
-                    "Target server version",
-                    w.message,
-                    w.hint,
-                ));
+                if check.status == CheckStatus::Warn {
+                    warnings.push(check.message.clone());
+                }
+                report.checks.push(check);
             }
         }
     } else {
@@ -1261,6 +1260,7 @@ pub(crate) async fn run(
                                 name: s.name,
                                 mode: wf.options.script_mode,
                                 sha256: s.sha256,
+                                size_bytes: Some(s.content.len() as u64),
                                 content: s.content,
                             });
                         }
@@ -1461,7 +1461,35 @@ pub(crate) async fn run(
     (report, Some((plan, lock, can_remember)))
 }
 
-/// Execute a [`PreflightFix`].
+/// The target-vs-source server version gate. A target older than the source is a warning for the
+/// staging strategies, where a failed restore leaves the target untouched. For drop-first it is a
+/// hard failure: the target would be dropped before a restore that is likely to fail, leaving no
+/// database (nothing is lost when the target does not exist yet, so create mode keeps the warning).
+fn target_version_check(
+    strategy: ReplaceStrategy,
+    create_mode: bool,
+    source_major: u32,
+    target_major: u32,
+) -> Option<PreflightCheck> {
+    let w = pgwhy_pgtools::target_version_warning(source_major, target_major)?;
+    let destroys = strategy == ReplaceStrategy::DropFirst && !create_mode;
+    Some(if destroys {
+        PreflightCheck::fail(
+            "target_version",
+            "Target server version",
+            format!(
+                "{}; the drop-first strategy drops the target before restoring, so a failed restore would leave no database",
+                w.message
+            ),
+            Some("switch the workflow to the staging strategy, or use a target server at least as new as the source".into()),
+        )
+    } else {
+        PreflightCheck::warn("target_version", "Target server version", w.message, w.hint)
+    })
+}
+
+/// Execute a [`PreflightFix`]. The fix comes from the UI, so nothing in it is trusted: each kind
+/// re-derives from the live server that it still applies to this workflow's own target.
 pub(crate) async fn apply_fix(
     deps: &RealDeps,
     ops: &dyn crate::ops::RefreshOps,
@@ -1472,50 +1500,337 @@ pub(crate) async fn apply_fix(
     match fix.kind {
         PreflightFixKind::DropLeftover => {
             let maint = ops.maintenance(&wf.target.connection).await?;
-            let dbs = maint.databases().await?;
-            let fact = dbs.iter().find(|d| d.name == fix.database).ok_or_else(|| {
-                AppError::new(
-                    ErrorKind::Refused,
-                    format!("{} no longer exists", fix.database),
-                )
-            })?;
-            let marker = fact
-                .comment
-                .as_deref()
-                .and_then(Marker::parse)
-                .filter(|m| {
-                    m.workflow_id == wf.id.0
-                        && m.original_target == wf.target.database
-                        && m.role != MarkerRole::WorkTarget
-                })
-                .ok_or_else(|| {
-                    AppError::new(
-                        ErrorKind::Refused,
-                        format!(
-                            "{} is not a pgWhy leftover of this workflow; not dropped",
-                            fix.database
-                        ),
-                    )
-                })?;
-            let run = crate::history::RunId(marker.run_id.clone());
-            crate::swap::drop_marked(&*maint, &fix.database, &run, Some(marker.role), timeout).await
+            drop_leftover(&*maint, wf, fix, timeout).await
         }
         PreflightFixKind::RollbackPrepared => {
-            let gid = fix
-                .gid
-                .as_deref()
-                .ok_or_else(|| AppError::internal("no gid"))?;
+            let maint = ops.maintenance(&wf.target.connection).await?;
+            let gid = verified_prepared_gid(&*maint, wf, fix).await?;
             let conn = deps
                 .manager
-                .open(&wf.target.connection, &fix.database, Purpose::Maintenance)
+                .open(
+                    &wf.target.connection,
+                    &wf.target.database,
+                    Purpose::Maintenance,
+                )
                 .await?;
             conn.client
                 .batch_execute(&format!(
                     "ROLLBACK PREPARED {}",
-                    crate::staging::quote_literal(gid)
+                    crate::staging::quote_literal(&gid)
                 ))
                 .await
                 .map_err(|e| pgwhy_core::conn::classify(&e, "roll back the prepared transaction"))
+        }
+    }
+}
+
+/// The gid to roll back, once proven: the fix names the workflow's own target database, and a
+/// fresh query reports that gid as a prepared transaction there (the one a preflight blocks on).
+async fn verified_prepared_gid(
+    maint: &dyn crate::ops::MaintenanceOps,
+    wf: &RefreshWorkflow,
+    fix: &PreflightFix,
+) -> AppResult<String> {
+    let gid = fix
+        .gid
+        .as_deref()
+        .ok_or_else(|| AppError::internal("no gid"))?;
+    if fix.database != wf.target.database {
+        return Err(AppError::new(
+            ErrorKind::Refused,
+            format!(
+                "{} is not this workflow's target database ({}); nothing was rolled back",
+                fix.database, wf.target.database
+            ),
+        ));
+    }
+    let blocking = maint.prepared_xacts(&wf.target.database).await?;
+    if !blocking.iter().any(|p| p.gid == gid) {
+        return Err(AppError::new(
+            ErrorKind::Refused,
+            format!(
+                "{} has no prepared transaction '{gid}' any more; nothing was rolled back",
+                wf.target.database
+            ),
+        ));
+    }
+    Ok(gid.to_string())
+}
+
+/// Drop a pgWhy-marked leftover of this workflow. Beyond the marker checks, `<target>_old` is
+/// never dropped while the target does not exist: then it is the only copy of the data.
+async fn drop_leftover(
+    maint: &dyn crate::ops::MaintenanceOps,
+    wf: &RefreshWorkflow,
+    fix: &PreflightFix,
+    timeout: std::time::Duration,
+) -> AppResult<()> {
+    let dbs = maint.databases().await?;
+    let fact = dbs.iter().find(|d| d.name == fix.database).ok_or_else(|| {
+        AppError::new(
+            ErrorKind::Refused,
+            format!("{} no longer exists", fix.database),
+        )
+    })?;
+    let marker = fact
+        .comment
+        .as_deref()
+        .and_then(Marker::parse)
+        .filter(|m| {
+            m.workflow_id == wf.id.0
+                && m.original_target == wf.target.database
+                && m.role != MarkerRole::WorkTarget
+        })
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorKind::Refused,
+                format!(
+                    "{} is not a pgWhy leftover of this workflow; not dropped",
+                    fix.database
+                ),
+            )
+        })?;
+    if marker.role == MarkerRole::Old && !dbs.iter().any(|d| d.name == wf.target.database) {
+        return Err(AppError::new(
+            ErrorKind::Refused,
+            format!(
+                "{} does not exist, so {} is the only copy of its data; it was not dropped",
+                wf.target.database, fix.database
+            ),
+        )
+        .with_hint("roll the swap back from the run's history to rename it back"));
+    }
+    let run = crate::history::RunId(marker.run_id.clone());
+    crate::swap::drop_marked(maint, &fix.database, &run, Some(marker.role), timeout).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::definition::{DbRef, RefreshOptions};
+    use crate::ops::{DbFact, MaintenanceOps, PreparedXact};
+    use crate::staging::LocaleSpec;
+    use pgwhy_core::conn::BoxFuture;
+    use std::sync::Mutex;
+
+    /// A server with a few databases and prepared transactions; records what was dropped.
+    struct Stub {
+        dbs: Vec<DbFact>,
+        prepared: Vec<PreparedXact>,
+        dropped: Mutex<Vec<String>>,
+    }
+
+    impl MaintenanceOps for Stub {
+        fn server_major(&self) -> u32 {
+            16
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn databases(&self) -> BoxFuture<'_, AppResult<Vec<DbFact>>> {
+            Box::pin(async move { Ok(self.dbs.clone()) })
+        }
+        fn create_database<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<&'a LocaleSpec>,
+        ) -> BoxFuture<'a, AppResult<()>> {
+            unimplemented!()
+        }
+        fn set_comment<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<&'a str>,
+        ) -> BoxFuture<'a, AppResult<()>> {
+            unimplemented!()
+        }
+        fn rename_database<'a>(&'a self, _: &'a str, _: &'a str) -> BoxFuture<'a, AppResult<()>> {
+            unimplemented!()
+        }
+        fn drop_database<'a>(&'a self, name: &'a str) -> BoxFuture<'a, AppResult<()>> {
+            Box::pin(async move {
+                self.dropped.lock().unwrap().push(name.to_string());
+                Ok(())
+            })
+        }
+        fn prepared_xacts<'a>(
+            &'a self,
+            db: &'a str,
+        ) -> BoxFuture<'a, AppResult<Vec<PreparedXact>>> {
+            Box::pin(async move {
+                Ok(self
+                    .prepared
+                    .iter()
+                    .filter(|p| p.database == db)
+                    .cloned()
+                    .collect())
+            })
+        }
+        fn sessions<'a>(
+            &'a self,
+            _: &'a [String],
+        ) -> BoxFuture<'a, AppResult<Vec<crate::history::SessionInfo>>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+        fn terminate<'a>(&'a self, _: &'a [String]) -> BoxFuture<'a, AppResult<u32>> {
+            Box::pin(async move { Ok(0) })
+        }
+    }
+
+    fn wf() -> RefreshWorkflow {
+        RefreshWorkflow {
+            id: WorkflowId("wf-1".into()),
+            name: "Refresh".into(),
+            source: DbRef {
+                connection: ConnectionId::new(),
+                database: "app".into(),
+            },
+            target: DbRef {
+                connection: ConnectionId::new(),
+                database: "app".into(),
+            },
+            post_restore_script: None,
+            options: RefreshOptions::default(),
+            remembered_confirmation: None,
+            has_succeeded: false,
+        }
+    }
+
+    fn px(gid: &str, db: &str) -> PreparedXact {
+        PreparedXact {
+            gid: gid.into(),
+            database: db.into(),
+            owner: "me".into(),
+            prepared_at: "now".into(),
+        }
+    }
+
+    fn marked(name: &str, role: MarkerRole, wf_id: &str) -> DbFact {
+        DbFact {
+            name: name.into(),
+            comment: Some(Marker::new(role, "run-1", wf_id, "app").to_comment()),
+            owner: "me".into(),
+        }
+    }
+
+    fn plain(name: &str) -> DbFact {
+        DbFact {
+            name: name.into(),
+            comment: None,
+            owner: "me".into(),
+        }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn an_older_target_fails_drop_first_but_only_warns_for_staging() {
+        let check = |s, create, src, tgt| target_version_check(s, create, src, tgt);
+        let drop_first = check(ReplaceStrategy::DropFirst, false, 17, 15).unwrap();
+        assert_eq!(drop_first.status, CheckStatus::Fail);
+        assert!(drop_first.message.contains("no database"));
+        assert_eq!(
+            check(ReplaceStrategy::StagingSwap, false, 17, 15)
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
+        // nothing is dropped when the target does not exist yet
+        assert_eq!(
+            check(ReplaceStrategy::DropFirst, true, 17, 15)
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
+        // same or newer target: no finding at all
+        assert!(check(ReplaceStrategy::DropFirst, false, 15, 15).is_none());
+        assert!(check(ReplaceStrategy::DropFirst, false, 15, 17).is_none());
+    }
+
+    #[test]
+    fn rollback_prepared_must_name_the_target_and_a_gid_the_server_reports() {
+        let wf = wf();
+        let stub = Stub {
+            dbs: vec![plain("app"), plain("other")],
+            prepared: vec![px("tx-1", "app"), px("tx-2", "other")],
+            dropped: Mutex::default(),
+        };
+        let fix = |db: &str, gid: Option<&str>| PreflightFix {
+            kind: PreflightFixKind::RollbackPrepared,
+            database: db.into(),
+            gid: gid.map(str::to_string),
+        };
+        let ok = block_on(verified_prepared_gid(&stub, &wf, &fix("app", Some("tx-1"))));
+        assert_eq!(ok.unwrap(), "tx-1");
+        // another database on the server, even with a real gid
+        let e = block_on(verified_prepared_gid(
+            &stub,
+            &wf,
+            &fix("other", Some("tx-2")),
+        ))
+        .unwrap_err();
+        assert!(
+            e.message.contains("not this workflow's target"),
+            "{}",
+            e.message
+        );
+        // a gid that is not blocking the target (here: another database's)
+        let e = block_on(verified_prepared_gid(&stub, &wf, &fix("app", Some("tx-2")))).unwrap_err();
+        assert!(
+            e.message.contains("no prepared transaction"),
+            "{}",
+            e.message
+        );
+        assert!(block_on(verified_prepared_gid(&stub, &wf, &fix("app", None))).is_err());
+    }
+
+    #[test]
+    fn leftover_old_is_never_dropped_while_the_target_is_missing() {
+        let wf = wf();
+        let fix = PreflightFix {
+            kind: PreflightFixKind::DropLeftover,
+            database: "app_old".into(),
+            gid: None,
+        };
+        let timeout = std::time::Duration::from_millis(200);
+
+        // the target is gone: `_old` is the only copy
+        let only_copy = Stub {
+            dbs: vec![marked("app_old", MarkerRole::Old, "wf-1")],
+            prepared: vec![],
+            dropped: Mutex::default(),
+        };
+        let e = block_on(drop_leftover(&only_copy, &wf, &fix, timeout)).unwrap_err();
+        assert!(e.message.contains("only copy"), "{}", e.message);
+        assert!(only_copy.dropped.lock().unwrap().is_empty());
+
+        // with the target present it is an ordinary marked leftover
+        let normal = Stub {
+            dbs: vec![plain("app"), marked("app_old", MarkerRole::Old, "wf-1")],
+            prepared: vec![],
+            dropped: Mutex::default(),
+        };
+        block_on(drop_leftover(&normal, &wf, &fix, timeout)).unwrap();
+        assert_eq!(*normal.dropped.lock().unwrap(), vec!["app_old".to_string()]);
+
+        // a leftover of another workflow, or an unmarked database, is refused as before
+        for dbs in [
+            vec![plain("app"), marked("app_old", MarkerRole::Old, "wf-other")],
+            vec![plain("app"), plain("app_old")],
+        ] {
+            let s = Stub {
+                dbs,
+                prepared: vec![],
+                dropped: Mutex::default(),
+            };
+            assert!(block_on(drop_leftover(&s, &wf, &fix, timeout)).is_err());
+            assert!(s.dropped.lock().unwrap().is_empty());
         }
     }
 }

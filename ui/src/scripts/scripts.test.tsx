@@ -1,15 +1,16 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { App } from "../app/App";
 import { registerTab, registerView } from "../app/registry";
+import { EditorView } from "@codemirror/view";
 import { useWorkspace } from "../app/workspace";
 import { useConnections } from "../connection/store";
 import { EditorTab } from "../editor/EditorTab";
 import type { ConnectionEntry } from "../lib/ipc/connections";
 import { ScriptsView } from "./ScriptsView";
-import { TextTab } from "./TextTab";
+import { openTextTab, TextTab } from "./TextTab";
 
 const ws0 = useWorkspace.getState();
 const conn0 = useConnections.getState();
@@ -132,5 +133,37 @@ describe("scripts view", () => {
     await user.click(within(lib).getByRole("button", { name: /restore\.md/ }));
     expect(await screen.findByRole("toolbar", { name: "Text editor" })).toBeInTheDocument();
     expect(calls.some((c) => c.cmd === "editor_open")).toBe(false);
+  });
+
+  describe("text tab close guard", () => {
+    const typeInto = (text: string) =>
+      act(() => {
+        const view = EditorView.findFromDOM(document.querySelector(".cm-content") as HTMLElement)!;
+        view.dispatch({ changes: { from: view.state.doc.length, insert: text } });
+      });
+
+    it("asks before closing unsaved text, and closes clean or empty notes without asking", async () => {
+      const user = userEvent.setup();
+      backend();
+      render(<App />);
+      act(() => openTextTab({ title: "todo.md", text: "- vacuum", filePath: "/notes/todo.md", fingerprint: fp }));
+      await screen.findByRole("toolbar", { name: "Text editor" });
+
+      await typeInto("\n- analyze");
+      await user.click(screen.getByRole("button", { name: /Close todo\.md/ }));
+      const ask = await screen.findByRole("alert");
+      expect(ask).toHaveTextContent("unsaved changes");
+      await user.click(within(ask).getByRole("button", { name: "Cancel" }));
+      expect(screen.getByRole("tab", { name: /todo\.md/ })).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: /Close todo\.md/ }));
+      await user.click(within(await screen.findByRole("alert")).getByRole("button", { name: "Discard" }));
+      expect(screen.queryByRole("tab", { name: /todo\.md/ })).not.toBeInTheDocument();
+
+      act(() => openTextTab({ title: "clean.md", text: "x", filePath: "/notes/clean.md", fingerprint: fp }));
+      await screen.findByRole("toolbar", { name: "Text editor" });
+      await user.click(screen.getByRole("button", { name: /Close clean\.md/ }));
+      expect(screen.queryByRole("tab", { name: /clean\.md/ })).not.toBeInTheDocument();
+    });
   });
 });

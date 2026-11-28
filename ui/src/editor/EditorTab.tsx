@@ -75,6 +75,9 @@ export function EditorTab({ tab }: { tab: Tab }) {
   const [openError, setOpenError] = useState<AppError | null>(null);
   const [policy, setPolicy] = useState<q.ErrorPolicy>("stop");
   const [ask, setAsk] = useState<Ask | null>(null);
+  const [unsaved, setUnsaved] = useState<{ resolve: (answer: "save" | "discard" | "cancel") => void } | null>(null);
+  const asking = useRef(false);
+  const dbInput = useRef<HTMLInputElement>(null);
   const [disk, setDisk] = useState<DiskState>(null);
   const [saveAs, setSaveAs] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<AppError | null>(null);
@@ -115,22 +118,41 @@ export function EditorTab({ tab }: { tab: Tab }) {
     if (txn) patch(tab.id, { txn });
   }, [tab.id, patch]);
 
-  // closing with an open transaction asks first
+  // Closing asks about unsaved text, then about an open transaction. Asking changes nothing
+  // about the tab; the connection and the tab's state go in the teardown, once the close is final.
   useEffect(() => {
-    setCloseGuard(tab.id, async () => {
-      await settle();
-      const s = useEditors.getState().tabs[tab.id];
-      if (s && (s.txn === "in_transaction" || s.txn === "failed_transaction")) {
-        const ok = await new Promise<boolean>((resolve) => setAsk({ resolve, reason: "close" }));
-        if (!ok) return false;
-      } else {
+    setCloseGuard(
+      tab.id,
+      async () => {
+        if (asking.current) return false; // a second close request while a prompt is up
+        asking.current = true;
+        try {
+          const dirty = useEditors.getState().tabs[tab.id]?.dirty;
+          // an untitled buffer that is empty has nothing to lose
+          if (dirty && (currentText().trim() || data.filePath || data.scriptId)) {
+            const answer = await new Promise<"save" | "discard" | "cancel">((resolve) => setUnsaved({ resolve }));
+            setUnsaved(null);
+            if (answer === "cancel") return false;
+            if (answer === "save" && !(await saveRef.current())) return false;
+          }
+          await settle();
+          const s = useEditors.getState().tabs[tab.id];
+          if (s && (s.txn === "in_transaction" || s.txn === "failed_transaction")) {
+            return await new Promise<boolean>((resolve) => setAsk({ resolve, reason: "close" }));
+          }
+          return true;
+        } finally {
+          asking.current = false;
+        }
+      },
+      async () => {
         await q.editorClose(tab.id, null).catch(() => {});
-      }
-      useEditors.getState().remove(tab.id);
-      return true;
-    });
+        useEditors.getState().remove(tab.id);
+      },
+    );
     return () => setCloseGuard(tab.id, null);
-  }, [tab.id, settle]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.id, settle, data.filePath, data.scriptId]);
 
   const finishTxn = async (action: "commit" | "rollback") => {
     const a = ask;
@@ -196,9 +218,10 @@ export function EditorTab({ tab }: { tab: Tab }) {
     [tab.id, open, policy, patch, data.filePath, data.scriptId, data.connectionId, data.database],
   );
 
+  const diskCurrent = useRef<scriptsIpc.FileFingerprint | null>(null);
   const setData = (patchData: Partial<EditorTabData>) => updateTab(tab.id, { data: { ...data, ...patchData } });
 
-  const save = async (asPath?: string) => {
+  const save = async (asPath?: string): Promise<boolean> => {
     setSaveError(null);
     const text = currentText();
     try {
@@ -208,23 +231,34 @@ export function EditorTab({ tab }: { tab: Tab }) {
         void scriptsIpc.recordRecent({ path: opened.path, library_id: opened.info.id, action: "save" });
         setSaveAs(null);
       } else if (data.scriptId) {
-        const info = await scriptsIpc.scriptWrite(data.scriptId, text);
+        const info = await scriptsIpc.scriptWrite(data.scriptId, text, data.fingerprint);
         setData({ fingerprint: info.fingerprint });
         if (data.filePath) void scriptsIpc.recordRecent({ path: data.filePath, library_id: data.scriptId, action: "save" });
       } else if (data.filePath) {
-        const fp = await scriptsIpc.fileWrite(data.filePath, text);
+        const fp = await scriptsIpc.fileWrite(data.filePath, text, data.fingerprint);
         setData({ fingerprint: fp });
         void scriptsIpc.recordRecent({ path: data.filePath, action: "save" });
       } else {
         setSaveAs(tab.title.replace(/\s+/g, "_").toLowerCase());
-        return;
+        return false;
       }
-      patch(tab.id, { dirty: false });
+      // keystrokes typed while the save was in flight are not on disk: only a buffer still equal
+      // to what was written is clean
+      if (currentText() === text) patch(tab.id, { dirty: false });
       setDisk(null);
+      return true;
     } catch (e) {
-      setSaveError(toAppError(e));
+      const current = scriptsIpc.changedOnDisk(e);
+      if (current) {
+        // someone else wrote the file since this tab read it: ask, rather than replace their work
+        diskCurrent.current = current;
+        setDisk("changed");
+      } else setSaveError(toAppError(e));
+      return false;
     }
   };
+  const saveRef = useRef(save);
+  saveRef.current = save;
 
   // a clean buffer follows the file on disk; a dirty one asks; a deleted file is marked
   useEffect(() => {
@@ -235,7 +269,10 @@ export function EditorTab({ tab }: { tab: Tab }) {
         if (res.state === "unchanged") return setDisk(null);
         if (res.state === "deleted_on_disk") return setDisk("deleted");
         if (!useEditors.getState().tabs[tab.id]?.dirty) await reloadFromDisk();
-        else setDisk("changed");
+        else {
+          diskCurrent.current = res.current ?? null;
+          setDisk("changed");
+        }
       } catch {
         /* unreadable: leave the buffer alone */
       }
@@ -243,6 +280,13 @@ export function EditorTab({ tab }: { tab: Tab }) {
     window.addEventListener("focus", check);
     return () => window.removeEventListener("focus", check);
   }); // re-bind each render so the closure sees current data
+
+  // "Keep mine" accepts the file as it is on disk now as the one the next save replaces
+  const keepMine = () => {
+    if (diskCurrent.current) setData({ fingerprint: diskCurrent.current });
+    diskCurrent.current = null;
+    setDisk(null);
+  };
 
   const reloadFromDisk = async () => {
     if (!data.filePath) return;
@@ -256,12 +300,12 @@ export function EditorTab({ tab }: { tab: Tab }) {
   };
 
   // switch the receiving connection explicitly; an open transaction is asked about first
-  const rebind = async (connectionId: string, database: string) => {
+  const rebind = async (connectionId: string, database: string): Promise<boolean> => {
     await settle(); // switching under a running query would orphan it
     const s = useEditors.getState().tabs[tab.id];
     if (s && (s.txn === "in_transaction" || s.txn === "failed_transaction")) {
       const ok = await new Promise<boolean>((resolve) => setAsk({ resolve, reason: "rebind" }));
-      if (!ok) return;
+      if (!ok) return false;
     } else {
       await q.editorClose(tab.id, null).catch(() => {});
     }
@@ -275,6 +319,14 @@ export function EditorTab({ tab }: { tab: Tab }) {
     } catch (e) {
       setOpenError(toAppError(e));
     }
+    return true;
+  };
+
+  // The box is uncontrolled, so a rebind that did not happen (transaction kept open) must put
+  // the bound database back, or it would show a database F5 doesn't run against.
+  const rebindDatabase = async (database: string) => {
+    const done = await rebind(data.connectionId, database);
+    if (!done && dbInput.current) dbInput.current.value = data.database;
   };
 
   const errorDecoration = useMemo(() => {
@@ -334,15 +386,17 @@ export function EditorTab({ tab }: { tab: Tab }) {
           <input
             className="binding-db"
             aria-label="Database"
+            ref={dbInput}
             defaultValue={data.database}
             key={`${data.connectionId}/${data.database}`}
             disabled={state.running}
             onKeyDown={(e) => {
-              if (e.key === "Enter") void rebind(data.connectionId, (e.target as HTMLInputElement).value.trim() || data.database);
+              if (e.key === "Enter") void rebindDatabase((e.target as HTMLInputElement).value.trim() || data.database);
             }}
             onBlur={(e) => {
               const db = e.target.value.trim();
-              if (db && db !== data.database) void rebind(data.connectionId, db);
+              if (db && db !== data.database) void rebindDatabase(db);
+              else if (!db) e.target.value = data.database;
             }}
           />
         </span>
@@ -366,12 +420,20 @@ export function EditorTab({ tab }: { tab: Tab }) {
         <div className="editor-banner" role="alert">
           <span>This file changed on disk.</span>
           <button type="button" onClick={() => void reloadFromDisk()}>Reload</button>
-          <button type="button" onClick={() => setDisk(null)}>Keep mine</button>
+          <button type="button" onClick={keepMine}>Keep mine</button>
         </div>
       )}
       {disk === "deleted" && (
         <div className="editor-banner" role="alert">
           <span>This file was deleted on disk. Save to recreate it.</span>
+        </div>
+      )}
+      {unsaved && (
+        <div className="txn-ask" role="alert">
+          <span>{tab.title} has unsaved changes.</span>
+          <button type="button" onClick={() => unsaved.resolve("save")}>Save</button>
+          <button type="button" onClick={() => unsaved.resolve("discard")}>Discard</button>
+          <button type="button" onClick={() => unsaved.resolve("cancel")}>Cancel</button>
         </div>
       )}
       {ask && (

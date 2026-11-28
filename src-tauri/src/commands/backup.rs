@@ -34,6 +34,25 @@ impl Backups {
     pub(crate) fn any_running(&self) -> bool {
         !self.running().is_empty()
     }
+
+    /// App quit: stop every pg_dump still running.
+    pub(crate) fn cancel_all(&self) {
+        for c in self.running().values() {
+            c.cancel();
+        }
+    }
+}
+
+/// Keeps a backup in the registry for exactly as long as it runs, whichever way it ends.
+struct Tracked<'a> {
+    backups: &'a Backups,
+    id: &'a str,
+}
+
+impl Drop for Tracked<'_> {
+    fn drop(&mut self) {
+        self.backups.untrack(self.id);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,7 +208,6 @@ pub async fn backup_database(
         Some(&events),
     )
     .await;
-    state.backups.untrack(&backup_id);
     match result {
         Ok(done) => {
             record_backup(&state, &connection_id, &database, &request, &done);
@@ -271,6 +289,14 @@ pub(crate) async fn run_backup(
     request: &BackupRequest,
     events: Option<&Channel<BackupEvent>>,
 ) -> AppResult<BackupDone> {
+    // Registered before the first await, so a cancel during the setup below is not lost: the
+    // runner refuses to start a child whose handle is already cancelled.
+    let cancel = CancelHandle::new();
+    state.backups.track(backup_id, cancel.clone());
+    let _tracked = Tracked {
+        backups: &state.backups,
+        id: backup_id,
+    };
     // Before anything connects, so a bad choice can be corrected on the spot.
     let save_as = request
         .save_as
@@ -333,8 +359,8 @@ pub(crate) async fn run_backup(
     let log = folder.join(format!("{stem}.log"));
 
     let (endpoint, password, _lease) = state.tool_endpoint(&entry, database).await?;
-    let ctx = state.run_context()?;
-    state.backups.track(backup_id, ctx.cancel.clone());
+    let mut ctx = state.run_context()?;
+    ctx.cancel = cancel;
     send(
         events,
         BackupEvent::Started {

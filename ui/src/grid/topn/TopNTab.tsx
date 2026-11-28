@@ -2,7 +2,7 @@
 // re-query the server (the whole table, not the loaded rows). Edits stay pending — marked in
 // the grid, previewable as SQL — until committed as one transaction, or discarded.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { setCloseGuard, useWorkspace, type Tab } from "../../app/workspace";
 import { useConnections } from "../../connection/store";
 import { TagPill } from "../../connection/EnvTag";
@@ -110,31 +110,39 @@ export function TopNTab({ tab }: { tab: Tab }) {
     return () => setCloseGuard(tab.id, null);
   }, [tab.id, pending, data.name]);
 
-  const requery = async (nextCriteria = criteria, nextSort = sort) => {
-    if (pending > 0 && !(await ask(`Re-running the query discards ${pending} pending change${pending === 1 ? "" : "s"}.`))) return;
+  // each requery takes a number; a response that is no longer the latest is dropped
+  const requerySeq = useRef(0);
+
+  /** Re-run the query; true once its rows are showing (false: declined, failed or superseded). */
+  const requery = async (nextCriteria = criteria, nextSort = sort): Promise<boolean> => {
+    if (pending > 0 && !(await ask(`Re-running the query discards ${pending} pending change${pending === 1 ? "" : "s"}.`))) return false;
+    const seq = ++requerySeq.current;
     setBusy(true);
     setError(null);
     try {
       if (pending > 0) await g.gridDiscard(gridId);
       const v = await g.gridRequery(gridId, nextCriteria.filter((c) => c.column), nextSort);
+      if (seq !== requerySeq.current) return false;
       setView(v);
       setPending(0);
       setPreview(null);
       setVersion((x) => x + 1);
+      return true;
     } catch (e) {
-      setError(toAppError(e));
+      if (seq === requerySeq.current) setError(toAppError(e));
+      return false;
     } finally {
-      setBusy(false);
+      if (seq === requerySeq.current) setBusy(false);
     }
   };
 
   const onSort = (colIdx: number) => {
-    if (!view) return;
+    if (!view || busy) return;
     const name = view.columns[colIdx].name;
     const cur = sort[0]?.column === name ? sort[0].dir : null;
     const next: g.SortKey[] = cur === "asc" ? [{ column: name, dir: "desc" }] : cur === "desc" ? [] : [{ column: name, dir: "asc" }];
-    setSort(next);
-    void requery(criteria, next);
+    // the arrow and the next Refresh follow the rows, so the sort is kept only once they arrived
+    void requery(criteria, next).then((ok) => ok && setSort(next));
   };
 
   const applyPending = (p: g.PendingInfo) => {
@@ -159,14 +167,21 @@ export function TopNTab({ tab }: { tab: Tab }) {
     setError(null);
     try {
       const r = await g.gridCommit(gridId);
+      // the changes are in the database now, whatever happens to the refresh below
       setNotice(`Committed: ${r.updated} updated, ${r.inserted} inserted, ${r.deleted} deleted`);
       setPreview(null);
-      const v = await g.gridRequery(gridId, criteria.filter((c) => c.column), sort);
-      setView(v);
       setPending(0);
       setVersion((x) => x + 1);
+      const seq = ++requerySeq.current;
+      try {
+        const v = await g.gridRequery(gridId, criteria.filter((c) => c.column), sort);
+        if (seq === requerySeq.current) setView(v);
+      } catch (e) {
+        setNotice(`Changes were committed (${r.updated} updated, ${r.inserted} inserted, ${r.deleted} deleted); refreshing the rows failed. Refresh to see them.`);
+        setError(toAppError(e));
+      }
     } catch (e) {
-      // pending edits are preserved on any failure
+      // the commit itself failed: pending edits are preserved
       setError(toAppError(e));
     } finally {
       setBusy(false);

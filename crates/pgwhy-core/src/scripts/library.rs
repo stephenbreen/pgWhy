@@ -180,7 +180,7 @@ impl Library {
             .with_hint("choose a folder to use as the script library"));
         }
         let root = std::fs::canonicalize(root).map_err(|e| fs_error(root, "open library", e))?;
-        let entries = load_index(&root.join(INDEX_FILE_NAME))?;
+        let entries = load_index(&root, &root.join(INDEX_FILE_NAME))?;
         let mut lib = Self { root, entries };
         lib.rescan()?;
         Ok(lib)
@@ -240,7 +240,7 @@ impl Library {
 
     /// Absolute path of a script (whether or not it currently exists).
     pub fn absolute_path(&self, id: &ScriptId) -> Option<PathBuf> {
-        self.entry(id).map(|e| self.abs(&e.path))
+        self.entry(id).and_then(|e| self.abs(&e.path).ok())
     }
 
     /// The id of the script at `path` (absolute, or relative to the library root), if the
@@ -263,15 +263,27 @@ impl Library {
     /// Read a script's text and the fingerprint of the bytes read (the editor's loaded state).
     pub fn read(&self, id: &ScriptId) -> AppResult<ScriptFile> {
         let entry = self.entry(id).ok_or_else(|| unknown_id(id))?;
-        super::read_script_file(&self.abs(&entry.path))
+        super::read_script_file(&self.abs(&entry.path)?)
     }
 
     /// Create or overwrite the script at library-relative `path` (`.sql` is appended unless
     /// it already names a library file type). An already-indexed path keeps its id; otherwise a new id is minted.
     pub fn save(&mut self, path: impl AsRef<Path>, content: &str) -> AppResult<ScriptInfo> {
+        self.save_checked(path, content, None)
+    }
+
+    /// [`Library::save`] that refuses to overwrite a file whose bytes no longer match
+    /// `expected` (the fingerprint the editor loaded or last saved): the error is
+    /// [`super::changed_on_disk`]'s, nothing is written. `None` writes unconditionally.
+    pub fn save_checked(
+        &mut self,
+        path: impl AsRef<Path>,
+        content: &str,
+        expected: Option<&FileFingerprint>,
+    ) -> AppResult<ScriptInfo> {
         let key = rel_key(&with_sql_ext(path.as_ref()))?;
-        let abs = self.abs(&key);
-        let fp = super::write_script_file(&abs, content)?;
+        let abs = self.abs(&key)?;
+        let fp = super::write_script_file_checked(&abs, content, expected)?;
         let idx = match self.entries.iter().position(|e| e.path == key) {
             Some(i) => i,
             None => {
@@ -297,8 +309,18 @@ impl Library {
 
     /// Overwrite an existing script by id (wherever it currently lives).
     pub fn write(&mut self, id: &ScriptId, content: &str) -> AppResult<ScriptInfo> {
+        self.write_checked(id, content, None)
+    }
+
+    /// [`Library::write`] with the expected-fingerprint check of [`Library::save_checked`].
+    pub fn write_checked(
+        &mut self,
+        id: &ScriptId,
+        content: &str,
+        expected: Option<&FileFingerprint>,
+    ) -> AppResult<ScriptInfo> {
         let path = self.entry(id).ok_or_else(|| unknown_id(id))?.path.clone();
-        self.save(path, content)
+        self.save_checked(path, content, expected)
     }
 
     /// Rename and/or move a script to library-relative `new_path`, keeping its id. Refuses to
@@ -309,8 +331,8 @@ impl Library {
         if entry.path == new_key {
             return Ok(entry.info());
         }
-        let from = self.abs(&entry.path);
-        let to = self.abs(&new_key);
+        let from = self.abs(&entry.path)?;
+        let to = self.abs(&new_key)?;
         if entry.missing || !from.is_file() {
             return Err(not_found(&from));
         }
@@ -349,7 +371,7 @@ impl Library {
             .iter()
             .position(|e| &e.id == id)
             .ok_or_else(|| unknown_id(id))?;
-        let abs = self.abs(&self.entries[idx].path);
+        let abs = self.abs(&self.entries[idx].path)?;
         match std::fs::remove_file(&abs) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -409,10 +431,19 @@ impl Library {
             {
                 continue;
             }
-            let Some(bytes) = read_bytes(abs)? else {
-                orphans.push(i);
-                claimed.remove(&entry.path);
-                continue;
+            let bytes = match read_bytes(abs) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    orphans.push(i);
+                    claimed.remove(&entry.path);
+                    continue;
+                }
+                Err(e) => {
+                    // Present but unreadable (permissions): keep the entry as it was rather
+                    // than failing the whole library or calling the script missing.
+                    tracing::warn!(path = %abs.display(), error = %e, "skipping unreadable library file");
+                    continue;
+                }
             };
             let fp = FileFingerprint::of(&bytes, meta.as_ref());
             if entry.missing {
@@ -430,8 +461,13 @@ impl Library {
             if claimed.contains(key) {
                 continue;
             }
-            let Some(bytes) = read_bytes(abs)? else {
-                continue;
+            let bytes = match read_bytes(abs) {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(path = %abs.display(), error = %e, "skipping unreadable library file");
+                    continue;
+                }
             };
             let meta = std::fs::metadata(abs).ok();
             let fp = FileFingerprint::of(&bytes, meta.as_ref());
@@ -498,10 +534,21 @@ impl Library {
         self.entries.iter_mut().find(|e| &e.id == id)
     }
 
-    fn abs(&self, key: &str) -> PathBuf {
+    /// Absolute path of an index key, refusing keys that pass through a symlinked folder
+    /// (they would reach outside the library; `walk` never follows such folders).
+    fn abs(&self, key: &str) -> AppResult<PathBuf> {
+        if has_symlinked_parent(&self.root, key) {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                format!(
+                    "{key} is not a valid library script path: it goes through a linked folder"
+                ),
+            )
+            .with_hint("the library does not follow symlinked folders; use a real folder"));
+        }
         let mut p = self.root.clone();
         p.extend(key.split('/'));
-        p
+        Ok(p)
     }
 
     fn sort(&mut self) {
@@ -523,7 +570,7 @@ impl Library {
     }
 }
 
-fn load_index(path: &Path) -> AppResult<Vec<IndexEntry>> {
+fn load_index(root: &Path, path: &Path) -> AppResult<Vec<IndexEntry>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -551,7 +598,13 @@ fn load_index(path: &Path) -> AppResult<Vec<IndexEntry>> {
     let mut entries = Vec::with_capacity(file.scripts.len());
     for mut e in file.scripts {
         let valid = rel_key(Path::new(&e.path)).is_ok_and(|k| k == e.path);
-        if !valid || !ids.insert(e.id.clone()) || !paths.insert(e.path.clone()) {
+        // An index is a plain file that can be merged or hand-edited: never trust it to stay
+        // inside the root through a symlinked folder.
+        if !valid
+            || has_symlinked_parent(root, &e.path)
+            || !ids.insert(e.id.clone())
+            || !paths.insert(e.path.clone())
+        {
             tracing::warn!(path = %e.path, id = %e.id, "skipping invalid or duplicate library index entry");
             continue;
         }
@@ -559,6 +612,25 @@ fn load_index(path: &Path) -> AppResult<Vec<IndexEntry>> {
         entries.push(e);
     }
     Ok(entries)
+}
+
+/// Whether any folder component of `key` (all but the file name) under `root` is a symlink.
+/// A missing component ends the walk: nothing exists below it to escape through.
+fn has_symlinked_parent(root: &Path, key: &str) -> bool {
+    let mut p = root.to_path_buf();
+    let mut parts = key.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            return false;
+        }
+        p.push(part);
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Collect library files (`.sql`, `.txt`, `.md`) under `dir` keyed by library-relative `/` path.
@@ -797,5 +869,57 @@ mod tests {
             ..e
         };
         assert_eq!(note.info().name, "restore.md");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_folders_are_rejected_and_unreadable_files_skipped() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("x.md"), "secret").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.sql"), "select 1;").unwrap();
+        symlink(outside.path(), dir.path().join("link")).unwrap();
+        let mut lib = Library::open(dir.path()).unwrap();
+        assert!(lib.save("link/y.md", "pwned").is_err());
+        assert!(!outside.path().join("y.md").exists());
+        // an index entry that goes through the link is dropped on load
+        let id = lib.list()[0].id.clone();
+        let index = format!(
+            r#"{{"version":1,"scripts":[{{"id":"evil","path":"link/x.md","sha256":"","size":0}},{{"id":"{id}","path":"ok.sql","sha256":"","size":0}}]}}"#
+        );
+        std::fs::write(dir.path().join(INDEX_FILE_NAME), index).unwrap();
+        let lib = Library::open(dir.path()).unwrap();
+        assert!(lib.list().iter().all(|s| s.id.0 != "evil"));
+        assert!(lib.read(&ScriptId("evil".into())).is_err());
+
+        // a file that cannot be read does not fail the library
+        let bad = dir.path().join("bad.sql");
+        std::fs::write(&bad, "select 2;").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read(&bad).is_ok(); // running as root ignores the mode
+        let lib = Library::open(dir.path());
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let lib = lib.unwrap();
+        assert!(lib.list().iter().any(|s| s.path == "ok.sql"));
+        if !readable {
+            assert!(lib.list().iter().all(|s| s.path != "bad.sql"));
+        }
+    }
+
+    #[test]
+    fn checked_save_refuses_changed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lib = Library::open(dir.path()).unwrap();
+        let info = lib.save("a.sql", "one").unwrap();
+        std::fs::write(dir.path().join("a.sql"), "two").unwrap();
+        let err = lib
+            .write_checked(&info.id, "three", Some(&info.fingerprint))
+            .unwrap_err();
+        assert_eq!(err.data.unwrap()["code"], "changed_on_disk");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.sql")).unwrap(),
+            "two"
+        );
     }
 }

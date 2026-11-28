@@ -352,6 +352,27 @@ async fn rollback(client: &tokio_postgres::Client) {
     }
 }
 
+/// The error for a failed COMMIT. A server error means the transaction was rolled back; any
+/// other failure (connection dropped mid-COMMIT) leaves the outcome unknown, and committing
+/// the same pending changes again could duplicate inserted rows.
+fn commit_failure(mut app: AppError, server_rejected: bool) -> AppError {
+    if server_rejected {
+        app.message = format!("the commit failed: {}; nothing was committed", app.message);
+        return app;
+    }
+    app.message = format!(
+        "the connection failed during the commit ({}); it is unknown whether the changes were saved",
+        app.message
+    );
+    app.class = ErrorClass::Fatal;
+    app.hint = Some(
+        "re-query the table to check whether the changes were saved before committing again; \
+         committing again could duplicate inserted rows"
+            .into(),
+    );
+    app
+}
+
 fn statement_error(
     e: &tokio_postgres::Error,
     st: &EditStatement,
@@ -461,12 +482,40 @@ pub async fn commit_edits(
             .with_data(serde_json::json!({ "rows": mismatches })));
     }
     if let Err(e) = client.batch_execute("COMMIT").await {
-        rollback(client).await;
-        let mut app = classify_pg(&e, "commit the grid changes");
-        app.message = format!("the commit failed: {}; nothing was committed", app.message);
-        return Err(app);
+        let server_rejected = e.as_db_error().is_some();
+        // A dead connection has nothing to roll back (and the server already ended the txn).
+        if server_rejected {
+            rollback(client).await;
+        }
+        return Err(commit_failure(
+            classify_pg(&e, "commit the grid changes"),
+            server_rejected,
+        ));
     }
     set.clear_committed(plan.version);
     report.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
     Ok(report)
+}
+
+#[cfg(test)]
+mod commit_failure_tests {
+    use super::*;
+
+    #[test]
+    fn a_server_rejected_commit_says_nothing_was_committed() {
+        let e = commit_failure(AppError::new(ErrorKind::Sql, "deferred constraint"), true);
+        assert!(e.message.contains("nothing was committed"));
+    }
+
+    #[test]
+    fn a_dropped_connection_leaves_the_outcome_unknown() {
+        let e = commit_failure(
+            AppError::new(ErrorKind::Network, "connection closed"),
+            false,
+        );
+        assert!(!e.message.contains("nothing was committed"));
+        assert!(e.message.contains("unknown"));
+        assert_eq!(e.class, ErrorClass::Fatal);
+        assert!(e.hint.unwrap().contains("re-query"));
+    }
 }

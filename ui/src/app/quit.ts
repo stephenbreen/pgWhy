@@ -1,5 +1,6 @@
-// Quit flow: the native close is intercepted; every tab with an open transaction asks
-// (commit / roll back / keep open) before the app exits.
+// Quit flow: the native close is intercepted; every tab with unsaved text or an open transaction
+// asks (save / discard / cancel, commit / roll back / keep open) before the app exits. Asking
+// leaves the tabs untouched, so cancelling at any of them aborts the quit with nothing lost.
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";

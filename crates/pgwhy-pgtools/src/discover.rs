@@ -149,13 +149,18 @@ impl ToolRegistry {
         self.tools.iter().filter(move |t| t.kind == kind)
     }
 
-    /// Selection rule: major ≥ `min_major`; prefer an exact major match (newest minor),
-    /// else the highest compatible version.
+    /// Selection rule: major ≥ `min_major`; prefer an exact major match, else the highest
+    /// compatible version. Among exact-major matches a tool from the folder the user
+    /// configured wins (they chose it on purpose), then the newest minor.
     pub fn select(&self, kind: ToolKind, min_major: u32) -> Option<&DiscoveredTool> {
         let compatible = || self.of_kind(kind).filter(|t| t.version.major >= min_major);
         compatible()
             .filter(|t| t.version.major == min_major)
-            .max_by(|a, b| a.version.order(&b.version))
+            .max_by(|a, b| {
+                (a.source == DiscoverySource::Configured)
+                    .cmp(&(b.source == DiscoverySource::Configured))
+                    .then_with(|| a.version.order(&b.version))
+            })
             .or_else(|| compatible().max_by(|a, b| a.version.order(&b.version)))
     }
 
@@ -461,5 +466,19 @@ mod tests {
             Some(17)
         );
         assert_eq!(reg.majors(ToolKind::PgDump), vec![15, 16, 18]);
+    }
+
+    #[test]
+    fn a_configured_folder_beats_a_newer_minor_elsewhere() {
+        let mut configured = tool(ToolKind::PgDump, 16, 1);
+        configured.source = DiscoverySource::Configured;
+        let reg = ToolRegistry {
+            tools: vec![tool(ToolKind::PgDump, 16, 15), configured],
+            searched: vec![],
+        };
+        let pick = reg.select(ToolKind::PgDump, 16).unwrap();
+        assert_eq!(pick.version.to_string(), "16.1");
+        // without an exact-major match the highest compatible version still wins
+        assert_eq!(reg.select(ToolKind::PgDump, 15).unwrap().version.minor, 15);
     }
 }

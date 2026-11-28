@@ -8,7 +8,7 @@
 //! inventory and the state-aware action set. Credentials are recorded by *source* only
 //! (keyring / session / none) — never a value.
 
-use crate::definition::{RefreshOptions, ReplaceStrategy, ScriptMode, WorkflowId};
+use crate::definition::{require_safe_id, RefreshOptions, ReplaceStrategy, ScriptMode, WorkflowId};
 use crate::staging::{LocaleSpec, Marker};
 use pgwhy_core::config::{ConnectionEntry, ConnectionId, EnvTag, ServerKey};
 use pgwhy_core::secret::CredentialSource;
@@ -16,6 +16,7 @@ use pgwhy_core::{AppError, AppResult, ErrorKind};
 use pgwhy_pgtools::runner::FailedItem;
 use pgwhy_pgtools::FailureCause;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const RECORD_SCHEMA_VERSION: u32 = 1;
@@ -256,14 +257,39 @@ pub struct BackupRecord {
     pub from_run: Option<RunId>,
 }
 
-/// The post-restore script exactly as executed.
+/// The post-restore script a run executed. The plan carries the full text (the run needs it);
+/// the persisted record carries only [`ScriptRecord::redacted`]: scripts routinely hold
+/// credentials or personal data (anonymisation rules, role passwords), and the record is written
+/// to disk at every step and sent to the UI. Nothing reads the text back from a record: a retry
+/// re-reads the current script from the library, and the hash says whether it changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptRecord {
     pub id: String,
     pub name: String,
     pub mode: ScriptMode,
     pub sha256: String,
+    /// Empty in a persisted record (records written before this was redacted still carry it).
+    #[serde(default)]
     pub content: String,
+    /// Size of the script in bytes, kept in place of the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+impl ScriptRecord {
+    /// The copy that is stored in history: name, mode, hash and size, never the text.
+    pub fn redacted(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            mode: self.mode,
+            sha256: self.sha256.clone(),
+            content: String::new(),
+            size_bytes: self
+                .size_bytes
+                .or((!self.content.is_empty()).then_some(self.content.len() as u64)),
+        }
+    }
 }
 
 /// Lifecycle of the database a run restores into: staging (staging-then-swap) or the target
@@ -1021,13 +1047,17 @@ impl HistoryStore {
         &self.dir
     }
 
-    pub fn record_path(&self, id: &RunId) -> PathBuf {
-        self.dir.join(format!("{id}.json"))
+    /// `<dir>/<id>.json`. Ids come from the UI, so one that is not a single safe path component
+    /// (a separator, `..`, empty) is an error rather than a path outside the store.
+    pub fn record_path(&self, id: &RunId) -> AppResult<PathBuf> {
+        require_safe_id("the run id", &id.0)?;
+        Ok(self.dir.join(format!("{id}.json")))
     }
 
     /// Where a run's full tool logs go.
-    pub fn log_dir(&self, id: &RunId) -> PathBuf {
-        self.dir.join(id.0.as_str())
+    pub fn log_dir(&self, id: &RunId) -> AppResult<PathBuf> {
+        require_safe_id("the run id", &id.0)?;
+        Ok(self.dir.join(id.0.as_str()))
     }
 
     /// Atomically replace the record (temp file + rename in the same directory).
@@ -1046,7 +1076,7 @@ impl HistoryStore {
         let bytes = serde_json::to_vec_pretty(rec).map_err(|e| {
             AppError::internal("could not serialize the history record").with_detail(e.to_string())
         })?;
-        let path = self.record_path(id);
+        let path = self.record_path(id)?;
         let tmp = self
             .dir
             .join(format!(".{id}.{}.tmp", uuid::Uuid::new_v4().simple()));
@@ -1077,7 +1107,7 @@ impl HistoryStore {
     }
 
     fn read<T: serde::de::DeserializeOwned>(&self, id: &RunId) -> AppResult<T> {
-        let path = self.record_path(id);
+        let path = self.record_path(id)?;
         let bytes = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::new(ErrorKind::Config, format!("{id} is not in the history"))
@@ -1154,6 +1184,16 @@ impl HistoryStore {
     /// back as `Stored::Unreadable`: one corrupt record must not hide the history, and it must
     /// not silently vanish from it either.
     fn read_all(&self) -> AppResult<Vec<Stored>> {
+        Ok(self
+            .read_all_files()?
+            .into_iter()
+            .map(|(_, stored)| stored)
+            .collect())
+    }
+
+    /// [`read_all`](Self::read_all) with each record's own file, so pruning removes exactly the
+    /// file a record was read from (never one derived from an id inside the JSON).
+    fn read_all_files(&self) -> AppResult<Vec<(PathBuf, Stored)>> {
         let rd = match std::fs::read_dir(&self.dir) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1170,32 +1210,136 @@ impl HistoryStore {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(path = %p.display(), "unreadable history record: {e}");
-                    out.push(Stored::Unreadable {
-                        file: name,
-                        why: e.to_string(),
-                    });
+                    out.push((
+                        p,
+                        Stored::Unreadable {
+                            file: name,
+                            why: e.to_string(),
+                        },
+                    ));
                     continue;
                 }
             };
             let run_err = match serde_json::from_slice::<RunRecord>(&bytes) {
                 Ok(rec) => {
-                    out.push(Stored::Run(rec));
+                    out.push((p, Stored::Run(rec)));
                     continue;
                 }
                 Err(e) => e,
             };
             if let Ok(rec) = serde_json::from_slice::<OperationRecord>(&bytes) {
-                out.push(Stored::Operation(rec));
+                out.push((p, Stored::Operation(rec)));
                 continue;
             }
             tracing::warn!(path = %p.display(), "unreadable history record: {run_err}");
-            out.push(Stored::Unreadable {
-                file: name,
-                why: run_err.to_string(),
-            });
+            out.push((
+                p,
+                Stored::Unreadable {
+                    file: name,
+                    why: run_err.to_string(),
+                },
+            ));
         }
         Ok(out)
     }
+
+    /// Delete the oldest finished records, keeping the newest `keep_runs_per_workflow` Refresh
+    /// records of each workflow and the newest `keep_operations` one-off operations (a record
+    /// and its log folder go together). Returns how many records were removed.
+    ///
+    /// A record is never removed while it still matters, whatever its age: one that is running,
+    /// interrupted, stopped mid-swap, or that still offers recovery (kept staging, an `_old`
+    /// database to drop, a swap to complete or roll back). Files that cannot be parsed are left
+    /// alone too: they may be the only trace of a run that was mid-swap.
+    pub fn prune(&self, keep_runs_per_workflow: usize, keep_operations: usize) -> AppResult<usize> {
+        let stored = self.read_all_files()?;
+        let mut runs: HashMap<WorkflowId, Vec<(&PathBuf, &RunRecord)>> = HashMap::new();
+        let mut ops: Vec<(&PathBuf, &OperationRecord)> = Vec::new();
+        for (path, s) in &stored {
+            match s {
+                Stored::Run(r) => runs
+                    .entry(r.workflow_id.clone())
+                    .or_default()
+                    .push((path, r)),
+                Stored::Operation(o) => ops.push((path, o)),
+                Stored::Unreadable { .. } => {}
+            }
+        }
+        let mut doomed: Vec<(&PathBuf, &RunId)> = Vec::new();
+        for group in runs.values_mut() {
+            sort_newest_first(group, |(_, r)| (r.started_at.clone(), r.run_id.0.clone()));
+            doomed.extend(
+                group
+                    .iter()
+                    .skip(keep_runs_per_workflow)
+                    .filter(|(_, r)| !run_needs_keeping(r))
+                    .map(|(p, r)| (*p, &r.run_id)),
+            );
+        }
+        sort_newest_first(&mut ops, |(_, o)| (o.started_at.clone(), o.id.0.clone()));
+        doomed.extend(
+            ops.iter()
+                .skip(keep_operations)
+                .filter(|(_, o)| !operation_needs_keeping(o))
+                .map(|(p, o)| (*p, &o.id)),
+        );
+
+        let mut removed = 0;
+        for (path, id) in doomed {
+            match std::fs::remove_file(path) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), "could not prune a history record: {e}");
+                    continue;
+                }
+            }
+            // The log folder is named by the id the record declares; only follow it when that is
+            // a safe single component, matches the record's file name and is a real directory (never a link out of the store).
+            let own_logs = path.file_stem().is_some_and(|s| s == id.0.as_str());
+            if let (true, Ok(logs)) = (own_logs, self.log_dir(id)) {
+                if std::fs::symlink_metadata(&logs).is_ok_and(|m| m.is_dir()) {
+                    if let Err(e) = std::fs::remove_dir_all(&logs) {
+                        tracing::warn!(path = %logs.display(), "could not prune run logs: {e}");
+                    }
+                }
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// How many Refresh records per workflow, and how many one-off operations, are kept before the
+/// oldest finished ones are pruned.
+pub const KEEP_RUNS_PER_WORKFLOW: usize = 50;
+pub const KEEP_OPERATIONS: usize = 50;
+
+/// Whether a record must outlive pruning: it is live, or the user may still need to act on it.
+fn run_needs_keeping(r: &RunRecord) -> bool {
+    use ActionKind::*;
+    !r.status.is_terminal()
+        || r.status == RunStatus::Interrupted
+        || r.status == RunStatus::SucceededCleanupRequired
+        || r.staging_kept
+        || r.renames_completed == 1
+        || r.actions.iter().any(|a| {
+            matches!(
+                a.kind,
+                DropStaging | KeepStaging | DropOld | RollbackSwap | CompleteSwap
+            )
+        })
+}
+
+fn operation_needs_keeping(o: &OperationRecord) -> bool {
+    !o.status.is_terminal()
+        || o.status == RunStatus::Interrupted
+        || o.status == RunStatus::SucceededCleanupRequired
+        || o.swap_state().is_some_and(|s| {
+            s.staging_kept
+                || s.renames_completed == 1
+                // staging still named: a swap that never finished may have left it behind
+                || (s.staging_db.is_some() && !o.status.is_success())
+        })
 }
 
 /// A record file, in whichever shape it declares. Both shapes are large and this value lives
@@ -1298,7 +1442,8 @@ mod tests {
 
         // the record is self-describing on disk: the detail carries its own tag
         let json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(store.record_path(&op.id)).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(store.record_path(&op.id).unwrap()).unwrap())
+                .unwrap();
         assert_eq!(json["detail"]["kind"], "restore");
         assert_eq!(json["detail"]["mode"], "new_database");
         assert_eq!(json["status"], "running");
@@ -1502,5 +1647,125 @@ mod tests {
         assert!(protected.contains(Path::new("/tmp/scratch_predrop.dump")));
         assert!(protected.contains(Path::new("/tmp/live.dump")));
         assert!(!protected.contains(Path::new("/tmp/done.dump")));
+    }
+}
+
+#[cfg(test)]
+mod hygiene_tests {
+    use super::*;
+
+    fn restore_op(started: &str, status: RunStatus) -> OperationRecord {
+        let mut op = OperationRecord::new(
+            OperationKind::Restore,
+            "Restore",
+            OperationDetail::Restore(Box::new(RestoreDetail {
+                archive: pgwhy_pgtools::ArchiveInspection {
+                    path: "/tmp/a.dump".into(),
+                    size_bytes: Some(1),
+                    reusable: true,
+                    reason: None,
+                    cause: None,
+                    toc: None,
+                },
+                source: None,
+                target: EndpointRecord {
+                    connection_id: ConnectionId::new(),
+                    connection_name: "Local".into(),
+                    host: "127.0.0.1".into(),
+                    port: 5432,
+                    database: "app".into(),
+                    user: "me".into(),
+                    maintenance_db: "postgres".into(),
+                    sslmode: "prefer".into(),
+                    tunnel: None,
+                    env_tag: EnvTag::Local,
+                    server_version: None,
+                    server_key: ServerKey {
+                        host: "127.0.0.1".into(),
+                        port: 5432,
+                        via: None,
+                    },
+                },
+                mode: RestoreMode::NewDatabase,
+                backup: None,
+                swap: None,
+            })),
+        );
+        op.started_at = started.into();
+        op.status = status;
+        op
+    }
+
+    #[test]
+    fn ids_that_could_leave_the_store_are_refused_at_the_path_choke_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::new(dir.path());
+        for bad in ["", "..", "../x", "a/b", "a\\b", "/etc/passwd", ".hidden"] {
+            let id = RunId(bad.into());
+            assert!(store.record_path(&id).is_err(), "{bad:?}");
+            assert!(store.log_dir(&id).is_err(), "{bad:?}");
+            assert!(store.load(&id).is_err(), "{bad:?}");
+        }
+        let mut op = restore_op("2026-01-01T00:00:00Z", RunStatus::Succeeded);
+        op.id = RunId("../../escape".into());
+        assert!(store.save_operation(&op).is_err());
+        assert!(!dir.path().parent().unwrap().join("escape.json").exists());
+        let ok = RunId::new();
+        assert!(store.record_path(&ok).is_ok() && store.log_dir(&ok).is_ok());
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_and_everything_still_live_or_awaiting_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::new(dir.path());
+        let mut finished = Vec::new();
+        for day in 1..=5 {
+            let op = restore_op(&format!("2026-01-0{day}T00:00:00Z"), RunStatus::Succeeded);
+            std::fs::create_dir_all(store.log_dir(&op.id).unwrap()).unwrap();
+            std::fs::write(store.log_dir(&op.id).unwrap().join("restore.log"), b"x").unwrap();
+            store.save_operation(&op).unwrap();
+            finished.push(op);
+        }
+        // old but not finished with: a running one, an interrupted one, an unfinished swap
+        let running = restore_op("2025-12-01T00:00:00Z", RunStatus::Running);
+        let interrupted = restore_op("2025-12-02T00:00:00Z", RunStatus::Interrupted);
+        let mut mid_swap = restore_op("2025-12-03T00:00:00Z", RunStatus::FailedAtStep);
+        if let OperationDetail::Restore(r) = &mut mid_swap.detail {
+            r.swap = Some(SwapState {
+                create_mode: false,
+                staging_db: Some("app_staging".into()),
+                old_db: Some("app_old".into()),
+                renames_completed: 1,
+                swap_phase: None,
+                work_db_state: WorkDbState::Verified,
+                staging_kept: false,
+            });
+        }
+        let leftover_old = restore_op("2025-12-04T00:00:00Z", RunStatus::SucceededCleanupRequired);
+        let abandoned = restore_op("2025-12-05T00:00:00Z", RunStatus::Cancelled);
+        for o in [&running, &interrupted, &mid_swap, &leftover_old, &abandoned] {
+            store.save_operation(o).unwrap();
+        }
+        let unreadable = dir.path().join("broken.json");
+        std::fs::write(&unreadable, b"{not json").unwrap();
+
+        // keep the 2 newest; the cancelled one is finished business and goes with the old ones
+        let removed = store.prune(50, 2).unwrap();
+        let left: Vec<RunId> = store
+            .list_operations()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.id)
+            .collect();
+        let has = |o: &OperationRecord| left.contains(&o.id);
+        assert!(has(&finished[4]) && has(&finished[3]), "newest kept");
+        assert!(!has(&finished[0]) && !has(&finished[1]) && !has(&finished[2]));
+        assert!(!has(&abandoned));
+        assert!(has(&running) && has(&interrupted) && has(&mid_swap) && has(&leftover_old));
+        assert_eq!(removed, 4);
+        // a pruned record's logs go with it; a kept one's stay; unreadable files are untouched
+        assert!(!store.log_dir(&finished[0].id).unwrap().exists());
+        assert!(store.log_dir(&finished[4].id).unwrap().exists());
+        assert!(unreadable.exists());
     }
 }

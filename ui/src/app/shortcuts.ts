@@ -1,5 +1,5 @@
 // App-wide shortcuts (SSMS muscle memory): Ctrl/Cmd+N new query on the active connection,
-// Ctrl/Cmd+W close the active tab (asking first when it holds a transaction).
+// Ctrl/Cmd+W close the active tab (asking first when it has unsaved text or a transaction).
 // Explorer: ⌘P / Ctrl+P finds any object; ⇧⌘P / Ctrl+Shift+P focuses the tree filter.
 // Both bring the Explorer into view first, from wherever focus is.
 // ⌘1 / ⌘2 / ⌘3 (Ctrl+1/2/3) open the Explorer, Scripts and Workflows views.

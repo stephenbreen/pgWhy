@@ -47,6 +47,8 @@ export interface RestoreStartRequest {
   settings: RestoreSettings;
   typed_name?: string | null;
   backup_first: boolean;
+  /** Id for the safety backup, so it can be cancelled (`backupCancel`) before the restore starts. */
+  backup_id?: string | null;
 }
 
 export type RestoreEvent =

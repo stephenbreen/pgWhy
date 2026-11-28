@@ -38,7 +38,9 @@ impl std::fmt::Debug for CancelHandle {
 }
 
 impl CancelHandle {
-    pub(crate) fn new(conn: &PgConn) -> Self {
+    /// A handle for `conn` with no cancel requested yet. Use a fresh one per run: the
+    /// requested flag is never cleared.
+    pub fn new(conn: &PgConn) -> Self {
         Self {
             token: conn.cancel_token(),
             tls: conn.cancel_tls(),

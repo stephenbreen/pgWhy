@@ -129,9 +129,11 @@ pub async fn script_write<R: tauri::Runtime>(
     app: AppHandle<R>,
     id: ScriptId,
     content: String,
+    expected: Option<FileFingerprint>,
 ) -> AppResult<ScriptInfo> {
+    // `expected` is the file as the tab last saw it: a file changed since is refused, not replaced
     blocking(app, move |state| {
-        state.with_library(|lib| lib.write(&id, &content))
+        state.with_library(|lib| lib.write_checked(&id, &content, expected.as_ref()))
     })
     .await
 }
@@ -259,9 +261,14 @@ pub async fn file_write<R: tauri::Runtime>(
     app: AppHandle<R>,
     path: PathBuf,
     content: String,
+    expected: Option<FileFingerprint>,
 ) -> AppResult<FileFingerprint> {
     blocking(app, move |state| {
-        scripts::write_script_file(&state.check_path(&path, false)?, &content)
+        scripts::write_script_file_checked(
+            &state.check_path(&path, false)?,
+            &content,
+            expected.as_ref(),
+        )
     })
     .await
 }

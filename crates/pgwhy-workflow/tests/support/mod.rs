@@ -655,6 +655,7 @@ impl Harness {
             mode,
             sha256: "abc123".into(),
             content: "update users set email = null;".into(),
+            size_bytes: None,
         });
     }
 

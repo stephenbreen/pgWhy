@@ -17,7 +17,10 @@
 
 use crate::destructive::{acquire_lock, check_target, require_typed_name, DestructiveContext};
 use crate::engine::Engine;
-use crate::history::{OperationDetail, OperationKind, OperationRecord, OperationStep, RunStatus};
+use crate::history::{
+    OperationDetail, OperationKind, OperationRecord, OperationStep, RunId, RunStatus,
+};
+use crate::ops::RunCancel;
 use crate::staging::LocaleSpec;
 use crate::swap;
 use pgwhy_core::config::{ConnectionId, EnvTag, ServerKey};
@@ -82,6 +85,45 @@ pub struct DropDatabaseRequest {
     pub backup: Option<PathBuf>,
 }
 
+/// Registers a running verb with the engine (so quitting cancels it and waits for it), and
+/// unregisters it however the verb ends.
+struct InFlight<'a> {
+    engine: &'a Engine,
+    id: RunId,
+    cancel: RunCancel,
+    window: crate::swap::SwapWindow,
+}
+
+impl<'a> InFlight<'a> {
+    fn new(engine: &'a Engine, id: &RunId) -> Self {
+        let cancel = RunCancel::new();
+        let window = engine.register_operation_cancel(id, cancel.clone());
+        Self {
+            engine,
+            id: id.clone(),
+            cancel,
+            window,
+        }
+    }
+
+    /// Stop before a step that has not started if cancelled (the user, or the app quitting).
+    fn check(&self) -> AppResult<()> {
+        if self.cancel.is_cancelled() {
+            return Err(AppError::new(
+                ErrorKind::Cancelled,
+                "the operation was cancelled",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.engine.unregister_operation_cancel(&self.id);
+    }
+}
+
 impl Engine {
     /// Create a database on the target's server (mode `template0`, locale optional).
     pub async fn create_database(&self, req: CreateDatabaseRequest) -> AppResult<OperationRecord> {
@@ -102,8 +144,12 @@ impl Engine {
             format!("Create database {}", req.target.database),
         ));
         self.save_operation(&rec)?;
+        let flight = InFlight::new(self, &rec.id);
 
         let maint = self.maintenance(&req.target.connection_id).await?;
+        if let Err(e) = flight.check() {
+            return Err(self.fail(&mut rec, "create", e)?);
+        }
         let step = rec.step_mut("create").expect("pushed above");
         step.start();
         if let Some(comment) = req.comment.as_deref().filter(|c| !c.trim().is_empty()) {
@@ -173,15 +219,22 @@ impl Engine {
             format!("Rename to {}", req.to),
         ));
         self.save_operation(&rec)?;
+        let flight = InFlight::new(self, &rec.id);
 
         let maint = self.maintenance(&req.target.connection_id).await?;
         rec.step_mut("rename").expect("pushed above").start();
         self.save_operation(&rec)?;
 
         let timeout = self.drain_timeout();
-        if let Err(e) =
-            swap::rename_with_drain(&*maint, &req.target.database, &req.to, timeout).await
-        {
+        // The rename is this verb's window: a cancel before it is honoured, one during it is
+        // refused, and quitting lets it finish within the grace period.
+        if let Err(e) = flight.window.enter(Some(&flight.cancel)) {
+            return Err(self.fail(&mut rec, "rename", e)?);
+        }
+        let renamed =
+            swap::rename_with_drain(&*maint, &req.target.database, &req.to, timeout).await;
+        flight.window.leave();
+        if let Err(e) = renamed {
             return Err(self.fail(&mut rec, "rename", e)?);
         }
 
@@ -223,6 +276,7 @@ impl Engine {
             format!("Terminate sessions on {} and drop it", req.target.database),
         ));
         self.save_operation(&rec)?;
+        let flight = InFlight::new(self, &rec.id);
 
         let maint = self.maintenance(&req.target.connection_id).await?;
 
@@ -240,7 +294,17 @@ impl Engine {
         rec.step_mut("drop").expect("pushed above").start();
         self.save_operation(&rec)?;
         let timeout = self.drain_timeout();
-        if let Err(e) = swap::drop_with_drain(&*maint, &req.target.database, timeout).await {
+        if let Err(e) = flight.check() {
+            return Err(self.fail(&mut rec, "drop", e)?);
+        }
+        if let Err(e) = swap::drop_with_drain_cancellable(
+            &*maint,
+            &req.target.database,
+            timeout,
+            Some(&flight.cancel),
+        )
+        .await
+        {
             return Err(self.fail(&mut rec, "drop", e)?);
         }
 
@@ -256,7 +320,11 @@ impl Engine {
         if let Some(s) = rec.step_mut(step) {
             s.fail(error.clone());
         }
-        rec.status = RunStatus::FailedAtStep;
+        rec.status = match error.kind {
+            ErrorKind::Cancelled if self.is_shutting_down() => RunStatus::Interrupted,
+            ErrorKind::Cancelled => RunStatus::Cancelled,
+            _ => RunStatus::FailedAtStep,
+        };
         rec.failed_step = Some(step.to_string());
         rec.finished_at = Some(crate::staging::now_rfc3339());
         rec.error = Some(error.clone());

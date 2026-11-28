@@ -230,7 +230,15 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
   // a column resize that ends over its header must not also count as a click on it
   const suppressHeaderClick = useRef(false);
 
-  useEffect(() => setWidths(columns.map(defaultWidth)), [columns]);
+  // Callers build the columns array afresh every render, so the widths follow what the columns
+  // are, not the array's identity: re-rendering with the same columns keeps a user's resizes.
+  const columnsKey = columns.map((c) => `${c.name}\u0000${c.type ?? ""}\u0000${c.key ? 1 : 0}`).join("\u0001");
+  const shownKey = useRef(columnsKey);
+  useEffect(() => {
+    if (shownKey.current === columnsKey) return;
+    shownKey.current = columnsKey;
+    setWidths(columns.map(defaultWidth));
+  }, [columnsKey]); // eslint-disable-line react-hooks/exhaustive-deps
   // Any store change can make the visible window re-fetchable (invalidate, a new partial chunk);
   // the rows themselves subscribe for their content.
   const revision = useSyncExternalStore(store.subscribe, () => store.revision);
@@ -273,12 +281,15 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
     },
     [onEditCell, store],
   );
+  // the edit in progress, readable outside a state updater (a side effect there runs twice in StrictMode)
+  const editingRef = useRef(editing);
+  editingRef.current = editing;
   const onEditDone = useCallback(
     (value: string | null, commit: boolean) => {
-      setEditing((ed) => {
-        if (ed && commit && onEditCell && value !== store.cell(ed.row, ed.col)) onEditCell(ed.row, ed.col, value);
-        return null;
-      });
+      const ed = editingRef.current;
+      editingRef.current = null; // Enter and the blur it causes both report; only the first counts
+      setEditing(null);
+      if (ed && commit && onEditCell && value !== store.cell(ed.row, ed.col)) onEditCell(ed.row, ed.col, value);
       scrollRef.current?.focus();
     },
     [onEditCell, store],
@@ -319,7 +330,11 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
       return;
     }
     if (withHeaders) text = toTsv([], columns.slice(c0, c1 + 1).map((c) => c.name)) + "\n" + text;
-    await navigator.clipboard?.writeText(text);
+    try {
+      await navigator.clipboard?.writeText(text);
+    } catch (e) {
+      setCopyError(toAppError(e).message);
+    }
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -353,7 +368,12 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
     }
   };
 
+  // detaches the window listeners of a drag in progress (also when the grid unmounts mid-drag)
+  const stopResize = useRef<(() => void) | null>(null);
+  useEffect(() => () => stopResize.current?.(), []);
+
   const startResize = (col: number, e: React.MouseEvent) => {
+    stopResize.current?.();
     e.preventDefault();
     e.stopPropagation();
     const x0 = e.clientX;
@@ -362,14 +382,19 @@ export function ResultGrid({ columns, store, rowCount, label, sort, onSort, onEd
       if (ev.clientX !== x0) suppressHeaderClick.current = true;
       setWidths((w) => w.map((x, i) => (i === col ? Math.max(MIN_COL_W, w0 + ev.clientX - x0) : x)));
     };
-    const onUp = () => {
+    const detach = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      stopResize.current = null;
+    };
+    const onUp = () => {
+      detach();
       // the click (if any) is dispatched right after this mouseup
       setTimeout(() => (suppressHeaderClick.current = false), 0);
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
+    stopResize.current = detach;
   };
 
   /** Widen (or narrow) a column to its header and the values loaded around the viewport. */

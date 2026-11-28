@@ -130,3 +130,20 @@ test("replace mode is disabled for a role that cannot create databases", async (
   // on-top stays available: it needs no CREATE DATABASE
   expect(screen.getByRole("radio", { name: /restore on top/i })).toBeEnabled();
 });
+
+test("switching mode clears the typed confirmation and restores the backup default", async () => {
+  backend();
+  open("local", "app");
+  render(<RestoreDialog />);
+  await userEvent.click(await screen.findByRole("button", { name: /choose/i }));
+
+  await userEvent.click(await screen.findByRole("radio", { name: /replace database/i }));
+  await userEvent.type(screen.getByLabelText(/type the database name/i), "app");
+  await userEvent.click(screen.getByRole("checkbox", { name: /back up first/i }));
+  expect(screen.getByRole("button", { name: /^restore$/i })).toBeEnabled();
+
+  await userEvent.click(screen.getByRole("radio", { name: /restore on top/i }));
+  expect(screen.getByLabelText(/type the database name/i)).toHaveValue("");
+  expect(screen.getByRole("checkbox", { name: /back up first/i })).toBeChecked();
+  expect(screen.getByRole("button", { name: /^restore$/i })).toBeDisabled();
+});

@@ -13,16 +13,66 @@
 //! Create-mode: quiesce, drain staging only, rename staging→target, then persist 2.
 
 use crate::engine::{RunEvent, Runner};
-use crate::history::{RunId, RunRecord, RunStatus, SessionInfo, SwapPhase, WorkDbState};
-use crate::ops::{object_in_use, MaintenanceOps, PreparedXact, RefreshOps, RunCancel};
+use crate::history::{
+    OperationDetail, OperationRecord, RunId, RunRecord, RunStatus, SessionInfo, StepStatus,
+    SwapPhase, WorkDbState,
+};
+use crate::ops::{object_in_use, DbFact, MaintenanceOps, PreparedXact, RefreshOps, RunCancel};
 use crate::staging::{Marker, MarkerRole};
 use pgwhy_core::{AppError, AppResult, ErrorClass, ErrorKind};
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
 const POLL: Duration = Duration::from_millis(150);
+
+/// The swap's outage window, from the first rename's start to the second's end, as a flag that
+/// cancel and the swap settle *together*.
+///
+/// A bare flag is racy: a cancel that read "not in the window" and then raised the cancel flag
+/// could land after the swap's last cancel check and before it entered the window, and be
+/// acknowledged yet silently ignored. Here entering the window checks cancellation and cancel
+/// checks the window under one lock, so a cancel is either seen by the swap (which then does not
+/// start renaming) or refused by the caller (the swap is already committed to finish).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SwapWindow(Arc<Mutex<bool>>);
+
+impl SwapWindow {
+    fn state(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_open(&self) -> bool {
+        *self.state()
+    }
+
+    /// Open the window unless `cancel` already fired (then nothing is committed to yet).
+    pub(crate) fn enter(&self, cancel: Option<&RunCancel>) -> AppResult<()> {
+        let mut open = self.state();
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            return Err(AppError::new(ErrorKind::Cancelled, "the run was cancelled"));
+        }
+        *open = true;
+        Ok(())
+    }
+
+    pub(crate) fn leave(&self) {
+        *self.state() = false;
+    }
+
+    /// Cancel `cancel` unless the window is open. `false` means refused: the swap is between its
+    /// renames and will finish, and the cancel flag was not raised.
+    pub(crate) fn cancel(&self, cancel: &RunCancel) -> bool {
+        let open = self.state();
+        if *open {
+            return false;
+        }
+        cancel.cancel();
+        true
+    }
+}
 
 fn blocked_error(dbs: &[String], sessions: &[SessionInfo]) -> AppError {
     let list = sessions
@@ -118,8 +168,18 @@ pub(crate) async fn drop_with_drain(
     db: &str,
     timeout: Duration,
 ) -> AppResult<()> {
+    drop_with_drain_cancellable(maint, db, timeout, None).await
+}
+
+/// [`drop_with_drain`] that stops draining when `cancel` fires (before the drop statement runs).
+pub(crate) async fn drop_with_drain_cancellable(
+    maint: &dyn MaintenanceOps,
+    db: &str,
+    timeout: Duration,
+    cancel: Option<&RunCancel>,
+) -> AppResult<()> {
     let drain_dbs = vec![db.to_string()];
-    drain(maint, &drain_dbs, timeout, None).await?;
+    drain(maint, &drain_dbs, timeout, cancel).await?;
     with_drain(maint, &drain_dbs, timeout, || maint.drop_database(db)).await
 }
 
@@ -197,7 +257,7 @@ pub(crate) struct SwapJob<'a> {
     pub owner: &'a str,
     pub timeout: Duration,
     pub cancel: Option<&'a RunCancel>,
-    pub in_window: &'a AtomicBool,
+    pub in_window: &'a SwapWindow,
     pub progress: SwapProgress,
     pub persist: &'a mut (dyn FnMut(&SwapProgress) -> AppResult<()> + Send),
 }
@@ -238,19 +298,40 @@ fn set_phase(job: &mut SwapJob<'_>, phase: SwapPhase) -> AppResult<()> {
     (job.persist)(&job.progress)
 }
 
-fn check_cancel(cancel: Option<&RunCancel>) -> AppResult<()> {
-    if cancel.is_some_and(|c| c.is_cancelled()) {
-        return Err(AppError::new(ErrorKind::Cancelled, "the run was cancelled"));
-    }
-    Ok(())
-}
-
 async fn clear_marker(job: &mut SwapJob<'_>, db: &str) {
     if let Err(e) = job.maint.set_comment(db, None).await {
         job.progress.warnings.push(format!(
             "could not clear pgWhy's marker comment on {db}: {}",
             e.message
         ));
+    }
+}
+
+/// Why `staging` cannot be swapped in by `run`, judged from a fresh database list: it is gone,
+/// carries no pgWhy marker, or is marked for another run or role. `None` means it is this run's.
+pub(crate) fn staging_problem(dbs: &[DbFact], staging: &str, run: &RunId) -> Option<AppError> {
+    let Some(fact) = dbs.iter().find(|d| d.name == staging) else {
+        return Some(
+            AppError::new(
+                ErrorKind::Refused,
+                format!("the staging database {staging} no longer exists, so nothing was renamed"),
+            )
+            .with_hint("run the workflow again to build a new one"),
+        );
+    };
+    match fact.comment.as_deref().and_then(Marker::parse) {
+        Some(m) if m.run_id == run.0 && m.role == MarkerRole::Staging => None,
+        Some(m) => Some(AppError::new(
+            ErrorKind::Refused,
+            format!(
+                "{staging} is not this run's staging database (it is marked for run {} as {:?}), so nothing was renamed",
+                m.run_id, m.role
+            ),
+        )),
+        None => Some(AppError::new(
+            ErrorKind::Refused,
+            format!("{staging} is not marked by pgWhy and may be a real database, so nothing was renamed"),
+        )),
     }
 }
 
@@ -291,6 +372,14 @@ pub(crate) async fn swap_into_place(mut job: SwapJob<'_>) -> AppResult<SwapOutco
         }
         _ => {}
     }
+    // The staging database is what takes the target's place: check it is there, and ours, from
+    // the list just fetched — before rename 1 moves the target away. Otherwise a staging
+    // database dropped or replaced since the verify step would leave the target renamed to `_old`
+    // with nothing to put in its place.
+    if let Some(e) = staging_problem(&dbs, &staging, job.run_id) {
+        let _ = (job.persist)(&job.progress);
+        return Err(e);
+    }
     if !create_mode {
         set_phase(&mut job, SwapPhase::CheckingPreparedTransactions)?;
         let px = job.maint.prepared_xacts(&target).await?;
@@ -323,13 +412,14 @@ pub(crate) async fn swap_into_place(mut job: SwapJob<'_>) -> AppResult<SwapOutco
         vec![target.clone(), staging.clone()]
     };
     drain(job.maint, &drain_dbs, job.timeout, job.cancel).await?;
-    check_cancel(job.cancel)?;
 
+    // Entering the window re-checks cancellation under the same lock `cancel` takes, so a cancel
+    // that lands after the drain is honoured here, or refused by `cancel` — never dropped.
     if create_mode {
-        job.in_window.store(true, Ordering::SeqCst);
+        job.in_window.enter(job.cancel)?;
         set_phase(&mut job, SwapPhase::RenamingStagingToTarget)?;
         let r = rename_with_drain(job.maint, &staging, &target, job.timeout).await;
-        job.in_window.store(false, Ordering::SeqCst);
+        job.in_window.leave();
         r?;
         job.progress.renames_completed = 2;
         job.progress.work_db_state = WorkDbState::SwappedIn;
@@ -353,10 +443,10 @@ pub(crate) async fn swap_into_place(mut job: SwapJob<'_>) -> AppResult<SwapOutco
     let mut marker = Marker::new(MarkerRole::Old, &job.run_id.0, job.owner, &target);
     marker.original_comment = original_comment.clone();
 
-    job.in_window.store(true, Ordering::SeqCst);
+    job.in_window.enter(job.cancel)?;
     // Persisted (renames_completed = 0, phase) before the first rename starts.
     if let Err(e) = set_phase(&mut job, SwapPhase::RenamingTargetToOld) {
-        job.in_window.store(false, Ordering::SeqCst);
+        job.in_window.leave();
         return Err(e);
     }
     if let Err(e) = job
@@ -364,7 +454,7 @@ pub(crate) async fn swap_into_place(mut job: SwapJob<'_>) -> AppResult<SwapOutco
         .set_comment(&target, Some(&marker.to_comment()))
         .await
     {
-        job.in_window.store(false, Ordering::SeqCst);
+        job.in_window.leave();
         job.progress.phase = Some(SwapPhase::TerminatingSessions);
         let _ = (job.persist)(&job.progress);
         return Err(e);
@@ -375,7 +465,7 @@ pub(crate) async fn swap_into_place(mut job: SwapJob<'_>) -> AppResult<SwapOutco
         if rename_landed(&mut job, &target, &old, &e).await {
             // The target is sitting under `old`: record it so recovery (rollback / complete)
             // sees the truth. The Old marker stays on the renamed database.
-            job.in_window.store(false, Ordering::SeqCst);
+            job.in_window.leave();
             job.progress.renames_completed = 1;
             let _ = (job.persist)(&job.progress);
             return Err(e);
@@ -384,7 +474,7 @@ pub(crate) async fn swap_into_place(mut job: SwapJob<'_>) -> AppResult<SwapOutco
             .maint
             .set_comment(&target, original_comment.as_deref())
             .await;
-        job.in_window.store(false, Ordering::SeqCst);
+        job.in_window.leave();
         job.progress.phase = Some(SwapPhase::TerminatingSessions);
         let _ = (job.persist)(&job.progress);
         return Err(e);
@@ -402,14 +492,14 @@ pub(crate) async fn swap_into_place(mut job: SwapJob<'_>) -> AppResult<SwapOutco
                 e.message
             ));
         } else {
-            job.in_window.store(false, Ordering::SeqCst);
+            job.in_window.leave();
             return Err(e);
         }
     }
     job.progress.renames_completed = 2;
     job.progress.work_db_state = WorkDbState::SwappedIn;
     (job.persist)(&job.progress)?;
-    job.in_window.store(false, Ordering::SeqCst);
+    job.in_window.leave();
     clear_marker(&mut job, &target).await;
 
     set_phase(&mut job, SwapPhase::DroppingOld)?;
@@ -634,6 +724,11 @@ pub(crate) async fn complete(
             vec![target.clone(), old.clone(), staging.clone()],
         )
         .await?;
+    // Same ownership check the swap itself makes: never rename a database that is not this
+    // run's staging copy into the target's place.
+    if let Some(e) = staging_problem(&maint.databases().await?, &staging, &rec.run_id) {
+        return Err(e);
+    }
     drain(maint, std::slice::from_ref(&staging), timeout, None).await?;
     rename_with_drain(maint, &staging, &target, timeout).await?;
     rec.renames_completed = 2;
@@ -661,4 +756,216 @@ pub(crate) async fn complete(
         }
     };
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recovery of a replace-restore (an operation record) — same moves as for a Refresh run
+// ---------------------------------------------------------------------------------------------
+
+/// What recovery needs from an operation record: the names a replace-restore recorded.
+struct OperationSwap {
+    connection: pgwhy_core::config::ConnectionId,
+    target: String,
+    staging: String,
+    old: String,
+}
+
+fn operation_swap(rec: &OperationRecord) -> AppResult<OperationSwap> {
+    let OperationDetail::Restore(r) = &rec.detail else {
+        return Err(AppError::new(
+            ErrorKind::Refused,
+            "only a replace-restore has a swap to recover",
+        ));
+    };
+    let swap = r.swap.as_ref().ok_or_else(|| {
+        AppError::new(
+            ErrorKind::Refused,
+            "this operation recorded no swap to recover",
+        )
+    })?;
+    Ok(OperationSwap {
+        connection: r.target.connection_id.clone(),
+        target: r.target.database.clone(),
+        staging: swap
+            .staging_db
+            .clone()
+            .ok_or_else(|| AppError::internal("no staging name recorded"))?,
+        old: swap
+            .old_db
+            .clone()
+            .ok_or_else(|| AppError::internal("no _old name recorded"))?,
+    })
+}
+
+fn swap_state_mut(rec: &mut OperationRecord) -> Option<&mut crate::history::SwapState> {
+    match &mut rec.detail {
+        OperationDetail::Restore(r) => r.swap.as_mut(),
+        _ => None,
+    }
+}
+
+/// Roll a replace-restore's half-finished swap back: `_old` becomes the target again. Staging
+/// stays under its own name (the record then offers to drop it).
+pub(crate) async fn rollback_operation(
+    ops: &dyn RefreshOps,
+    maint: &dyn MaintenanceOps,
+    rec: &mut OperationRecord,
+    timeout: Duration,
+) -> AppResult<()> {
+    let n = operation_swap(rec)?;
+    let _q = ops
+        .quiesce(
+            &n.connection,
+            vec![n.target.clone(), n.old.clone(), n.staging.clone()],
+        )
+        .await?;
+    let warnings = rollback_rename(maint, &n.target, &n.old, timeout).await?;
+    if let Some(s) = swap_state_mut(rec) {
+        s.renames_completed = 0;
+        s.swap_phase = None;
+        s.work_db_state = WorkDbState::Verified;
+    }
+    rec.warnings.extend(warnings);
+    rec.warnings.push(format!(
+        "rolled back: {} is the previous database again; the restored copy is still in {}",
+        n.target, n.staging
+    ));
+    Ok(())
+}
+
+/// Finish a replace-restore's swap stopped between its renames: staging → target, marker cleared,
+/// then `_old` dropped. Refuses unless the staging database is still this operation's own.
+pub(crate) async fn complete_operation(
+    ops: &dyn RefreshOps,
+    maint: &dyn MaintenanceOps,
+    rec: &mut OperationRecord,
+    timeout: Duration,
+) -> AppResult<()> {
+    let n = operation_swap(rec)?;
+    let _q = ops
+        .quiesce(
+            &n.connection,
+            vec![n.target.clone(), n.old.clone(), n.staging.clone()],
+        )
+        .await?;
+    let dbs = maint.databases().await?;
+    if let Some(e) = staging_problem(&dbs, &n.staging, &rec.id) {
+        return Err(e);
+    }
+    if dbs.iter().any(|d| d.name == n.target) {
+        return Err(AppError::new(
+            ErrorKind::Refused,
+            format!(
+                "{} exists again; the swap cannot be completed over it",
+                n.target
+            ),
+        ));
+    }
+    drain(maint, std::slice::from_ref(&n.staging), timeout, None).await?;
+    rename_with_drain(maint, &n.staging, &n.target, timeout).await?;
+    if let Some(s) = swap_state_mut(rec) {
+        s.renames_completed = 2;
+        s.work_db_state = WorkDbState::SwappedIn;
+        s.swap_phase = Some(SwapPhase::Done);
+        s.staging_db = None;
+    }
+    if let Err(e) = maint.set_comment(&n.target, None).await {
+        rec.warnings.push(format!(
+            "could not clear pgWhy's marker comment on {}: {}",
+            n.target, e.message
+        ));
+    }
+    if let Some(e) = rec.error.take() {
+        rec.warnings.push(format!(
+            "swap completed after recovery; the restore had stopped with: {}",
+            e.message
+        ));
+    }
+    rec.failed_step = None;
+    if let Some(step) = rec.step_mut("swap") {
+        step.status = StepStatus::Succeeded;
+        step.error = None;
+    }
+    rec.status = match drop_marked(maint, &n.old, &rec.id, Some(MarkerRole::Old), timeout).await {
+        Ok(()) => RunStatus::Succeeded,
+        Err(e) => {
+            rec.warnings
+                .push(format!("{} could not be dropped: {}", n.old, e.message));
+            RunStatus::SucceededCleanupRequired
+        }
+    };
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fact(name: &str, comment: Option<String>) -> DbFact {
+        DbFact {
+            name: name.into(),
+            comment,
+            owner: "pgwhy".into(),
+        }
+    }
+
+    #[test]
+    fn a_cancel_before_the_window_stops_the_swap_and_one_inside_it_is_refused() {
+        // cancelled first: the swap never enters the window
+        let (w, c) = (SwapWindow::default(), RunCancel::new());
+        assert!(w.cancel(&c), "outside the window a cancel is honoured");
+        assert!(c.is_cancelled());
+        assert_eq!(w.enter(Some(&c)).unwrap_err().kind, ErrorKind::Cancelled);
+        assert!(!w.is_open());
+
+        // window first: the cancel is refused and the flag is not raised, so it cannot linger
+        // and misclassify a later failure as a cancellation
+        let (w, c) = (SwapWindow::default(), RunCancel::new());
+        w.enter(Some(&c)).unwrap();
+        assert!(w.is_open());
+        assert!(!w.cancel(&c));
+        assert!(!c.is_cancelled());
+        w.leave();
+        assert!(w.cancel(&c), "honoured again once the window closed");
+    }
+
+    #[test]
+    fn every_interleaving_of_cancel_and_enter_is_honoured_or_refused() {
+        for _ in 0..200 {
+            let (w, c) = (SwapWindow::default(), RunCancel::new());
+            let (w2, c2) = (w.clone(), c.clone());
+            let canceller = std::thread::spawn(move || w2.cancel(&c2));
+            let entered = w.enter(Some(&c)).is_ok();
+            let cancelled = canceller.join().unwrap();
+            // the swap is committed XOR the cancel took effect — never both, never neither
+            assert_ne!(entered, cancelled);
+        }
+    }
+
+    #[test]
+    fn staging_must_exist_and_carry_this_runs_staging_marker() {
+        let run = RunId("run-1".into());
+        let mine = Marker::new(MarkerRole::Staging, "run-1", "wf", "app").to_comment();
+        let other = Marker::new(MarkerRole::Staging, "run-2", "wf", "app").to_comment();
+        let wrong_role = Marker::new(MarkerRole::Old, "run-1", "wf", "app").to_comment();
+
+        let ok = [fact("app_staging", Some(mine))];
+        assert!(staging_problem(&ok, "app_staging", &run).is_none());
+        assert!(staging_problem(&ok, "missing", &run)
+            .unwrap()
+            .message
+            .contains("no longer exists"));
+        let foreign = [fact("app_staging", Some(other))];
+        assert!(staging_problem(&foreign, "app_staging", &run)
+            .unwrap()
+            .message
+            .contains("run-2"));
+        let unmarked = [fact("app_staging", Some("my notes".into()))];
+        assert!(staging_problem(&unmarked, "app_staging", &run)
+            .unwrap()
+            .message
+            .contains("not marked"));
+        let role = [fact("app_staging", Some(wrong_role))];
+        assert!(staging_problem(&role, "app_staging", &run).is_some());
+    }
 }

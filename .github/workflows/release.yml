@@ -17,7 +17,7 @@ jobs:
     outputs:
       release_id: ${{ steps.draft.outputs.id }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - run: scripts/check-release-version.sh "$GITHUB_REF_NAME"
       # Up front, so a missing secret costs seconds rather than a half-built draft. An unsigned Mac
       # build opens as "damaged" once downloaded, and an unsigned one can't reach the updater.
@@ -77,15 +77,15 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: "1.94"
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.target }}
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
@@ -99,7 +99,7 @@ jobs:
       # Two steps so the Apple secrets only ever reach the Mac runners.
       - name: Build, sign and notarize
         if: runner.os == 'macOS'
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -118,7 +118,7 @@ jobs:
           args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
       - name: Build
         if: runner.os == 'Windows'
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -163,11 +163,22 @@ jobs:
           gh api -H "Accept: application/octet-stream" \
             "repos/$GITHUB_REPOSITORY/releases/assets/$asset" > latest.json
           status=0
+          version=$(jq -r '.version // empty' latest.json)
+          if [ "${version#v}" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::latest.json says version ${version:-none}, the tag is $GITHUB_REF_NAME"
+            status=1
+          fi
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            --jq '.[].name' > assets.txt
           for platform in darwin-aarch64 darwin-x86_64 windows-x86_64; do
             url=$(jq -r ".platforms[\"$platform\"].url // empty" latest.json)
             signature=$(jq -r ".platforms[\"$platform\"].signature // empty" latest.json)
             if [ -z "$signature" ] || [[ "$url" != *"/releases/download/$GITHUB_REF_NAME/"* ]]; then
               echo "::error::latest.json is wrong for $platform (url: ${url:-none})"
+              status=1
+            # a URL to a file the release does not have would break that platform's updates
+            elif ! grep -qxF "${url##*/}" assets.txt; then
+              echo "::error::latest.json points $platform at ${url##*/}, which is not in the release"
               status=1
             fi
           done

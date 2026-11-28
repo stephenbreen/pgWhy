@@ -1,10 +1,11 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { App } from "../app/App";
 import { registerTab } from "../app/registry";
-import { useWorkspace } from "../app/workspace";
+import { EditorView } from "@codemirror/view";
+import { requestCloseAll, useWorkspace } from "../app/workspace";
 import { useConnections } from "../connection/store";
 import type { ConnectionEntry } from "../lib/ipc/connections";
 import type { QueryEvent } from "../lib/ipc/query";
@@ -173,5 +174,152 @@ describe("editor tab", () => {
     expect(screen.getByText(/SQLSTATE 42601/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Reconnect" })).toBeInTheDocument();
     expect(document.querySelector(".cm-content")?.textContent).toContain("select 1 frm t");
+  });
+
+  // typing into the real CodeMirror document
+  const typeInto = (text: string) =>
+    act(() => {
+      const view = EditorView.findFromDOM([...document.querySelectorAll<HTMLElement>(".cm-content")].at(-1)!)!;
+      view.dispatch({ changes: { from: view.state.doc.length, insert: text } });
+    });
+
+  it("asks Save / Discard / Cancel before closing a tab with unsaved text", async () => {
+    const user = userEvent.setup();
+    const calls = backend();
+    render(<App />);
+    act(() => void openEditorTab("c1", "app", { text: "select 1" }));
+    await screen.findByRole("toolbar", { name: "Editor" });
+    await typeInto(" -- edited");
+
+    await user.click(screen.getByRole("button", { name: /Close Query/ }));
+    const ask = await screen.findByRole("alert");
+    expect(ask).toHaveTextContent("unsaved changes");
+    await user.click(within(ask).getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("tab", { name: /Query/ })).toBeInTheDocument();
+    expect(calls.some((c) => c.cmd === "editor_close")).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: /Close Query/ }));
+    await user.click(within(await screen.findByRole("alert")).getByRole("button", { name: "Discard" }));
+    expect(screen.queryByRole("tab", { name: /Query/ })).not.toBeInTheDocument();
+    expect(calls.some((c) => c.cmd === "editor_close")).toBe(true);
+  });
+
+  it("an empty untitled tab closes without asking, even after typing and deleting", async () => {
+    const user = userEvent.setup();
+    backend();
+    render(<App />);
+    act(() => void openEditorTab("c1", "app"));
+    await screen.findByRole("toolbar", { name: "Editor" });
+    await typeInto("x");
+    act(() => {
+      const view = EditorView.findFromDOM([...document.querySelectorAll<HTMLElement>(".cm-content")].at(-1)!)!;
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "" } });
+    });
+    await user.click(screen.getByRole("button", { name: /Close Query/ }));
+    expect(screen.queryByRole("tab", { name: /Query/ })).not.toBeInTheDocument();
+  });
+
+  it("Save in the close prompt saves a library script and then closes", async () => {
+    const user = userEvent.setup();
+    const calls = backend();
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args: args as Record<string, unknown> });
+      if (cmd === "editor_open") return { handle: 7, connection_id: "c1", database: "app", purpose: "editor_tab", server_version_num: 160000, backend_pid: 9, tls: "plaintext" };
+      if (cmd === "script_write") return { sha256: "y", size: 2, modified_ms: 2 };
+      return null;
+    });
+    render(<App />);
+    act(() => void openEditorTab("c1", "app", { text: "select 1", scriptId: "s1", filePath: "/lib/a.sql" }));
+    await screen.findByRole("toolbar", { name: "Editor" });
+    await typeInto(";");
+    await user.click(screen.getByRole("button", { name: /Close Query/ }));
+    await user.click(within(await screen.findByRole("alert")).getByRole("button", { name: "Save" }));
+    expect(calls.find((c) => c.cmd === "script_write")?.args).toMatchObject({ content: "select 1;" });
+    expect(screen.queryByRole("tab", { name: /Query/ })).not.toBeInTheDocument();
+  });
+
+  it("text typed while a save is in flight keeps the tab dirty", async () => {
+    const user = userEvent.setup();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    mockIPC((cmd) => {
+      if (cmd === "editor_open") return { handle: 7, connection_id: "c1", database: "app", purpose: "editor_tab", server_version_num: 160000, backend_pid: 9, tls: "plaintext" };
+      if (cmd === "script_write") return gate.then(() => ({ sha256: "y", size: 2, modified_ms: 2 }));
+      return null;
+    });
+    render(<App />);
+    act(() => void openEditorTab("c1", "app", { text: "select 1", scriptId: "s1", filePath: "/lib/a.sql" }));
+    await screen.findByRole("toolbar", { name: "Editor" });
+    await typeInto(";");
+    await user.click(screen.getByRole("button", { name: /^Save/ }));
+    await typeInto(" -- more");
+    await act(async () => release());
+    expect(screen.getByRole("button", { name: /^Save/ })).toHaveTextContent("Save •");
+  });
+
+  it("a save over a file changed on disk asks first, and Keep mine then replaces it", async () => {
+    const user = userEvent.setup();
+    const loaded = { sha256: "a", size: 8, modified_ms: 1 };
+    const theirs = { sha256: "b", size: 9, modified_ms: 2 };
+    const writes: Record<string, unknown>[] = [];
+    mockIPC((cmd, args) => {
+      if (cmd === "editor_open") return { handle: 7, connection_id: "c1", database: "app", purpose: "editor_tab", server_version_num: 160000, backend_pid: 9, tls: "plaintext" };
+      if (cmd === "file_write") {
+        const a = args as { expected: { sha256: string } | null };
+        writes.push(a as Record<string, unknown>);
+        if (a.expected?.sha256 !== "b") throw { kind: "refused", class: "fatal", message: "changed", data: { code: "changed_on_disk", current: theirs } };
+        return { sha256: "c", size: 9, modified_ms: 3 };
+      }
+      return null;
+    });
+    render(<App />);
+    act(() => void openEditorTab("c1", "app", { text: "select 1", filePath: "/tmp/a.sql", fingerprint: loaded }));
+    await screen.findByRole("toolbar", { name: "Editor" });
+    await typeInto(";");
+    await user.click(screen.getByRole("button", { name: /^Save/ }));
+    const banner = await screen.findByText("This file changed on disk.");
+    expect(writes[0]).toMatchObject({ expected: loaded });
+    expect(screen.getByRole("button", { name: /^Save/ })).toHaveTextContent("Save •");
+    await user.click(within(banner.parentElement!).getByRole("button", { name: "Keep mine" }));
+    await user.click(screen.getByRole("button", { name: /^Save/ }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Save/ })).not.toHaveTextContent("•"));
+    expect(writes[1]).toMatchObject({ expected: theirs, content: "select 1;" });
+  });
+
+  it("an aborted close-all leaves earlier tabs and their text intact", async () => {
+    const user = userEvent.setup();
+    const calls = backend();
+    render(<App />);
+    act(() => void openEditorTab("c1", "app", { text: "select 'first'" }));
+    await screen.findByRole("toolbar", { name: "Editor" });
+    act(() => void openEditorTab("c1", "app", { text: "select 'second'" }));
+    await waitFor(() => expect(document.querySelectorAll(".cm-content")).toHaveLength(2));
+    await typeInto(" -- dirty"); // the second tab; the first stays clean and agrees to close
+    let result: Promise<boolean>;
+    act(() => {
+      result = requestCloseAll();
+    });
+    await user.click(within(await screen.findByRole("alert")).getByRole("button", { name: "Cancel" }));
+    expect(await result!).toBe(false);
+    expect(calls.some((c) => c.cmd === "editor_close")).toBe(false);
+    expect(Object.keys(useEditors.getState().tabs)).toHaveLength(2);
+    expect(screen.getAllByRole("tab", { name: /Query/ })).toHaveLength(2);
+  });
+
+  it("the database box goes back to the bound database when the rebind is declined", async () => {
+    const user = userEvent.setup();
+    backend((emit) => {
+      emit({ type: "txn", status: "in_transaction" });
+      emit(finished({ txn: "in_transaction" }));
+    });
+    render(<App />);
+    act(() => void openEditorTab("c1", "app", { text: "begin" }));
+    await user.click(await screen.findByRole("button", { name: /Run/ }));
+    await screen.findByText("in transaction");
+    const box = screen.getByLabelText("Database");
+    await user.clear(box);
+    await user.type(box, "other{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Keep open" }));
+    expect(box).toHaveValue("app");
   });
 });

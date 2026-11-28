@@ -907,9 +907,7 @@ impl QuerySession {
     }
 
     fn lost_or_cancelled(&self, e: &tokio_postgres::Error) -> Option<StmtResult> {
-        let fatal = e
-            .as_db_error()
-            .is_some_and(|db| matches!(db.severity(), "FATAL" | "PANIC"));
+        let fatal = e.as_db_error().is_some_and(is_fatal_severity);
         if fatal || e.is_closed() || self.conn.is_closed() {
             self.lost.store(true, Ordering::SeqCst);
             let mut err = disconnected_error(self.txn_status() != TxnStatus::Idle);
@@ -1221,6 +1219,16 @@ fn disconnected_error(in_transaction: bool) -> SqlError {
     }
     e.hint = Some("reconnect to continue".into());
     e
+}
+
+/// FATAL/PANIC from the non-localised severity field; only servers older than 9.6 omit it, so
+/// fall back to the (possibly localised) text there.
+fn is_fatal_severity(db: &tokio_postgres::error::DbError) -> bool {
+    use tokio_postgres::error::Severity;
+    match db.parsed_severity() {
+        Some(s) => matches!(s, Severity::Fatal | Severity::Panic),
+        None => matches!(db.severity(), "FATAL" | "PANIC"),
+    }
 }
 
 fn flush<S: ResultSink + ?Sized>(batch: &mut Vec<SimpleQueryRow>, index: usize, sink: &mut S) {
