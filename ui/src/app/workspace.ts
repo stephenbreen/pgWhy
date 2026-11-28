@@ -5,7 +5,7 @@ import { create } from "zustand";
 
 export type ActivityView = "explorer" | "scripts" | "workflows";
 
-export type TabKind = "welcome" | "editor" | "grid" | "workflow-run" | "connection-form" | "details" | "workflow-editor" | "backup" | "settings" | "workflow-history" | "history" | "operation" | "text";
+export type TabKind = "welcome" | "editor" | "grid" | "workflow-run" | "connection-form" | "details" | "workflow-editor" | "backup" | "settings" | "workflow-history" | "history" | "operation" | "text" | "activity";
 
 export interface Tab {
   id: string;

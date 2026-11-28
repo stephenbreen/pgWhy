@@ -6,6 +6,7 @@ import { useState, type ReactNode } from "react";
 import { trustHostKey, type ConnectionEntry, type HostKeyPrompt, type TunnelStatus } from "../lib/ipc/connections";
 import { toAppError } from "../lib/ipc/errors";
 import { useWorkspace } from "../app/workspace";
+import { openActivityTab } from "../explorer/ActivityTab";
 import { useConnections, type ConnStatus } from "./store";
 import { TagBar } from "./EnvTag";
 import { ErrorNote } from "./ErrorNote";
@@ -109,9 +110,23 @@ export function ConnectionNode({
         {b.label && <span className="status-badge" data-state={b.state}>{b.label}</span>}
         <span className="row-actions">
           {connected && (
-            <button type="button" className="icon" aria-label={`Disconnect ${entry.name}`} onClick={(e) => { e.stopPropagation(); void disconnect(entry.id); }}>
-              ⏏
-            </button>
+            <>
+              <button
+                type="button"
+                className="icon"
+                aria-label={`Activity & locks for ${entry.name}`}
+                title="Activity & locks monitor"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openActivityTab(entry.id);
+                }}
+              >
+                ⚡
+              </button>
+              <button type="button" className="icon" aria-label={`Disconnect ${entry.name}`} onClick={(e) => { e.stopPropagation(); void disconnect(entry.id); }}>
+                ⏏
+              </button>
+            </>
           )}
           <button type="button" className="icon" aria-label={`Edit ${entry.name}`} onClick={(e) => { e.stopPropagation(); openConnectionForm(entry.id, entry.name); }}>
             ✎

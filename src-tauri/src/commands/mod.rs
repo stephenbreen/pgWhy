@@ -1,6 +1,7 @@
 //! Tauri commands. Each module is a thin adapter over a pgwhy-* crate: argument decoding,
 //! state lookup, and error conversion only — no business logic here.
 
+pub mod activity;
 pub mod app;
 pub mod backup;
 pub mod connections;

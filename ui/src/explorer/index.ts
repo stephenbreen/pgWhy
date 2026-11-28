@@ -1,7 +1,8 @@
-import { registerView } from "../app/registry";
+import { registerTab, registerView } from "../app/registry";
 import { setSelectHandler } from "./actions";
 import { useDetails } from "./details/store";
 import { ExplorerView } from "./ExplorerView";
+import { ActivityTab, registerActivityActions } from "./ActivityTab";
 import { registerDatabaseActions } from "./DatabaseOps";
 import { registerRestoreActions } from "./RestoreDialog";
 import { registerExplorerActions } from "./scriptActions";
@@ -11,9 +12,11 @@ import type { SQLNamespace } from "@codemirror/lang-sql";
 
 export function initExplorer() {
   registerView("explorer", ExplorerView);
+  registerTab("activity", ActivityTab);
   registerExplorerActions();
   registerDatabaseActions();
   registerRestoreActions();
+  registerActivityActions();
   setSelectHandler((t) => void useDetails.getState().select(t));
   // schema.table.column completion from whatever the explorer has loaded; `public` objects
   // also complete unqualified
