@@ -1,12 +1,16 @@
-// SSMS-style results pane: one grid at a time with a result-set switcher, plus Messages.
-// A 50-statement script yields one pane, not 50 tabs.
+// SSMS-style results pane: one grid at a time with a result-set switcher, Messages,
+// visual EXPLAIN Plan tree, and searchable Query Execution History.
 
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
+import { ErrorNote } from "../connection/ErrorNote";
 import { ResultGrid } from "../grid/ResultGrid";
 import { useResultStore } from "../grid/useResultStore";
 import { resultCopy } from "../lib/ipc/query";
 import { ExportButton } from "../grid/ExportButton";
-import type { EditorTabState, ResultSet } from "./store";
+import { ExplainPlanView } from "./ExplainPlanView";
+import { QueryHistoryPanel } from "./QueryHistoryPanel";
+import { useQueryHistory, type QueryHistoryEntry } from "./history";
+import type { EditorTabState, ResultSet, ResultsPaneTab } from "./store";
 
 function ResultView({ rs, label }: { rs: ResultSet; label: string }) {
   const store = useResultStore(rs.resultId);
@@ -36,21 +40,48 @@ function ResultView({ rs, label }: { rs: ResultSet; label: string }) {
   );
 }
 
-export function ResultsPane({ state, onSelectResult }: { state: EditorTabState; onSelectResult: (i: number) => void }) {
-  const [view, setView] = useState<"results" | "messages">("results");
+export function ResultsPane({
+  state,
+  onSelectResult,
+  onSelectPane,
+  onLoadSql,
+  onOpenHistoryTab,
+}: {
+  state: EditorTabState;
+  onSelectResult: (i: number) => void;
+  onSelectPane: (pane: ResultsPaneTab) => void;
+  onLoadSql: (sql: string) => void;
+  onOpenHistoryTab: (entry: QueryHistoryEntry) => void;
+}) {
+  const historyCount = useQueryHistory((s) => s.entries.length);
   const hasResults = state.results.length > 0;
-  const shown = hasResults && view === "results" ? "results" : "messages";
+  const hasPlan = !!state.explain || !!state.explainError;
+  const shown: ResultsPaneTab =
+    state.activePane === "plan" && hasPlan
+      ? "plan"
+      : state.activePane === "history"
+        ? "history"
+        : state.activePane === "results" && hasResults
+          ? "results"
+          : "messages";
+
   const errors = state.messages.filter((m) => m.kind === "error").length;
   const rs = state.results[Math.min(state.activeResult, state.results.length - 1)];
 
   return (
     <div className="results-pane">
       <div className="results-tabs" role="tablist" aria-label="Results">
-        <button type="button" role="tab" aria-selected={shown === "results"} disabled={!hasResults} onClick={() => setView("results")}>
+        <button type="button" role="tab" aria-selected={shown === "results"} disabled={!hasResults} onClick={() => onSelectPane("results")}>
           Results{state.results.length > 1 ? ` (${state.results.length})` : ""}
         </button>
-        <button type="button" role="tab" aria-selected={shown === "messages"} onClick={() => setView("messages")}>
+        <button type="button" role="tab" aria-selected={shown === "messages"} onClick={() => onSelectPane("messages")}>
           Messages{errors ? ` · ${errors} error${errors === 1 ? "" : "s"}` : ""}
+        </button>
+        <button type="button" role="tab" aria-selected={shown === "plan"} disabled={!hasPlan} onClick={() => onSelectPane("plan")}>
+          Plan{state.explain?.analyze ? " (Analyze)" : ""}
+        </button>
+        <button type="button" role="tab" aria-selected={shown === "history"} onClick={() => onSelectPane("history")}>
+          History{historyCount > 0 ? ` (${historyCount})` : ""}
         </button>
         {shown === "results" && state.results.length > 1 && (
           <select aria-label="Result set" value={state.activeResult} onChange={(e) => onSelectResult(Number(e.target.value))}>
@@ -64,6 +95,21 @@ export function ResultsPane({ state, onSelectResult }: { state: EditorTabState; 
       </div>
       {shown === "results" && rs ? (
         <ResultView key={rs.resultId} rs={rs} label={`Result ${state.activeResult + 1}`} />
+      ) : shown === "plan" ? (
+        state.explainError ? (
+          <div className="explain-pane" aria-label="Execution plan">
+            <ErrorNote error={state.explainError} />
+          </div>
+        ) : state.explain ? (
+          <ExplainPlanView output={state.explain} />
+        ) : null
+      ) : shown === "history" ? (
+        <QueryHistoryPanel
+          connectionId={state.connectionId}
+          database={state.database}
+          onLoadSql={onLoadSql}
+          onOpenNewTab={onOpenHistoryTab}
+        />
       ) : (
         <ol className="messages" aria-label="Messages">
           {state.messages.length === 0 && <li className="empty">{state.running ? "Running…" : "No messages."}</li>}

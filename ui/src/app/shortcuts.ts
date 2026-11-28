@@ -9,7 +9,7 @@ import { useConnections } from "../connection/store";
 import { openEditorTab } from "../editor/EditorTab";
 import { requestCloseTab, useWorkspace, type ActivityView } from "./workspace";
 import { useLayout } from "./layout";
-import { FILTER_OBJECTS_EVENT, FIND_OBJECT_EVENT, primaryMod } from "./keys";
+import { FILTER_OBJECTS_EVENT, FIND_OBJECT_EVENT, TOGGLE_RESULTS_EVENT, primaryMod } from "./keys";
 
 const VIEW_SHORTCUTS: Record<string, ActivityView> = { "1": "explorer", "2": "scripts", "3": "workflows" };
 // by physical key, so "=" works with or without Shift and on layouts that move "+" and "-"
@@ -28,6 +28,15 @@ export function initShortcuts() {
       e.preventDefault();
       useLayout.getState().stepZoom(ZOOM_KEYS[e.code]);
       return;
+    }
+    if (primaryMod(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "r") {
+      const ws = useWorkspace.getState();
+      const active = ws.tabs.find((t) => t.id === ws.activeTabId);
+      if (active?.kind === "editor") {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent(TOGGLE_RESULTS_EVENT, { detail: { tabId: active.id } }));
+        return;
+      }
     }
     if (primaryMod(e) && !e.altKey && e.key.toLowerCase() === "p") {
       e.preventDefault();
